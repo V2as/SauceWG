@@ -1,0 +1,45 @@
+name: ${COMPOSE_PROJECT_NAME:-saucewg-exit}
+
+# Exit node: a single AmneziaWG legacy interface that terminates the cascade uplink
+# from the entry node and NATs it out to the internet. No panel, no database.
+
+services:
+  awg:
+    image: ${IMAGE_AWG:-saucewg/awg:1.0.0}
+    build:
+      context: ./docker/awg
+      args:
+        AWG_GO_REF: ${AWG_GO_REF:-v0.2.19}
+        AWG_TOOLS_REF: ${AWG_TOOLS_REF:-v1.0.20260618-2}
+    restart: unless-stopped
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      AWG_ROLE: exit
+      AWG_IFACE: ${AWG_IFACE:-awg0}
+      AWG_PORT: ${AWG_PORT:-51820}
+      AWG_SUBNET: ${AWG_SUBNET:-10.77.0.0/24}
+      AWG_MTU: ${AWG_MTU:-1420}
+      AWG_PRIVATE_KEY: ${AWG_PRIVATE_KEY:-}
+      AWG_JC: ${AWG_JC:-}
+      AWG_JMIN: ${AWG_JMIN:-}
+      AWG_JMAX: ${AWG_JMAX:-}
+      AWG_S1: ${AWG_S1:-}
+      AWG_S2: ${AWG_S2:-}
+      AWG_H1: ${AWG_H1:-}
+      AWG_H2: ${AWG_H2:-}
+      AWG_H3: ${AWG_H3:-}
+      AWG_H4: ${AWG_H4:-}
+      AWG_PEER_PUBLIC_KEY: ${AWG_PEER_PUBLIC_KEY:-}
+      AWG_PEER_PSK: ${AWG_PEER_PSK:-}
+      AWG_PEER_ALLOWED_IPS: ${AWG_PEER_ALLOWED_IPS:-10.77.0.2/32}
+      WAN_IFACE: ${WAN_IFACE:-}
+    volumes:
+      - awg-config:/etc/amnezia/amneziawg
+      - awg-run:/var/run/amneziawg
+
+volumes:
+  awg-config:
+  awg-run:

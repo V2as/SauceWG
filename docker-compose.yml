@@ -1,0 +1,152 @@
+name: ${COMPOSE_PROJECT_NAME:-saucewg}
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  postgres:
+    <<: *restart
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-saucewg}
+      POSTGRES_USER: ${POSTGRES_USER:-saucewg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-saucewg} -d ${POSTGRES_DB:-saucewg}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+
+  awg:
+    <<: *restart
+    image: ${IMAGE_AWG:-saucewg/awg:1.0.0}
+    build:
+      context: ./docker/awg
+      args:
+        AWG_GO_REF: ${AWG_GO_REF:-v0.2.19}
+        AWG_TOOLS_REF: ${AWG_TOOLS_REF:-v1.0.20260618-2}
+    # The node manages interfaces, routes and NAT for the host, so it shares the
+    # host network namespace instead of running behind a bridge.
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      AWG_ROLE: entry
+      AWG_IFACE: ${AWG_IFACE:-awg0}
+      AWG_PORT: ${AWG_PORT:-51820}
+      AWG_SUBNET: ${AWG_SUBNET:-10.8.0.0/24}
+      AWG_MTU: ${AWG_MTU:-1420}
+      AWG_PRIVATE_KEY: ${AWG_PRIVATE_KEY:-}
+      AWG_JC: ${AWG_JC:-}
+      AWG_JMIN: ${AWG_JMIN:-}
+      AWG_JMAX: ${AWG_JMAX:-}
+      AWG_S1: ${AWG_S1:-}
+      AWG_S2: ${AWG_S2:-}
+      AWG_H1: ${AWG_H1:-}
+      AWG_H2: ${AWG_H2:-}
+      AWG_H3: ${AWG_H3:-}
+      AWG_H4: ${AWG_H4:-}
+      CASCADE_ENABLED: ${CASCADE_ENABLED:-true}
+      CASCADE_IFACE: ${CASCADE_IFACE:-awg1}
+      CASCADE_ADDRESS: ${CASCADE_ADDRESS:-10.77.0.2/32}
+      CASCADE_MTU: ${CASCADE_MTU:-1380}
+      CASCADE_ENDPOINT: ${CASCADE_ENDPOINT:-}
+      CASCADE_PRIVATE_KEY: ${CASCADE_PRIVATE_KEY:-}
+      CASCADE_PEER_PUBLIC_KEY: ${CASCADE_PEER_PUBLIC_KEY:-}
+      CASCADE_PEER_PSK: ${CASCADE_PEER_PSK:-}
+      CASCADE_KEEPALIVE: ${CASCADE_KEEPALIVE:-25}
+      CASCADE_KILLSWITCH: ${CASCADE_KILLSWITCH:-true}
+      CASCADE_JC: ${CASCADE_JC:-}
+      CASCADE_JMIN: ${CASCADE_JMIN:-}
+      CASCADE_JMAX: ${CASCADE_JMAX:-}
+      CASCADE_S1: ${CASCADE_S1:-}
+      CASCADE_S2: ${CASCADE_S2:-}
+      CASCADE_H1: ${CASCADE_H1:-}
+      CASCADE_H2: ${CASCADE_H2:-}
+      CASCADE_H3: ${CASCADE_H3:-}
+      CASCADE_H4: ${CASCADE_H4:-}
+    volumes:
+      - awg-config:/etc/amnezia/amneziawg
+      - awg-run:/var/run/amneziawg
+
+  panel:
+    <<: *restart
+    image: ${IMAGE_PANEL:-saucewg/panel:1.0.0}
+    build:
+      context: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      awg:
+        condition: service_started
+    environment:
+      PANEL_TITLE: ${PANEL_TITLE:-SauceWG}
+      DEBUG: ${DEBUG:-false}
+      DOCS_ENABLED: ${DOCS_ENABLED:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-saucewg}
+      POSTGRES_USER: ${POSTGRES_USER:-saucewg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set}
+      AWG_IFACE: ${AWG_IFACE:-awg0}
+      AWG_SUBNET: ${AWG_SUBNET:-10.8.0.0/24}
+      AWG_ENDPOINT_HOST: ${AWG_ENDPOINT_HOST:?AWG_ENDPOINT_HOST must be set}
+      AWG_ENDPOINT_PORT: ${AWG_PORT:-51820}
+      CASCADE_ENABLED: ${CASCADE_ENABLED:-true}
+      CASCADE_IFACE: ${CASCADE_IFACE:-awg1}
+      CLIENT_DNS: ${CLIENT_DNS:-1.1.1.1, 1.0.0.1}
+      CLIENT_MTU: ${CLIENT_MTU:-1280}
+      CLIENT_ALLOWED_IPS: ${CLIENT_ALLOWED_IPS:-0.0.0.0/0, ::/0}
+      CLIENT_KEEPALIVE: ${CLIENT_KEEPALIVE:-25}
+      CLIENT_JC: ${CLIENT_JC:-0}
+      CLIENT_JMIN: ${CLIENT_JMIN:-0}
+      CLIENT_JMAX: ${CLIENT_JMAX:-0}
+      COLLECTOR_INTERVAL_SECONDS: ${COLLECTOR_INTERVAL_SECONDS:-10}
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-30}
+      ONLINE_TIMEOUT_SECONDS: ${ONLINE_TIMEOUT_SECONDS:-180}
+      USAGE_BUCKET_MINUTES: ${USAGE_BUCKET_MINUTES:-60}
+      USAGE_RETENTION_DAYS: ${USAGE_RETENTION_DAYS:-90}
+      SUBSCRIPTION_URL_PREFIX: ${SUBSCRIPTION_URL_PREFIX:-}
+    volumes:
+      - awg-config:/etc/amnezia/amneziawg:ro
+      - awg-run:/var/run/amneziawg
+    networks: [internal]
+
+  caddy:
+    <<: *restart
+    image: ${IMAGE_WEB:-saucewg/web:1.0.0}
+    build:
+      context: .
+      dockerfile: docker/caddy/Dockerfile
+    depends_on: [panel]
+    environment:
+      PANEL_SITE_ADDRESS: ${PANEL_SITE_ADDRESS:-:80}
+      CADDY_AUTO_HTTPS: ${CADDY_AUTO_HTTPS:-off}
+    ports:
+      - "${PANEL_HTTP_PORT:-8080}:80"
+      - "${PANEL_HTTPS_PORT:-8443}:443"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  awg-config:
+  awg-run:
+  caddy-data:
+  caddy-config:

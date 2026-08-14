@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: pip install -r requirements.txt
+        working-directory: backend
+      - name: Import the application
+        working-directory: backend
+        env:
+          JWT_SECRET: ci
+          ADMIN_PASSWORD: ci-password
+          POSTGRES_PASSWORD: ci
+          AWG_ENDPOINT_HOST: 127.0.0.1
+        run: python -c "from app.main import app; print(len(app.routes), 'routes registered')"
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -x -S warning docker/awg/entrypoint.sh docker/awg/lib.sh scripts/*.sh
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose files
+        run: |
+          cp .env.example .env
+          sed -i 's/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=ci-password/;
+                  s/^JWT_SECRET=.*/JWT_SECRET=ci-secret/;
+                  s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci/;
+                  s/^AWG_ENDPOINT_HOST=.*/AWG_ENDPOINT_HOST=127.0.0.1/' .env
+          docker compose --env-file .env config >/dev/null
+          docker compose -f docker-compose.exit.yml --env-file .env.exit.example config >/dev/null
+          echo "compose files are valid"

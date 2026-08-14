@@ -1,0 +1,30 @@
+{
+	admin off
+	auto_https {$CADDY_AUTO_HTTPS:off}
+}
+
+# Defaults to plain ":80" so the panel is reachable by IP with no domain configured.
+# Set PANEL_SITE_ADDRESS to a hostname (and CADDY_AUTO_HTTPS to "on") to get automatic TLS.
+{$PANEL_SITE_ADDRESS::80} {
+	encode zstd gzip
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	@api path /api/* /sub/*
+	handle @api {
+		reverse_proxy {$PANEL_UPSTREAM:panel:8000} {
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	handle {
+		root * /srv/panel
+		try_files {path} /index.html
+		file_server
+	}
+}

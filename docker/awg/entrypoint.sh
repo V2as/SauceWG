@@ -11,21 +11,20 @@ AWG_SUBNET=${AWG_SUBNET:-10.8.0.0/24}
 AWG_MTU=${AWG_MTU:-1420}
 
 CASCADE_ENABLED=${CASCADE_ENABLED:-false}
-CASCADE_IFACE=${CASCADE_IFACE:-awg1}
-CASCADE_ADDRESS=${CASCADE_ADDRESS:-10.77.0.2/32}
 CASCADE_MTU=${CASCADE_MTU:-1380}
 CASCADE_KEEPALIVE=${CASCADE_KEEPALIVE:-25}
 CASCADE_TABLE=${CASCADE_TABLE:-451}
 CASCADE_RULE_PRIORITY=${CASCADE_RULE_PRIORITY:-451}
 
 SERVER_PARAMS_FILE="${AWG_CONFIG_DIR}/${AWG_IFACE}.params"
-CASCADE_PARAMS_FILE="${AWG_CONFIG_DIR}/${CASCADE_IFACE}.params"
 # Private keys live in their own files so the panel can mount the params read-only
 # without gaining access to them.
 SERVER_KEY_FILE="${AWG_CONFIG_DIR}/${AWG_IFACE}.key"
-CASCADE_KEY_FILE="${AWG_CONFIG_DIR}/${CASCADE_IFACE}.key"
 
 PIDS=()
+
+# shellcheck source=uplinks.sh
+. /usr/local/lib/awg-uplinks.sh
 
 # ---------------------------------------------------------------------------
 # Server interface (clients on the entry node, the entry node on the exit node)
@@ -102,75 +101,6 @@ setup_server_iface() {
 }
 
 # ---------------------------------------------------------------------------
-# Cascade uplink: entry node -> exit node
-# ---------------------------------------------------------------------------
-
-setup_cascade_iface() {
-    params_load "$CASCADE_PARAMS_FILE"
-
-    if [ -z "${CASCADE_PRIVATE_KEY:-}" ] && [ -f "$CASCADE_KEY_FILE" ]; then
-        CASCADE_PRIVATE_KEY=$(cat "$CASCADE_KEY_FILE")
-    fi
-    if [ -z "${CASCADE_PRIVATE_KEY:-}" ]; then
-        CASCADE_PRIVATE_KEY=$(awg_genkey)
-        log "generated a new private key for ${CASCADE_IFACE}"
-    fi
-    store_secret "$CASCADE_KEY_FILE" "$CASCADE_PRIVATE_KEY"
-
-    for suffix in JC JMIN JMAX S1 S2 H1 H2 H3 H4; do
-        local env_name="CASCADE_${suffix}" saved_name="UPLINK_${suffix}"
-        if [ -z "${!env_name:-}" ] && [ -n "${!saved_name:-}" ]; then
-            printf -v "$env_name" '%s' "${!saved_name}"
-        fi
-    done
-    generate_obfuscation "CASCADE_"
-
-    UPLINK_PUBLIC_KEY=$(awg_pubkey "$CASCADE_PRIVATE_KEY")
-    # params_store reads these by name, so shellcheck cannot see the use.
-    # shellcheck disable=SC2034
-    {
-        UPLINK_ENDPOINT=${CASCADE_ENDPOINT:-}
-        UPLINK_ADDRESS=$CASCADE_ADDRESS
-        UPLINK_JC=$CASCADE_JC; UPLINK_JMIN=$CASCADE_JMIN; UPLINK_JMAX=$CASCADE_JMAX
-        UPLINK_S1=$CASCADE_S1; UPLINK_S2=$CASCADE_S2
-        UPLINK_H1=$CASCADE_H1; UPLINK_H2=$CASCADE_H2; UPLINK_H3=$CASCADE_H3; UPLINK_H4=$CASCADE_H4
-    }
-
-    params_store "$CASCADE_PARAMS_FILE" \
-        UPLINK_PUBLIC_KEY UPLINK_ENDPOINT UPLINK_ADDRESS \
-        UPLINK_JC UPLINK_JMIN UPLINK_JMAX UPLINK_S1 UPLINK_S2 UPLINK_H1 UPLINK_H2 UPLINK_H3 UPLINK_H4
-
-    local conf="${AWG_CONFIG_DIR}/${CASCADE_IFACE}.conf"
-    {
-        echo "[Interface]"
-        echo "PrivateKey = ${CASCADE_PRIVATE_KEY}"
-        emit_obfuscation "CASCADE_"
-        # During first-time pairing the exit node's key is not known yet. The interface
-        # still comes up (peerless) so the uplink public key gets published and the
-        # kill switch stays in force.
-        if [ -n "${CASCADE_PEER_PUBLIC_KEY:-}" ] && [ -n "${CASCADE_ENDPOINT:-}" ]; then
-            echo
-            echo "[Peer]"
-            echo "PublicKey = ${CASCADE_PEER_PUBLIC_KEY}"
-            [ -n "${CASCADE_PEER_PSK:-}" ] && echo "PresharedKey = ${CASCADE_PEER_PSK}"
-            echo "AllowedIPs = 0.0.0.0/0"
-            echo "Endpoint = ${CASCADE_ENDPOINT}"
-            echo "PersistentKeepalive = ${CASCADE_KEEPALIVE}"
-        else
-            log "cascade peer is not configured yet; ${CASCADE_IFACE} starts without a peer"
-        fi
-    } > "$conf"
-    chmod 0600 "$conf"
-
-    amneziawg-go -f "$CASCADE_IFACE" &
-    PIDS+=("$!")
-    wait_for_socket "$CASCADE_IFACE"
-    awg setconf "$CASCADE_IFACE" "$conf"
-    iface_up "$CASCADE_IFACE" "$CASCADE_ADDRESS" "$CASCADE_MTU"
-    log "${CASCADE_IFACE} up towards ${CASCADE_ENDPOINT:-<unpaired>} (pub ${UPLINK_PUBLIC_KEY})"
-}
-
-# ---------------------------------------------------------------------------
 # Forwarding / NAT
 # ---------------------------------------------------------------------------
 
@@ -190,69 +120,61 @@ setup_exit_routing() {
         || iptables -t mangle -A FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 }
 
-setup_entry_routing() {
-    # Client traffic leaves only through the cascade uplink. Policy routing keeps the
-    # host's own default route (SSH, panel, the uplink handshake itself) untouched.
-    ip route replace default dev "$CASCADE_IFACE" table "$CASCADE_TABLE"
-    ip rule del from "$AWG_SUBNET" lookup "$CASCADE_TABLE" 2>/dev/null || true
-    ip rule add from "$AWG_SUBNET" lookup "$CASCADE_TABLE" priority "$CASCADE_RULE_PRIORITY"
-
-    iptables -t nat -C POSTROUTING -s "$AWG_SUBNET" -o "$CASCADE_IFACE" -j MASQUERADE 2>/dev/null \
-        || iptables -t nat -A POSTROUTING -s "$AWG_SUBNET" -o "$CASCADE_IFACE" -j MASQUERADE
-
-    iptables -C FORWARD -i "$AWG_IFACE" -o "$CASCADE_IFACE" -j ACCEPT 2>/dev/null \
-        || iptables -I FORWARD 1 -i "$AWG_IFACE" -o "$CASCADE_IFACE" -j ACCEPT
-    iptables -C FORWARD -i "$CASCADE_IFACE" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
-        || iptables -I FORWARD 1 -i "$CASCADE_IFACE" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-
-    if [ "${CASCADE_KILLSWITCH:-true}" = "true" ]; then
-        # Without the uplink there is no path out, so a dead tunnel cannot leak the
-        # entry node's own address.
-        iptables -C FORWARD -i "$AWG_IFACE" -j REJECT --reject-with icmp-net-unreachable 2>/dev/null \
-            || iptables -A FORWARD -i "$AWG_IFACE" -j REJECT --reject-with icmp-net-unreachable
-    fi
-
-    iptables -t mangle -C FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
-        || iptables -t mangle -A FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-}
-
 teardown() {
     log "shutting down"
     if [ "$AWG_ROLE" = "entry" ] && [ "$CASCADE_ENABLED" = "true" ]; then
-        ip rule del from "$AWG_SUBNET" lookup "$CASCADE_TABLE" 2>/dev/null || true
-        ip route flush table "$CASCADE_TABLE" 2>/dev/null || true
-        ip link del "$CASCADE_IFACE" 2>/dev/null || true
+        uplinks_teardown
     fi
     ip link del "$AWG_IFACE" 2>/dev/null || true
     kill "${PIDS[@]}" 2>/dev/null || true
 }
 
 do_run() {
+    local initial
     mkdir -p "$AWG_CONFIG_DIR" /var/run/amneziawg
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
     trap teardown EXIT INT TERM
 
     ip link del "$AWG_IFACE" 2>/dev/null || true
-    ip link del "$CASCADE_IFACE" 2>/dev/null || true
-
     setup_server_iface
-    if [ "$AWG_ROLE" = "entry" ] && [ "$CASCADE_ENABLED" = "true" ]; then
-        setup_cascade_iface
-        setup_entry_routing
-    else
+
+    if [ "$AWG_ROLE" != "entry" ] || [ "$CASCADE_ENABLED" != "true" ]; then
         setup_exit_routing
+        log "node ready (role=${AWG_ROLE})"
+        wait -n "${PIDS[@]}"
+        log "an amneziawg-go process exited, stopping container"
+        return
     fi
 
-    log "node ready (role=${AWG_ROLE})"
+    uplinks_parse
+    [ "$(uplink_count)" -gt 0 ] || die "CASCADE_ENABLED=true but no exit node is configured"
+
+    uplinks_setup_all
+    uplinks_routing_base
+
+    # Start on the highest-priority uplink; the monitor corrects the choice as soon
+    # as it has enough health samples to know better.
+    uplinks_read_control
+    initial=$(uplinks_select)
+    [ "$initial" -ge 0 ] || initial=0
+    uplink_activate "$initial"
+    uplinks_write_state
+
+    uplinks_monitor &
+    PIDS+=("$!")
+
+    log "node ready (role=entry, uplinks=$(uplink_count))"
     wait -n "${PIDS[@]}"
-    log "an amneziawg-go process exited, stopping container"
+    log "a node process exited, stopping container"
 }
 
 do_healthcheck() {
     [ -S "/var/run/amneziawg/${AWG_IFACE}.sock" ] || exit 1
     ip link show "$AWG_IFACE" >/dev/null 2>&1 || exit 1
     if [ "$AWG_ROLE" = "entry" ] && [ "$CASCADE_ENABLED" = "true" ]; then
-        ip link show "$CASCADE_IFACE" >/dev/null 2>&1 || exit 1
+        # The uplinks are only healthy as a group: at least the active one must exist.
+        [ -f "$UPLINK_STATE_FILE" ] || exit 1
+        jq -e '.active != null' "$UPLINK_STATE_FILE" >/dev/null 2>&1 || exit 1
     fi
     exit 0
 }

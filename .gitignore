@@ -8,6 +8,10 @@
 caddy_data/
 caddy_config/
 
+# The live exit node list holds peer keys and pre-shared keys.
+config/*
+!config/exit-nodes.example.json
+
 node_modules/
 dist/
 .vite/

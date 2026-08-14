@@ -33,6 +33,38 @@ export interface CascadeStatus {
   rx_bytes: number
   tx_bytes: number
   exit_ip: string | null
+  node: string | null
+  mode: string
+  nodes_total: number
+  nodes_healthy: number
+}
+
+export interface ExitNode {
+  name: string
+  iface: string
+  address: string
+  priority: number
+  endpoint: string | null
+  exit_ip: string | null
+  public_key: string
+  peer_public_key: string | null
+  paired: boolean
+  healthy: boolean
+  active: boolean
+  last_handshake_at: string | null
+  latency_ms: number | null
+  rx_bytes: number
+  tx_bytes: number
+}
+
+export interface ExitNodeList {
+  mode: string
+  active: string | null
+  pinned: string | null
+  killswitch: boolean
+  stale: boolean
+  updated_at: string | null
+  nodes: ExitNode[]
 }
 
 export interface SystemStats {
@@ -159,6 +191,11 @@ export const api = {
   nodeUsage: (hours: number) => request<UsageSeries>(`/system/usage?hours=${hours}`),
   settings: () => request<NodeSettings>('/settings'),
   forceSync: () => request<Record<string, number>>('/system/sync', { method: 'POST' }),
+
+  exitNodes: () => request<ExitNodeList>('/nodes'),
+  activateNode: (name: string) =>
+    request<ExitNodeList>(`/nodes/${encodeURIComponent(name)}/activate`, { method: 'POST' }),
+  autoFailover: () => request<ExitNodeList>('/nodes/auto', { method: 'POST' }),
 
   clients: (params: Record<string, string | number | undefined>) => {
     const query = new URLSearchParams()

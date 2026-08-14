@@ -22,7 +22,7 @@ services:
 
   awg:
     <<: *restart
-    image: ${IMAGE_AWG:-saucewg/awg:1.0.0}
+    image: ${IMAGE_AWG:-saucewg/awg:1.1.0}
     build:
       context: ./docker/awg
       args:
@@ -51,15 +51,27 @@ services:
       AWG_H3: ${AWG_H3:-}
       AWG_H4: ${AWG_H4:-}
       CASCADE_ENABLED: ${CASCADE_ENABLED:-true}
-      CASCADE_IFACE: ${CASCADE_IFACE:-awg1}
-      CASCADE_ADDRESS: ${CASCADE_ADDRESS:-10.77.0.2/32}
       CASCADE_MTU: ${CASCADE_MTU:-1380}
-      CASCADE_ENDPOINT: ${CASCADE_ENDPOINT:-}
-      CASCADE_PRIVATE_KEY: ${CASCADE_PRIVATE_KEY:-}
-      CASCADE_PEER_PUBLIC_KEY: ${CASCADE_PEER_PUBLIC_KEY:-}
-      CASCADE_PEER_PSK: ${CASCADE_PEER_PSK:-}
       CASCADE_KEEPALIVE: ${CASCADE_KEEPALIVE:-25}
       CASCADE_KILLSWITCH: ${CASCADE_KILLSWITCH:-true}
+      # The exit node list. CASCADE_NODES_JSON wins when set; otherwise the file is
+      # read from the bind-mounted ./config directory.
+      CASCADE_NODES_JSON: ${CASCADE_NODES_JSON:-}
+      CASCADE_NODES_FILE: ${CASCADE_NODES_FILE:-/etc/amnezia/host/exit-nodes.json}
+      CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
+      # Failover tuning.
+      CASCADE_PROBE_ENABLED: ${CASCADE_PROBE_ENABLED:-true}
+      CASCADE_PROBE_TARGET: ${CASCADE_PROBE_TARGET:-1.1.1.1}
+      CASCADE_PROBE_INTERVAL: ${CASCADE_PROBE_INTERVAL:-10}
+      CASCADE_PROBE_TIMEOUT: ${CASCADE_PROBE_TIMEOUT:-3}
+      CASCADE_FAIL_THRESHOLD: ${CASCADE_FAIL_THRESHOLD:-3}
+      CASCADE_RECOVER_THRESHOLD: ${CASCADE_RECOVER_THRESHOLD:-2}
+      CASCADE_HANDSHAKE_TIMEOUT: ${CASCADE_HANDSHAKE_TIMEOUT:-180}
+      # Single-uplink variables, still honoured when no node list is present.
+      CASCADE_ENDPOINT: ${CASCADE_ENDPOINT:-}
+      CASCADE_ADDRESS: ${CASCADE_ADDRESS:-}
+      CASCADE_PEER_PUBLIC_KEY: ${CASCADE_PEER_PUBLIC_KEY:-}
+      CASCADE_PEER_PSK: ${CASCADE_PEER_PSK:-}
       CASCADE_JC: ${CASCADE_JC:-}
       CASCADE_JMIN: ${CASCADE_JMIN:-}
       CASCADE_JMAX: ${CASCADE_JMAX:-}
@@ -72,10 +84,11 @@ services:
     volumes:
       - awg-config:/etc/amnezia/amneziawg
       - awg-run:/var/run/amneziawg
+      - ./config:/etc/amnezia/host:ro
 
   panel:
     <<: *restart
-    image: ${IMAGE_PANEL:-saucewg/panel:1.0.0}
+    image: ${IMAGE_PANEL:-saucewg/panel:1.1.0}
     build:
       context: ./backend
     depends_on:
@@ -103,7 +116,6 @@ services:
       AWG_ENDPOINT_HOST: ${AWG_ENDPOINT_HOST:?AWG_ENDPOINT_HOST must be set}
       AWG_ENDPOINT_PORT: ${AWG_PORT:-51820}
       CASCADE_ENABLED: ${CASCADE_ENABLED:-true}
-      CASCADE_IFACE: ${CASCADE_IFACE:-awg1}
       CLIENT_DNS: ${CLIENT_DNS:-1.1.1.1, 1.0.0.1}
       CLIENT_MTU: ${CLIENT_MTU:-1280}
       CLIENT_ALLOWED_IPS: ${CLIENT_ALLOWED_IPS:-0.0.0.0/0, ::/0}
@@ -124,7 +136,7 @@ services:
 
   caddy:
     <<: *restart
-    image: ${IMAGE_WEB:-saucewg/web:1.0.0}
+    image: ${IMAGE_WEB:-saucewg/web:1.1.0}
     build:
       context: .
       dockerfile: docker/caddy/Dockerfile

@@ -31,13 +31,17 @@ RUN git clone --depth 1 --branch "${AWG_TOOLS_REF}" https://github.com/amnezia-v
     && make install DESTDIR=/out WITH_BASHCOMPLETION=no WITH_WGQUICK=yes WITH_SYSTEMDUNITS=no
 
 FROM alpine:3.20
+# jq parses the exit node list and renders the uplink state file; conntrack-tools
+# drops stale NAT bindings when the active uplink changes.
 RUN apk add --no-cache bash iproute2 iptables ip6tables nftables openresolv iputils \
+        jq conntrack-tools \
     && rm -rf /var/cache/apk/*
 
 COPY --from=go-build /out/ /
 COPY --from=tools-build /out/ /
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY lib.sh /usr/local/lib/awg-lib.sh
+COPY uplinks.sh /usr/local/lib/awg-uplinks.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh \
     && mkdir -p /etc/amnezia/amneziawg /var/run/amneziawg
 

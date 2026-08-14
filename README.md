@@ -8,14 +8,23 @@ AmneziaWG tunnel to an exit node in another country, which performs the NAT. Bot
 speak AmneziaWG, so neither the client link nor the inter-server link looks like
 WireGuard to a DPI box.
 
+Any number of exit nodes can be configured. All of them stay connected; one carries
+traffic, and the node fails over to the next healthy one within about 30 seconds when it
+stops answering.
+
 ```
-   client                 entry node (unblocked IP)              exit node
- ┌────────┐  AmneziaWG   ┌───────────────────────┐  AmneziaWG   ┌──────────┐
- │ phone  │ ───────────▶ │ awg0  10.8.0.1/24     │ ───────────▶ │  awg0    │ ──▶ internet
- │ laptop │   legacy     │ awg1  10.77.0.2/32    │   legacy     │ 10.77.0.1│
- └────────┘              │ panel · api · caddy   │              └──────────┘
-                         └───────────────────────┘
+   client                 entry node (unblocked IP)                exit nodes
+ ┌────────┐  AmneziaWG   ┌───────────────────────┐  awg1  ┌──────────────┐
+ │ phone  │ ───────────▶ │ awg0  10.8.0.1/24     │───────▶│ eu-nl  prio 10│──▶ internet
+ │ laptop │   legacy     │ awg1  10.77.0.2/32    │  awg2  ├──────────────┤
+ └────────┘              │ awg2  10.77.0.3/32    │╌╌╌╌╌╌▶ │ eu-de  prio 20│  (standby)
+                         │ panel · api · caddy   │  awgN  ├──────────────┤
+                         └───────────────────────┘╌╌╌╌╌╌▶ │ …             │  (standby)
+                                                          └──────────────┘
 ```
+
+Integrating this into a larger system? [`AWG_USAGE.md`](AWG_USAGE.md) is the reference
+for driving the panel from a central API.
 
 ## Why "legacy"
 
@@ -51,17 +60,7 @@ a reconciliation loop re-applies every peer after a node restart.
 
 ## Quick start
 
-### 1. Exit node
-
-```bash
-git clone <this repo> /opt/saucewg && cd /opt/saucewg
-cp .env.exit.example .env
-./scripts/bootstrap-exit.sh --port 51820 --subnet 10.77.0.0/24
-```
-
-The script prints the exit node's public key and its obfuscation profile. Keep them.
-
-### 2. Entry node
+### 1. Entry node
 
 ```bash
 git clone <this repo> /opt/saucewg && cd /opt/saucewg
@@ -75,20 +74,38 @@ ADMIN_PASSWORD=...              # openssl rand -base64 18
 JWT_SECRET=...                  # openssl rand -hex 32
 POSTGRES_PASSWORD=...           # openssl rand -hex 24
 AWG_ENDPOINT_HOST=<entry ip>
-CASCADE_ENDPOINT=<exit ip>:51820
-CASCADE_PEER_PUBLIC_KEY=<exit public key>
-CASCADE_S1=...                  # mirror the exit node's AWG_S1/S2/H1-H4
 ```
 
 Then:
 
 ```bash
-./scripts/bootstrap-entry.sh --endpoint-host <entry ip> --cascade-endpoint <exit ip>:51820
+./scripts/bootstrap-entry.sh --endpoint-host <entry ip>
 ```
+
+The entry node starts with one unpaired uplink, so it is up and serving the panel
+before any exit node exists.
+
+### 2. Exit node
+
+```bash
+git clone <this repo> /opt/saucewg && cd /opt/saucewg
+./scripts/bootstrap-exit.sh --name eu-nl --port 51820
+```
+
+It prints a ready-made JSON object describing itself — public key, endpoint and
+obfuscation profile.
 
 ### 3. Pair the two
 
-The entry node prints its uplink public key. Put it on the exit node and restart:
+On the entry node, paste that object in:
+
+```bash
+./scripts/add-exit-node.sh --json '{"name":"eu-nl","endpoint":"…","public_key":"…", …}'
+```
+
+The script assigns the node a free uplink address and a priority, restarts the node
+container and prints the entry node's uplink public key for that slot. Install it on the
+exit node:
 
 ```bash
 # on the exit node
@@ -96,9 +113,13 @@ sed -i "s|^AWG_PEER_PUBLIC_KEY=.*|AWG_PEER_PUBLIC_KEY=<entry uplink key>|" .env
 docker compose -f docker-compose.exit.yml up -d --force-recreate
 ```
 
-Optionally add a pre-shared key to the uplink for post-quantum resistance: generate it
-once with `docker run --rm --entrypoint awg saucewg/awg:1.0.0 genpsk`, then set
-`AWG_PEER_PSK` on the exit node and `CASCADE_PEER_PSK` on the entry node.
+Repeat steps 2 and 3 for every additional exit node. Each gets its own interface, key
+pair and obfuscation profile on the entry node.
+
+Optionally add a pre-shared key to an uplink for post-quantum resistance: generate it
+once with `docker run --rm --entrypoint awg saucewg/awg:1.1.0 genpsk`, then set
+`AWG_PEER_PSK` on the exit node and `preshared_key` on that node's entry in
+`config/exit-nodes.json`.
 
 Private keys are generated inside the node container on first start and persisted in the
 `awg-config` volume. They never need to be typed into `.env`.
@@ -137,6 +158,9 @@ curl -H "Authorization: Bearer $TOKEN" http://<host>/api/clients
 | `GET` | `/api/clients/{name}/config` | the `.conf` profile |
 | `GET` | `/api/clients/{name}/qr` | the profile as a PNG QR code |
 | `GET` | `/api/clients/{name}/usage?hours=` | per-bucket traffic history |
+| `GET` | `/api/nodes` | exit node inventory with health, latency and which one is active |
+| `POST` | `/api/nodes/{name}/activate` | prefer one exit node |
+| `POST` | `/api/nodes/auto` | drop the preference, back to priority order |
 | `GET` | `/api/system` | host stats, client counts, live speed, cascade state |
 | `GET` | `/api/system/usage?hours=` | node-wide traffic history |
 | `POST` | `/api/system/sync` | force peer reconciliation |
@@ -144,6 +168,45 @@ curl -H "Authorization: Bearer $TOKEN" http://<host>/api/clients
 | `GET` | `/sub/{token}` | the client profile, no admin auth required |
 
 Interactive docs are at `/api/docs` when `DOCS_ENABLED=true`.
+[`AWG_USAGE.md`](AWG_USAGE.md) documents every field and its semantics.
+
+## Exit nodes and failover
+
+The exit node list lives in `config/exit-nodes.json` (or inline in
+`CASCADE_NODES_JSON`). Each entry becomes its own interface — `awg1`, `awg2`, … — with
+its own persistent key pair and obfuscation profile. All of them handshake continuously;
+only the one named in the client policy-routing table carries traffic.
+
+```json
+[
+  { "name": "eu-nl", "endpoint": "198.51.100.20:51820", "public_key": "…=",
+    "address": "10.77.0.2/32", "priority": 10, "s1": 96, "s2": 40,
+    "h1": 1148643707, "h2": 1420633205, "h3": 1817636915, "h4": 1996553108 },
+  { "name": "eu-de", "endpoint": "203.0.113.31:51820", "public_key": "…=",
+    "address": "10.77.0.3/32", "priority": 20, "…": "…" }
+]
+```
+
+**Lower `priority` wins.** Every 10 seconds each uplink is checked: a handshake older
+than `CASCADE_HANDSHAKE_TIMEOUT` fails it outright, otherwise an ICMP probe is sent
+through the tunnel to `CASCADE_PROBE_TARGET` — which is what catches an exit node that
+is still up but has lost its own internet. Three consecutive failures take it out of
+rotation and traffic moves to the next healthy node; two successes bring it back.
+
+Switching rewrites one route and flushes stale NAT conntrack entries. Clients keep their
+tunnel to the entry node the whole time — they see a new exit IP, not a disconnect.
+
+`POST /api/nodes/{name}/activate` and the **Exit nodes** page pin a preferred node. The
+pin is a preference, not a lock: a pinned node that goes down is still failed over, and
+is taken back once it recovers.
+
+Two invariants when adding nodes by hand:
+
+- `s1`, `s2` and `h1`–`h4` must be identical on both ends of an uplink, and different
+  between uplinks.
+- an uplink's `address` must be inside that exit node's `AWG_SUBNET`, since the exit
+  node's NAT rule is scoped to it. The defaults (`10.77.0.0/24` everywhere, `.2`, `.3`,
+  `.4` … on the entry node) satisfy this.
 
 ## Monitoring
 
@@ -201,9 +264,9 @@ files. It needs no secrets.
 ### From your machine
 
 ```bash
-export IMAGE_AWG=yourname/saucewg-awg:1.0.0
-export IMAGE_PANEL=yourname/saucewg-panel:1.0.0
-export IMAGE_WEB=yourname/saucewg-web:1.0.0
+export IMAGE_AWG=yourname/saucewg-awg:1.1.0
+export IMAGE_PANEL=yourname/saucewg-panel:1.1.0
+export IMAGE_WEB=yourname/saucewg-web:1.1.0
 
 make build
 make push
@@ -215,10 +278,11 @@ workflow does.
 ## Operating notes
 
 - **Kill switch.** With `CASCADE_KILLSWITCH=true` the entry node only forwards client
-  traffic into the uplink interface. If the exit node is unreachable, clients lose
+  traffic into an uplink interface. If every exit node is unreachable, clients lose
   connectivity instead of leaking through the entry node's own address.
 - **Routing.** The entry node uses policy routing (`ip rule from <subnet> lookup 451`)
   rather than a default route, so SSH and the panel keep using the normal route.
+  Failover is a single `ip route replace default dev awgN table 451`.
 - **Performance.** Both hops run the userspace `amneziawg-go`, which is CPU-bound. On a
   2-core VPS expect tens of Mbit/s per node. Installing the AmneziaWG kernel module on the
   host and pointing `WG_QUICK_USERSPACE_IMPLEMENTATION` at it is the usual next step if you
@@ -232,10 +296,12 @@ workflow does.
 ```
 backend/          FastAPI service (app/awg = UAPI client, app/services = workers)
 frontend/         Vue 3 + Vite single-page UI
-docker/awg/       AmneziaWG legacy node image and entrypoint
+docker/awg/       AmneziaWG legacy node image: entrypoint, uplinks + failover monitor
 docker/caddy/     frontend build + Caddy reverse proxy image
-scripts/          bootstrap helpers for both node roles
+scripts/          bootstrap helpers and the exit node list manager
+config/           exit-nodes.json, bind-mounted into the node container
 .github/workflows/  CI checks and the Docker Hub publish pipeline
+AWG_USAGE.md      integration reference for a central API
 docker-compose.yml       entry node: awg + panel + caddy + postgres
 docker-compose.exit.yml  exit node: awg only
 ```

@@ -49,7 +49,7 @@ jobs:
       - name: shellcheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck -x -S warning docker/awg/entrypoint.sh docker/awg/lib.sh scripts/*.sh
+          shellcheck -x -S warning docker/awg/*.sh scripts/*.sh
 
   compose:
     runs-on: ubuntu-latest

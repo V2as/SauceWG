@@ -85,9 +85,14 @@ onUnmounted(() => window.clearInterval(timer))
         <div class="stat-label">Cascade</div>
         <div class="stat-value row" style="gap: 9px">
           <i class="dot" :class="{ on: stats.cascade.connected }"></i>
-          <span>{{ stats.cascade.connected ? 'Connected' : 'Down' }}</span>
+          <span>{{ stats.cascade.node ?? (stats.cascade.connected ? 'Connected' : 'Down') }}</span>
         </div>
-        <div class="stat-sub">exit {{ stats.cascade.exit_ip ?? 'unknown' }}</div>
+        <div class="stat-sub">
+          exit {{ stats.cascade.exit_ip ?? 'unknown' }}
+          <template v-if="stats.cascade.nodes_total > 1">
+            · {{ stats.cascade.nodes_healthy }}/{{ stats.cascade.nodes_total }} nodes up
+          </template>
+        </div>
       </div>
     </div>
 
@@ -144,6 +149,13 @@ onUnmounted(() => window.clearInterval(timer))
         <dd class="mono">{{ stats.endpoint }}</dd>
         <dt>Entry public key</dt>
         <dd class="mono">{{ stats.server_public_key || '—' }}</dd>
+        <dt>Active exit node</dt>
+        <dd>
+          <RouterLink to="/exit-nodes">{{ stats.cascade.node ?? '—' }}</RouterLink>
+          <span style="color: var(--text-dim)">
+            ({{ stats.cascade.mode }}, {{ stats.cascade.nodes_healthy }}/{{ stats.cascade.nodes_total }} healthy)
+          </span>
+        </dd>
         <dt>Uplink interface</dt>
         <dd class="mono">{{ stats.cascade.iface }}</dd>
         <dt>Exit endpoint</dt>

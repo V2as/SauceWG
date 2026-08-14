@@ -2,10 +2,11 @@
 # Bootstraps the entry node (AmneziaWG + panel). Run on the entry server from the
 # project directory.
 #
-#   ./scripts/bootstrap-entry.sh --endpoint-host 203.0.113.10 \
-#       --cascade-endpoint 198.51.100.20:51820
+#   ./scripts/bootstrap-entry.sh --endpoint-host 203.0.113.10
 #
-# Writes .env if it does not exist, then builds and starts the whole stack.
+# Writes .env if it does not exist, then builds and starts the whole stack. Exit
+# nodes are added afterwards with scripts/add-exit-node.sh — the entry node comes up
+# with one unpaired uplink so it can publish the key you need for the first one.
 # Secrets are generated locally on the server; only the admin password is printed.
 set -euo pipefail
 
@@ -14,8 +15,7 @@ cd "$(dirname "$0")/.."
 ENDPOINT_HOST=""
 PORT=443
 SUBNET=10.8.0.0/24
-CASCADE_ENDPOINT=""
-CASCADE_ADDRESS=10.77.0.2/32
+UPLINK_SUBNET=10.77.0.0/24
 HTTP_PORT=80
 ENV_FILE=.env
 
@@ -24,8 +24,7 @@ while [ $# -gt 0 ]; do
         --endpoint-host) ENDPOINT_HOST=$2; shift 2 ;;
         --port) PORT=$2; shift 2 ;;
         --subnet) SUBNET=$2; shift 2 ;;
-        --cascade-endpoint) CASCADE_ENDPOINT=$2; shift 2 ;;
-        --cascade-address) CASCADE_ADDRESS=$2; shift 2 ;;
+        --uplink-subnet) UPLINK_SUBNET=$2; shift 2 ;;
         --http-port) HTTP_PORT=$2; shift 2 ;;
         --env-file) ENV_FILE=$2; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
@@ -49,9 +48,9 @@ if [ ! -f "$ENV_FILE" ]; then
 
     cat > "$ENV_FILE" <<EOF
 COMPOSE_PROJECT_NAME=saucewg
-IMAGE_AWG=saucewg/awg:1.0.0
-IMAGE_PANEL=saucewg/panel:1.0.0
-IMAGE_WEB=saucewg/web:1.0.0
+IMAGE_AWG=saucewg/awg:1.1.0
+IMAGE_PANEL=saucewg/panel:1.1.0
+IMAGE_WEB=saucewg/web:1.1.0
 
 PANEL_TITLE=SauceWG
 PANEL_HTTP_PORT=${HTTP_PORT}
@@ -86,24 +85,19 @@ AWG_H3=${H[2]}
 AWG_H4=${H[3]}
 
 CASCADE_ENABLED=true
-CASCADE_IFACE=awg1
-CASCADE_ADDRESS=${CASCADE_ADDRESS}
 CASCADE_MTU=1380
 CASCADE_KEEPALIVE=25
 CASCADE_KILLSWITCH=true
-CASCADE_ENDPOINT=${CASCADE_ENDPOINT}
-CASCADE_PEER_PUBLIC_KEY=
-CASCADE_PEER_PSK=
-# Must match the exit node's AWG_* obfuscation values.
-CASCADE_JC=
-CASCADE_JMIN=
-CASCADE_JMAX=
-CASCADE_S1=
-CASCADE_S2=
-CASCADE_H1=
-CASCADE_H2=
-CASCADE_H3=
-CASCADE_H4=
+# Exit nodes live in config/exit-nodes.json; add them with scripts/add-exit-node.sh.
+CASCADE_NODES_FILE=/etc/amnezia/host/exit-nodes.json
+CASCADE_UPLINK_SUBNET=${UPLINK_SUBNET}
+CASCADE_PROBE_ENABLED=true
+CASCADE_PROBE_TARGET=1.1.1.1
+CASCADE_PROBE_INTERVAL=10
+CASCADE_PROBE_TIMEOUT=3
+CASCADE_FAIL_THRESHOLD=3
+CASCADE_RECOVER_THRESHOLD=2
+CASCADE_HANDSHAKE_TIMEOUT=180
 
 CLIENT_DNS=1.1.1.1, 1.0.0.1
 CLIENT_MTU=1280
@@ -125,13 +119,20 @@ EOF
     echo "admin password: ${ADMIN_PASSWORD}"
 fi
 
+mkdir -p config
+[ -f config/exit-nodes.json ] || { echo '[]' > config/exit-nodes.json; chmod 600 config/exit-nodes.json; }
+
 echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-saucewg.conf
 sysctl -q -p /etc/sysctl.d/99-saucewg.conf
 
 docker compose --env-file "$ENV_FILE" build
 docker compose --env-file "$ENV_FILE" up -d
 
+sleep 6
 echo
-echo "Entry node started. Uplink public key to install on the exit node:"
-sleep 4
-docker compose --env-file "$ENV_FILE" exec -T awg cat /etc/amnezia/amneziawg/awg1.params 2>/dev/null || true
+echo "Entry node started. Uplink public keys, one per configured exit node:"
+docker compose --env-file "$ENV_FILE" exec -T awg jq -r \
+    '.nodes[] | "  \(.name)\t\(.public_key)"' /var/run/amneziawg/uplinks.json 2>/dev/null \
+    || echo "  (still starting; check the Exit nodes page in the panel)"
+echo
+echo "Add exit nodes with:  ./scripts/add-exit-node.sh --json '<object from bootstrap-exit.sh>'"

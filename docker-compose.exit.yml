@@ -5,7 +5,7 @@ name: ${COMPOSE_PROJECT_NAME:-saucewg-exit}
 
 services:
   awg:
-    image: ${IMAGE_AWG:-saucewg/awg:1.0.0}
+    image: ${IMAGE_AWG:-saucewg/awg:1.1.0}
     build:
       context: ./docker/awg
       args:
@@ -34,7 +34,9 @@ services:
       AWG_H4: ${AWG_H4:-}
       AWG_PEER_PUBLIC_KEY: ${AWG_PEER_PUBLIC_KEY:-}
       AWG_PEER_PSK: ${AWG_PEER_PSK:-}
-      AWG_PEER_ALLOWED_IPS: ${AWG_PEER_ALLOWED_IPS:-10.77.0.2/32}
+      # Each entry-node uplink terminates on its own address inside this subnet, so
+      # accepting the whole range keeps one exit image usable for any slot.
+      AWG_PEER_ALLOWED_IPS: ${AWG_PEER_ALLOWED_IPS:-10.77.0.0/24}
       WAN_IFACE: ${WAN_IFACE:-}
     volumes:
       - awg-config:/etc/amnezia/amneziawg

@@ -1,6 +1,6 @@
-IMAGE_AWG   ?= saucewg/awg:1.0.0
-IMAGE_PANEL ?= saucewg/panel:1.0.0
-IMAGE_WEB   ?= saucewg/web:1.0.0
+IMAGE_AWG   ?= saucewg/awg:1.1.0
+IMAGE_PANEL ?= saucewg/panel:1.1.0
+IMAGE_WEB   ?= saucewg/web:1.1.0
 PLATFORMS   ?=
 
 AWG_GO_REF    ?= v0.2.19

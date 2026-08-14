@@ -11,18 +11,24 @@ cd "$(dirname "$0")/.."
 
 PORT=51820
 SUBNET=10.77.0.0/24
-PEER_ALLOWED_IPS=10.77.0.2/32
+# Every entry-node uplink lands on its own address in this subnet, so accepting the
+# whole range keeps this node usable in any slot of the entry node's list.
+PEER_ALLOWED_IPS=10.77.0.0/24
 ENV_FILE=.env
+NODE_NAME=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --port) PORT=$2; shift 2 ;;
         --subnet) SUBNET=$2; shift 2 ;;
         --peer-allowed-ips) PEER_ALLOWED_IPS=$2; shift 2 ;;
+        --name) NODE_NAME=$2; shift 2 ;;
         --env-file) ENV_FILE=$2; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+[ -n "$NODE_NAME" ] || NODE_NAME=$(hostname -s 2>/dev/null || echo exit)
 
 rand() { python3 -c "import random;print(random.randint($1,$2))"; }
 
@@ -36,7 +42,7 @@ if [ ! -f "$ENV_FILE" ]; then
 
     cat > "$ENV_FILE" <<EOF
 COMPOSE_PROJECT_NAME=saucewg-exit
-IMAGE_AWG=saucewg/awg:1.0.0
+IMAGE_AWG=saucewg/awg:1.1.0
 
 AWG_IFACE=awg0
 AWG_PORT=${PORT}
@@ -71,6 +77,34 @@ docker compose -f docker-compose.exit.yml --env-file "$ENV_FILE" build
 docker compose -f docker-compose.exit.yml --env-file "$ENV_FILE" up -d
 
 echo
-echo "Exit node started. Public parameters for the entry node:"
 sleep 4
-docker compose -f docker-compose.exit.yml --env-file "$ENV_FILE" exec -T awg cat /etc/amnezia/amneziawg/awg0.params
+
+PARAMS=$(docker compose -f docker-compose.exit.yml --env-file "$ENV_FILE" \
+    exec -T awg cat /etc/amnezia/amneziawg/awg0.params)
+
+PUBLIC_IP=$(curl -fsS --max-time 5 https://api.ipify.org || echo "REPLACE_WITH_THIS_SERVERS_IP")
+
+# Emit the entry that goes straight into the entry node's config/exit-nodes.json.
+echo "Exit node started. Add this object to the entry node's exit-nodes.json:"
+echo
+printf '%s\n' "$PARAMS" | awk -v name="$NODE_NAME" -v ip="$PUBLIC_IP" '
+    BEGIN { FS = "=" }
+    { p[$1] = $2 }
+    END {
+        printf "  {\n"
+        printf "    \"name\": \"%s\",\n", name
+        printf "    \"endpoint\": \"%s:%s\",\n", ip, p["SERVER_PORT"]
+        printf "    \"public_key\": \"%s\",\n", p["SERVER_PUBLIC_KEY"]
+        printf "    \"priority\": 10,\n"
+        printf "    \"s1\": %s,\n", p["SERVER_S1"]
+        printf "    \"s2\": %s,\n", p["SERVER_S2"]
+        printf "    \"h1\": %s,\n", p["SERVER_H1"]
+        printf "    \"h2\": %s,\n", p["SERVER_H2"]
+        printf "    \"h3\": %s,\n", p["SERVER_H3"]
+        printf "    \"h4\": %s\n", p["SERVER_H4"]
+        printf "  }\n"
+    }'
+echo
+echo "Then install the uplink public key the entry node prints for this slot into"
+echo "AWG_PEER_PUBLIC_KEY here and restart:"
+echo "  docker compose -f docker-compose.exit.yml up -d --force-recreate"

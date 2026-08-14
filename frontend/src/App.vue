@@ -53,6 +53,7 @@ onUnmounted(() => window.removeEventListener('saucewg:unauthorized', onUnauthori
       <nav class="nav">
         <RouterLink to="/">Dashboard</RouterLink>
         <RouterLink to="/clients">Clients</RouterLink>
+        <RouterLink to="/exit-nodes">Exit nodes</RouterLink>
         <RouterLink to="/settings">Node</RouterLink>
         <RouterLink v-if="store.admin?.is_sudo" to="/admins">Admins</RouterLink>
       </nav>

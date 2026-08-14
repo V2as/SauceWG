@@ -1,0 +1,30 @@
+[
+  {
+    "name": "eu-nl",
+    "endpoint": "198.51.100.20:51820",
+    "public_key": "REPLACE_WITH_THE_EXIT_NODE_PUBLIC_KEY=",
+    "preshared_key": "",
+    "address": "10.77.0.2/32",
+    "priority": 10,
+    "s1": 96,
+    "s2": 40,
+    "h1": 1148643707,
+    "h2": 1420633205,
+    "h3": 1817636915,
+    "h4": 1996553108
+  },
+  {
+    "name": "eu-de",
+    "endpoint": "203.0.113.31:51820",
+    "public_key": "REPLACE_WITH_THE_EXIT_NODE_PUBLIC_KEY=",
+    "preshared_key": "",
+    "address": "10.77.0.3/32",
+    "priority": 20,
+    "s1": 71,
+    "s2": 118,
+    "h1": 1259421841,
+    "h2": 1732298144,
+    "h3": 1035461285,
+    "h4": 1512994177
+  }
+]

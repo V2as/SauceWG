@@ -39,6 +39,9 @@ class Settings(BaseSettings):
 
     cascade_enabled: bool = True
     cascade_iface: str = "awg1"
+    # The node container republishes uplinks.json on every health tick; anything
+    # older than this means its monitor stopped.
+    uplink_state_max_age_seconds: int = 60
 
     # --- generated client configs ---------------------------------------
     client_dns: str = "1.1.1.1, 1.0.0.1"
@@ -88,6 +91,14 @@ class Settings(BaseSettings):
     @property
     def cascade_params_file(self) -> str:
         return f"{self.awg_config_dir}/{self.cascade_iface}.params"
+
+    @property
+    def uplink_state_file(self) -> str:
+        return f"{self.awg_socket_dir}/uplinks.json"
+
+    @property
+    def uplink_control_file(self) -> str:
+        return f"{self.awg_socket_dir}/uplink-control.json"
 
 
 @lru_cache

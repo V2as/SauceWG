@@ -9,9 +9,10 @@ from fastapi import APIRouter, Query
 from sqlalchemy import func, select
 
 from .. import __version__
-from ..awg import cascade_device
+from ..awg import device_for
 from ..awg.node import load_cascade_params, load_server_params
 from ..awg.uapi import UAPIError
+from ..awg.uplinks import load_uplink_state
 from ..config import settings
 from ..deps import AdminDep, SessionDep
 from ..models import Client, ClientStatus, NodeUsage
@@ -29,24 +30,53 @@ router = APIRouter(tags=["system"])
 
 
 async def build_cascade_status() -> CascadeStatus:
-    params = load_cascade_params()
-    endpoint = params.get("UPLINK_ENDPOINT")
+    """Summarises the uplink the client traffic is currently leaving through."""
+    state = load_uplink_state()
     status = CascadeStatus(
         enabled=settings.cascade_enabled,
         connected=False,
         iface=settings.cascade_iface,
-        endpoint=endpoint,
-        exit_ip=endpoint.rsplit(":", 1)[0] if endpoint else None,
+        mode=state.mode,
+        nodes_total=len(state.nodes),
+        nodes_healthy=sum(1 for node in state.nodes if node.healthy),
     )
     if not settings.cascade_enabled:
         return status
 
+    if not state.nodes:
+        return await _legacy_cascade_status(status)
+
+    active = state.active_node
+    if active is None:
+        return status
+
+    status.node = active.name
+    status.iface = active.iface
+    status.endpoint = active.endpoint
+    status.exit_ip = active.exit_ip
+    status.peer_public_key = active.peer_public_key
+    status.last_handshake_at = active.last_handshake
+    status.rx_bytes = active.rx_bytes
+    status.tx_bytes = active.tx_bytes
+    # A stale state file means the node's monitor stopped, so its verdict on the
+    # link cannot be trusted any more.
+    status.connected = active.healthy and not state.stale
+    return status
+
+
+async def _legacy_cascade_status(status: CascadeStatus) -> CascadeStatus:
+    """Fallback for a node container that predates the multi-uplink state file."""
+    params = load_cascade_params()
+    endpoint = params.get("UPLINK_ENDPOINT")
+    status.endpoint = endpoint
+    status.exit_ip = endpoint.rsplit(":", 1)[0] if endpoint else None
+
     try:
-        state = await cascade_device.get()
+        device = await device_for(settings.cascade_iface).get()
     except UAPIError:
         return status
 
-    for peer in state.peers.values():
+    for peer in device.peers.values():
         status.peer_public_key = peer.public_key
         status.last_handshake_at = peer.last_handshake
         status.rx_bytes = peer.rx_bytes

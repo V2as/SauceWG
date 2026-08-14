@@ -119,6 +119,41 @@ class CascadeStatus(BaseModel):
     rx_bytes: int = 0
     tx_bytes: int = 0
     exit_ip: str | None = None
+    # Which of the configured exit nodes is carrying traffic right now.
+    node: str | None = None
+    mode: str = "auto"
+    nodes_total: int = 0
+    nodes_healthy: int = 0
+
+
+class ExitNode(BaseModel):
+    name: str
+    iface: str
+    address: str
+    priority: int
+    endpoint: str | None = None
+    exit_ip: str | None = None
+    # The entry node's own key for this uplink; install it on the exit node.
+    public_key: str
+    peer_public_key: str | None = None
+    paired: bool
+    healthy: bool
+    active: bool
+    last_handshake_at: datetime | None = None
+    latency_ms: float | None = None
+    rx_bytes: int = 0
+    tx_bytes: int = 0
+
+
+class ExitNodeList(BaseModel):
+    mode: str
+    active: str | None = None
+    pinned: str | None = None
+    killswitch: bool = True
+    # True when the node container stopped refreshing its state file.
+    stale: bool = False
+    updated_at: datetime | None = None
+    nodes: list[ExitNode]
 
 
 class SystemStats(BaseModel):

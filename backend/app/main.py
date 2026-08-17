@@ -17,6 +17,7 @@ from .routers import admins, auth, clients, nodes, subscription, system
 from .security import hash_password
 from .services.collector import collect, purge_old_usage
 from .services.sync import sync_peers
+from .services.tasks import tasks
 
 logging.basicConfig(
     level=settings.log_level.upper(),
@@ -92,7 +93,7 @@ async def lifespan(app: FastAPI):
 
     await seed_admin()
 
-    tasks = [
+    workers = [
         asyncio.create_task(collector_loop()),
         asyncio.create_task(sync_loop()),
         asyncio.create_task(housekeeping_loop()),
@@ -101,9 +102,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task in tasks:
+        await tasks.shutdown()
+        for task in workers:
             task.cancel()
-        for task in tasks:
+        for task in workers:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 

@@ -1,3 +1,6 @@
+# Build context is the repository root: the panel ships the installer script so it
+# can provision an exit node over SSH with exactly the code an operator would run.
+
 FROM python:3.12-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -10,10 +13,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
+COPY backend/app ./app
+COPY saucewg.sh /app/assets/saucewg.sh
 
 EXPOSE 8000
 

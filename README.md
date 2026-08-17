@@ -1,6 +1,6 @@
 # SauceWG
 
-A Marzban-style control panel for an **AmneziaWG legacy** cascade ("double VPN").
+A Marzban-style control panel for an **AmneziaWG** cascade ("double VPN").
 
 Clients connect to an entry node whose IP is not blocked by the censor. The entry node
 does not reach the internet directly: it forwards everything through a second obfuscated
@@ -16,7 +16,7 @@ stops answering.
    client                 entry node (unblocked IP)                exit nodes
  ┌────────┐  AmneziaWG   ┌───────────────────────┐  awg1  ┌──────────────┐
  │ phone  │ ───────────▶ │ awg0  10.8.0.1/24     │───────▶│ eu-nl  prio 10│──▶ internet
- │ laptop │   legacy     │ awg1  10.77.0.2/32    │  awg2  ├──────────────┤
+ │ laptop │   1.0 – 2.0  │ awg1  10.77.0.2/32    │  awg2  ├──────────────┤
  └────────┘              │ awg2  10.77.0.3/32    │╌╌╌╌╌╌▶ │ eu-de  prio 20│  (standby)
                          │ panel · api · caddy   │  awgN  ├──────────────┤
                          └───────────────────────┘╌╌╌╌╌╌▶ │ …             │  (standby)
@@ -24,13 +24,36 @@ stops answering.
 ```
 
 Integrating this into a larger system? [`AWG_USAGE.md`](AWG_USAGE.md) is the reference
-for driving the panel from a central API.
+for managing *users* from a central API, and [`SAUCEWG_USAGE.md`](SAUCEWG_USAGE.md) for
+installing and managing *servers* — from a shell, a script or a bot.
 
-## Why "legacy"
+## AmneziaWG generations
 
-AmneziaWG has two protocol generations. This project pins the **legacy (AWG 1.x)** line —
-`amneziawg-go` v0.2.x with `amneziawg-tools` v1.0.x — which uses the original obfuscation
-set and is understood by every AmneziaVPN client in the wild:
+Which generation a tunnel speaks is not a version number sent on the wire — it is decided
+entirely by which obfuscation parameters the `[Interface]` section carries. That is also
+how AmneziaVPN and KeeneticOS tell them apart, and it is why a profile can only be loaded
+into a client that understands every parameter in it.
+
+SauceWG serves the three generations that router firmware can load, and defaults new
+installations to **2.0**:
+
+| Generation | Parameters on top of WireGuard | KeeneticOS |
+| --- | --- | --- |
+| `1.0` | `Jc` `Jmin` `Jmax` `S1` `S2` `H1`–`H4` | 4.2 Alpha 2 and newer |
+| `1.5` | the same, plus `I1` | 5.1 Alpha 3 and newer |
+| `2.0` | the same, plus `I1` `S3` `S4` | 5.1 Alpha 3 and newer |
+
+Loading a 1.5 or 2.0 profile into KeeneticOS 5.0.8 or older fails with
+`"Wireguard": invalid H1 value` — the firmware is not rejecting `H1`, it simply does not
+recognise the parameters that come with the newer generations. 5.1 is a developer-channel
+build for most models; if a router cannot be moved to it, that node stays on 1.0, which
+[Amnezia's own instructions](https://docs.amnezia.org/ru/documentation/instructions/keenetic-os-awg/)
+also note is the more blockable of the three. AmneziaVPN calls 1.0 **AmneziaWG Legacy**;
+`legacy` is accepted as a spelling of `1.0` everywhere in SauceWG for that reason.
+
+AmneziaWG 3.0 — header protection, content padding, custom timings — is deliberately
+absent. No router firmware speaks it, so a 3.0 profile could not be loaded into a
+Keenetic at all.
 
 | Parameter | Meaning | Must match on both sides |
 | --- | --- | --- |
@@ -38,12 +61,41 @@ set and is understood by every AmneziaVPN client in the wild:
 | `Jmin` / `Jmax` | junk packet size range in bytes | no |
 | `S1` | padding of the handshake initiation (`S1 + 56 != S2`) | **yes** |
 | `S2` | padding of the handshake response | **yes** |
+| `S3` / `S4` | padding of the cookie reply and of every transport packet | **yes** |
 | `H1`–`H4` | replacement values for the four packet type headers | **yes** |
+| `I1`–`I5` | signature packets sent ahead of the handshake | no |
 
-The v3.x line (`I1`–`I5` signature packets, `S3`/`S4`, header protection) is deliberately
-not used. The panel copies `S1`, `S2` and `H1`–`H4` verbatim into every generated client
-profile, and may hand out a different junk profile via `CLIENT_JC` / `CLIENT_JMIN` /
-`CLIENT_JMAX`.
+The asymmetry matters for what a profile has to contain. `S1`–`S4` change how long each
+message is and `H1`–`H4` change its type header, so a mismatch is a tunnel that never
+handshakes — the panel copies those verbatim into every client profile. Junk packets and
+signature packets are only ever *built* by the sender and never parsed by the receiver, so
+each side may use its own: the entry node keeps its own `I1` disguise while handing clients
+whatever `CLIENT_SIGNATURE`, `CLIENT_JC`, `CLIENT_JMIN` and `CLIENT_JMAX` say.
+
+A signature packet is what a censor's classifier sees first, so `I1` is chosen from a
+preset rather than written by hand — `quic` (the default, matching the entry node's UDP/443),
+`dns`, `random`, `short`, or `none`. `saucewg signatures` lists them; a literal
+`<b 0x…><r n>` spec is accepted anywhere a preset name is.
+
+Every node, uplink and client profile carries its own generation, so a cascade can serve
+2.0 to phones while an uplink to an older exit node stays on 1.0. Moving a node between
+generations is one command (`saucewg set-protocol`, or the **⇅** button on the Exit nodes
+page) and only adds or drops parameters — the padding both ends already agreed on is
+kept, so the tunnel is not rekeyed.
+
+The node image pins `amneziawg-go` v0.2.x with `amneziawg-tools` v1.0.x, which implement
+all three; `scripts/test-protocol-parity.sh` in CI keeps the three places that describe a
+generation from drifting apart.
+
+> **A client-facing 2.0 interface pads by zero.** `S3` and `S4` default to `0` on the
+> interface app clients dial, because the AmneziaVPN app has an
+> [open bug](https://github.com/amnezia-vpn/amnezia-client/issues/2582) where it does not
+> hand non-zero `S3`/`S4` to its own backend: it strips no padding from transport packets
+> that have it, so the handshake completes and nothing flows. The profile is still a valid
+> 2.0 one, and routers using the AmneziaWG kernel module (Keenetic among them) work either
+> way. Cascade hops keep real padding — both ends there run `amneziawg-go`, which honours
+> it, and that is the hop a censor actually sees. Pin `AWG_S3`/`AWG_S4` in `.env` if every
+> client you serve is a router.
 
 ## Components
 
@@ -62,76 +114,106 @@ a reconciliation loop re-applies every peer after a node restart.
 
 ### 1. Entry node
 
-```bash
-git clone <this repo> /opt/saucewg && cd /opt/saucewg
-cp .env.example .env
-```
-
-Fill in at least:
-
-```ini
-ADMIN_PASSWORD=...              # openssl rand -base64 18
-JWT_SECRET=...                  # openssl rand -hex 32
-POSTGRES_PASSWORD=...           # openssl rand -hex 24
-AWG_ENDPOINT_HOST=<entry ip>
-```
-
-Then:
+On a bare server, as root:
 
 ```bash
-./scripts/bootstrap-entry.sh --endpoint-host <entry ip>
+bash <(curl -fsSL https://raw.githubusercontent.com/V2as/SauceWG/main/saucewg.sh) \
+  install --domain panel.example.com
 ```
 
-The entry node starts with one unpaired uplink, so it is up and serving the panel
-before any exit node exists.
+That installs Docker if it is missing, writes `/opt/saucewg`, starts everything and
+prints the panel URL with a generated admin password. `--domain` gets an automatic
+Let's Encrypt certificate; leave it out to serve the panel over plain HTTP by IP.
 
-### 2. Exit node
+The entry node comes up on AmneziaWG 2.0 with no exit nodes, so the panel is usable
+immediately. Add `--protocol 1.0` if the clients that will connect are routers on
+KeeneticOS 5.0.8 or older — it can also be changed later with `saucewg set-protocol`.
+
+### 2. Exit nodes
+
+From the panel: **Exit nodes → Add exit node**, then give it a name, the server's IP
+and its root password. SauceWG installs everything over SSH, joins the node to the
+cascade, pairs both ends and waits for the first handshake, streaming the log as it
+goes. The password is used once and never stored: the panel leaves an SSH key of its
+own on the server, so managing it afterwards — status, logs, restart, upgrade, or
+moving it to another AmneziaWG generation — needs no credentials at all. Preload that
+key (**Exit nodes → This panel's SSH key**, or `GET /api/nodes/ssh-key`) into a new
+server at creation time and even the install needs no password.
+
+The whole of that is API, not just UI, so a bot adds a node in another country with
+one call to the entry node and no shell anywhere — see
+[`SAUCEWG_USAGE.md` §5](SAUCEWG_USAGE.md#5-driving-it-from-a-bot).
+
+By hand, if you prefer — on the new exit server:
 
 ```bash
-git clone <this repo> /opt/saucewg && cd /opt/saucewg
-./scripts/bootstrap-exit.sh --name eu-nl --port 51820
+bash <(curl -fsSL https://raw.githubusercontent.com/V2as/SauceWG/main/saucewg.sh) \
+  install-node --name eu-nl              # add --protocol 1.0 to pair with an older entry node
 ```
 
-It prints a ready-made JSON object describing itself — public key, endpoint and
-obfuscation profile.
-
-### 3. Pair the two
-
-On the entry node, paste that object in:
+It prints a JSON object describing itself. On the entry server:
 
 ```bash
-./scripts/add-exit-node.sh --json '{"name":"eu-nl","endpoint":"…","public_key":"…", …}'
+saucewg add-node --json '{"name":"eu-nl","endpoint":"…","public_key":"…", …}'
 ```
 
-The script assigns the node a free uplink address and a priority, restarts the node
-container and prints the entry node's uplink public key for that slot. Install it on the
-exit node:
+which allocates an uplink address and a priority and prints the entry node's uplink
+key for that slot. Back on the exit server:
 
 ```bash
-# on the exit node
-sed -i "s|^AWG_PEER_PUBLIC_KEY=.*|AWG_PEER_PUBLIC_KEY=<entry uplink key>|" .env
-docker compose -f docker-compose.exit.yml up -d --force-recreate
+saucewg node-pair --peer-key '<that key>'
 ```
 
-Repeat steps 2 and 3 for every additional exit node. Each gets its own interface, key
-pair and obfuscation profile on the entry node.
+Adding or removing a node takes effect within a second and restarts nothing.
 
-Optionally add a pre-shared key to an uplink for post-quantum resistance: generate it
-once with `docker run --rm --entrypoint awg saucewg/awg:1.1.0 genpsk`, then set
-`AWG_PEER_PSK` on the exit node and `preshared_key` on that node's entry in
-`config/exit-nodes.json`.
+Optionally add a pre-shared key to an uplink for post-quantum resistance: generate one
+with `docker run --rm --entrypoint awg saucewg/awg:1.3.0 genpsk` and pass it as
+`--psk` to `install-node` and `preshared_key` in the object above.
 
 Private keys are generated inside the node container on first start and persisted in the
 `awg-config` volume. They never need to be typed into `.env`.
 
-### 4. Sign in
+### 3. Sign in
 
-Open `http://<entry ip>/` and log in with `ADMIN_USERNAME` / `ADMIN_PASSWORD`. Create a
-client, then hand out the `.conf` file, the QR code, or the subscription link.
+Open the URL the installer printed and log in. Create a client, then hand out the
+`.conf` file, the QR code, or the subscription link.
 
-> Serving the panel over plain HTTP sends the admin password in the clear. Point a domain
-> at the entry node and set `PANEL_SITE_ADDRESS=panel.example.com` with
-> `CADDY_AUTO_HTTPS=on` to get an automatic Let's Encrypt certificate.
+> Serving the panel over plain HTTP sends the admin password in the clear. Re-run the
+> installer with `--domain`, or set `PANEL_SITE_ADDRESS` and `CADDY_AUTO_HTTPS=on` in
+> `.env`, to get TLS.
+
+### Managing the server afterwards
+
+The installer leaves a `saucewg` command behind on both roles:
+
+```bash
+saucewg status                 # what is running
+saucewg start | stop | restart
+saucewg logs -f awg            # awg, panel, postgres, caddy
+saucewg update                 # pull newer images and recreate
+saucewg nodes                  # the cascade, with health
+saucewg protocol               # which AmneziaWG generation this node serves
+saucewg set-protocol 2.0       # move it to another one
+saucewg admin-password         # reset panel credentials
+saucewg info                   # the same, as JSON, for monitoring
+```
+
+[`SAUCEWG_USAGE.md`](SAUCEWG_USAGE.md) documents every command and flag, the JSON
+contracts for automating installs, and the node management API.
+
+### From a git checkout
+
+For development, or to run modified images, the repository still works the classic way:
+
+```bash
+cp .env.example .env            # fill in ADMIN_PASSWORD, JWT_SECRET, POSTGRES_PASSWORD
+./scripts/bootstrap-entry.sh --endpoint-host <entry ip> [--protocol 1.0]
+./scripts/bootstrap-exit.sh --name eu-nl        # on an exit server
+./scripts/add-exit-node.sh --json '{…}'         # on the entry server
+```
+
+Both bootstrap scripts source `docker/awg/lib.sh` for their obfuscation profile, so the
+`.env` they write is the same one the container would have generated for itself.
 
 ## API
 
@@ -159,33 +241,53 @@ curl -H "Authorization: Bearer $TOKEN" http://<host>/api/clients
 | `GET` | `/api/clients/{name}/qr` | the profile as a PNG QR code |
 | `GET` | `/api/clients/{name}/usage?hours=` | per-bucket traffic history |
 | `GET` | `/api/nodes` | exit node inventory with health, latency and which one is active |
+| `POST` | `/api/nodes` | install an exit node on a server over SSH (returns a task) |
+| `GET` | `/api/nodes/ssh-key` | the panel's public SSH key, to preload onto a new server |
+| `POST` | `/api/nodes/check` | pre-flight a server: reachable, root, what it is, what is on it |
+| `POST` | `/api/nodes/adopt` | register an exit node installed by hand |
+| `PUT/DELETE` | `/api/nodes/{name}` | change priority, endpoint or note / remove it |
+| `POST` | `/api/nodes/{name}/repair` | reinstall the uplink key on an unpaired node |
+| `POST` | `/api/nodes/{name}/protocol` | move a node to another AmneziaWG generation over SSH |
+| `GET` | `/api/nodes/{name}/status` | the exit server as it describes itself: containers, version, host |
+| `GET` | `/api/nodes/{name}/logs` | the tail of that server's container logs |
+| `POST` | `/api/nodes/{name}/restart\|start\|stop` | control the exit node's containers |
+| `POST` | `/api/nodes/{name}/upgrade` | pull newer images on the exit server |
+| `GET` | `/api/nodes/tasks[/{id}]` | progress and logs of a provisioning operation |
 | `POST` | `/api/nodes/{name}/activate` | prefer one exit node |
 | `POST` | `/api/nodes/auto` | drop the preference, back to priority order |
 | `GET` | `/api/system` | host stats, client counts, live speed, cascade state |
 | `GET` | `/api/system/usage?hours=` | node-wide traffic history |
 | `POST` | `/api/system/sync` | force peer reconciliation |
-| `GET` | `/api/settings` | interface and obfuscation parameters |
+| `GET` | `/api/settings` | interface, AmneziaWG generation and obfuscation parameters |
 | `GET` | `/sub/{token}` | the client profile, no admin auth required |
 
 Interactive docs are at `/api/docs` when `DOCS_ENABLED=true`.
-[`AWG_USAGE.md`](AWG_USAGE.md) documents every field and its semantics.
+[`AWG_USAGE.md`](AWG_USAGE.md) documents every field and its semantics;
+[`SAUCEWG_USAGE.md`](SAUCEWG_USAGE.md) covers the node management calls in detail.
 
 ## Exit nodes and failover
 
-The exit node list lives in `config/exit-nodes.json` (or inline in
-`CASCADE_NODES_JSON`). Each entry becomes its own interface — `awg1`, `awg2`, … — with
-its own persistent key pair and obfuscation profile. All of them handshake continuously;
-only the one named in the client policy-routing table carries traffic.
+The exit node list lives in `config/exit-nodes.json`, which the panel, the `saucewg`
+command and the node container all share. Each entry becomes its own interface —
+`awg1`, `awg2`, … — with its own persistent key pair and obfuscation profile. All of
+them handshake continuously; only the one named in the client policy-routing table
+carries traffic.
 
 ```json
 [
   { "name": "eu-nl", "endpoint": "198.51.100.20:51820", "public_key": "…=",
-    "address": "10.77.0.2/32", "priority": 10, "s1": 96, "s2": 40,
-    "h1": 1148643707, "h2": 1420633205, "h3": 1817636915, "h4": 1996553108 },
+    "address": "10.77.0.2/32", "priority": 10, "protocol": "2.0",
+    "s1": 96, "s2": 40, "s3": 31, "s4": 12,
+    "h1": 1148643707, "h2": 1420633205, "h3": 1817636915, "h4": 1996553108,
+    "i1": "<b 0xc30000000108><r 8><b 0x08><r 8><b 0x0045dc><t><r 16>" },
   { "name": "eu-de", "endpoint": "203.0.113.31:51820", "public_key": "…=",
-    "address": "10.77.0.3/32", "priority": 20, "…": "…" }
+    "address": "10.77.0.3/32", "priority": 20, "protocol": "1.0", "…": "…" }
 ]
 ```
+
+An entry with no `protocol` is read as 1.0 if it carries no `s3`/`s4`/`i1`, and otherwise
+as whichever generation its parameters describe — so a list written before this existed
+keeps working untouched.
 
 **Lower `priority` wins.** Every 10 seconds each uplink is checked: a handshake older
 than `CASCADE_HANDSHAKE_TIMEOUT` fails it outright, otherwise an ICMP probe is sent
@@ -200,13 +302,28 @@ tunnel to the entry node the whole time — they see a new exit IP, not a discon
 pin is a preference, not a lock: a pinned node that goes down is still failed over, and
 is taken back once it recovers.
 
-Two invariants when adding nodes by hand:
+Editing the list — from the panel, from `saucewg add-node`, or with a text editor —
+does not restart anything. The node container notices within a second and rebuilds only
+the interfaces whose configuration actually changed. Interface numbers are pinned per
+node name, so removing one node never renumbers the others, and a node whose process
+dies is rebuilt on the next tick.
 
-- `s1`, `s2` and `h1`–`h4` must be identical on both ends of an uplink, and different
-  between uplinks.
+Three invariants when adding nodes by hand:
+
+- `s1`–`s4` and `h1`–`h4` must be identical on both ends of an uplink, and different
+  between uplinks. `jc`/`jmin`/`jmax` and `i1` need not match.
+- `protocol` must be one the exit node actually serves. Both ends have to carry the same
+  parameters, and an exit node on 1.0 does not read `s3`, `s4` or `i1` at all.
 - an uplink's `address` must be inside that exit node's `AWG_SUBNET`, since the exit
   node's NAT rule is scoped to it. The defaults (`10.77.0.0/24` everywhere, `.2`, `.3`,
   `.4` … on the entry node) satisfy this.
+
+`saucewg add-node --json` from the exit node's own `install-node` output satisfies all
+three, and `saucewg update-node <name> --protocol …` moves an existing uplink.
+
+Setting `CASCADE_NODES_JSON` puts the list in the environment instead, which takes
+precedence over the file and makes the panel read-only with respect to the cascade —
+it says so on the Exit nodes page rather than silently ignoring your edits.
 
 ## Monitoring
 
@@ -257,16 +374,21 @@ Tagging a release adds semver tags, so `git tag v1.0.0 && git push --tags` also 
 `:1.0.0`, `:1.0` and `:1`. The three Docker Hub repositories are created automatically on
 first push; make them public in their settings if you want to pull without logging in.
 
-A second workflow, `.github/workflows/ci.yml`, runs on pull requests and builds the
-frontend, imports the backend, shellchecks the node scripts and validates both compose
-files. It needs no secrets.
+A second workflow, `.github/workflows/ci.yml`, runs on pull requests. It builds the
+frontend, shellchecks the scripts, validates the compose files in the repository and
+the ones `saucewg.sh` generates, and exercises the paths that are easy to break without
+noticing: the node container's live reload (`scripts/test-uplinks.sh`), the exit node API
+(`scripts/test-node-api.py`), and the fact that the node container, the panel and the
+installer still agree on what each AmneziaWG generation contains
+(`scripts/test-protocol-parity.sh`) — all against stubs rather than real servers. It
+needs no secrets.
 
 ### From your machine
 
 ```bash
-export IMAGE_AWG=yourname/saucewg-awg:1.1.0
-export IMAGE_PANEL=yourname/saucewg-panel:1.1.0
-export IMAGE_WEB=yourname/saucewg-web:1.1.0
+export IMAGE_AWG=yourname/saucewg-awg:1.3.0
+export IMAGE_PANEL=yourname/saucewg-panel:1.3.0
+export IMAGE_WEB=yourname/saucewg-web:1.3.0
 
 make build
 make push
@@ -294,14 +416,16 @@ workflow does.
 ## Layout
 
 ```
+saucewg.sh        installer and service CLI; also the /usr/local/bin/saucewg command
 backend/          FastAPI service (app/awg = UAPI client, app/services = workers)
 frontend/         Vue 3 + Vite single-page UI
-docker/awg/       AmneziaWG legacy node image: entrypoint, uplinks + failover monitor
+docker/awg/       AmneziaWG node image: entrypoint, generations, uplinks + failover monitor
 docker/caddy/     frontend build + Caddy reverse proxy image
-scripts/          bootstrap helpers and the exit node list manager
+scripts/          bootstrap helpers, the exit node list manager, CI test harnesses
 config/           exit-nodes.json, bind-mounted into the node container
 .github/workflows/  CI checks and the Docker Hub publish pipeline
-AWG_USAGE.md      integration reference for a central API
+AWG_USAGE.md      integration reference for managing users from a central API
+SAUCEWG_USAGE.md  installing and managing servers, from a shell or a bot
 docker-compose.yml       entry node: awg + panel + caddy + postgres
 docker-compose.exit.yml  exit node: awg only
 ```

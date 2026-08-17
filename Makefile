@@ -1,6 +1,6 @@
-IMAGE_AWG   ?= saucewg/awg:1.1.0
-IMAGE_PANEL ?= saucewg/panel:1.1.0
-IMAGE_WEB   ?= saucewg/web:1.1.0
+IMAGE_AWG   ?= saucewg/awg:1.3.0
+IMAGE_PANEL ?= saucewg/panel:1.3.0
+IMAGE_WEB   ?= saucewg/web:1.3.0
 PLATFORMS   ?=
 
 AWG_GO_REF    ?= v0.2.19
@@ -15,14 +15,14 @@ help:
 
 build: build-awg build-panel build-web ## Build all three images
 
-build-awg: ## Build the AmneziaWG legacy node image
+build-awg: ## Build the AmneziaWG node image
 	docker buildx build $(BUILDX_FLAGS) \
 		--build-arg AWG_GO_REF=$(AWG_GO_REF) \
 		--build-arg AWG_TOOLS_REF=$(AWG_TOOLS_REF) \
 		-t $(IMAGE_AWG) docker/awg
 
 build-panel: ## Build the FastAPI panel image
-	docker buildx build $(BUILDX_FLAGS) -t $(IMAGE_PANEL) backend
+	docker buildx build $(BUILDX_FLAGS) -f backend/Dockerfile -t $(IMAGE_PANEL) .
 
 build-web: ## Build the Vue UI + Caddy image
 	docker buildx build $(BUILDX_FLAGS) -f docker/caddy/Dockerfile -t $(IMAGE_WEB) .

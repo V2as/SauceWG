@@ -1,8 +1,10 @@
-# AmneziaWG "legacy" (AWG 1.x) userspace node.
+# AmneziaWG userspace node.
 #
-# The legacy line is amneziawg-go v0.2.x + amneziawg-tools v1.0.x, which speak the
-# original obfuscation set (Jc/Jmin/Jmax, S1/S2, H1-H4). The v3.x line is a different
-# generation of the protocol and is intentionally not used here.
+# amneziawg-go v0.2.x + amneziawg-tools v1.0.x implement every generation a router can
+# load: 1.0 (Jc/Jmin/Jmax, S1/S2, H1-H4), 1.5 (plus I1) and 2.0 (plus S3/S4). Which one
+# an interface speaks is decided per interface at runtime by entrypoint.sh, so one image
+# serves all three. The v3.x line is a protocol no router firmware speaks and is
+# intentionally not built here.
 
 ARG AWG_GO_REF=v0.2.19
 ARG AWG_TOOLS_REF=v1.0.20260618-2

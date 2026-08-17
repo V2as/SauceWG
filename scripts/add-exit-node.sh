@@ -137,7 +137,7 @@ fi
 
 if [ -z "$PRIORITY" ] && ! printf '%s' "$NODE" | jq -e 'has("priority")' >/dev/null; then
     # Append below every existing node so the current exit keeps carrying traffic.
-    PRIORITY=$(jq '[.[].priority // 100] | (max // 0) + 10' "$LIST_FILE")
+    PRIORITY=$(jq '[.[] | .priority // 100] | (max // 0) + 10' "$LIST_FILE")
 fi
 
 jq --argjson node "$NODE" \

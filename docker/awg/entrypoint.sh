@@ -22,6 +22,7 @@ SERVER_PARAMS_FILE="${AWG_CONFIG_DIR}/${AWG_IFACE}.params"
 SERVER_KEY_FILE="${AWG_CONFIG_DIR}/${AWG_IFACE}.key"
 
 PIDS=()
+SERVER_PID=0
 
 # shellcheck source=uplinks.sh
 . /usr/local/lib/awg-uplinks.sh
@@ -45,36 +46,65 @@ setup_server_iface() {
     SERVER_PRIVATE_KEY=$AWG_PRIVATE_KEY
     SERVER_PUBLIC_KEY=$(awg_pubkey "$SERVER_PRIVATE_KEY")
 
-    for suffix in JC JMIN JMAX S1 S2 H1 H2 H3 H4; do
+    local suffix
+    for suffix in $AWG_OBF_SUFFIXES; do
         local env_name="AWG_${suffix}" saved_name="SERVER_${suffix}"
         if [ -z "${!env_name:-}" ] && [ -n "${!saved_name:-}" ]; then
             printf -v "$env_name" '%s' "${!saved_name}"
         fi
     done
-    generate_obfuscation "AWG_"
+
+    # An installation that predates protocol selection has a profile but no
+    # generation recorded, and it is serving 1.0 clients right now — so it stays on
+    # 1.0 until someone asks for something else. Only a genuinely new interface
+    # gets the current default.
+    if [ -z "${AWG_PROTOCOL:-}" ]; then
+        if [ -n "${SERVER_PROTOCOL:-}" ]; then
+            AWG_PROTOCOL=$SERVER_PROTOCOL
+        elif [ -n "${SERVER_S1:-}" ]; then
+            AWG_PROTOCOL=1.0
+            log "no protocol recorded for ${AWG_IFACE}; keeping the existing AmneziaWG 1.0 profile"
+        else
+            AWG_PROTOCOL=$AWG_PROTOCOL_DEFAULT
+        fi
+    fi
+    SERVER_PROTOCOL=$(awg_protocol "$AWG_PROTOCOL") \
+        || die "AWG_PROTOCOL=${AWG_PROTOCOL} is not an AmneziaWG generation this node can serve (1.0, 1.5 or 2.0)"
+    AWG_PROTOCOL=$SERVER_PROTOCOL
+
+    # Only an entry node's server interface is dialled by app clients; an exit node's
+    # is dialled by the entry node, which speaks the protocol in full.
+    local peers=nodes
+    [ "$AWG_ROLE" = "entry" ] && peers=clients
+    generate_obfuscation "AWG_" "$SERVER_PROTOCOL" "$peers"
 
     # params_store reads these by name, so shellcheck cannot see the use.
     # shellcheck disable=SC2034
     {
-        SERVER_JC=$AWG_JC; SERVER_JMIN=$AWG_JMIN; SERVER_JMAX=$AWG_JMAX
-        SERVER_S1=$AWG_S1; SERVER_S2=$AWG_S2
-        SERVER_H1=$AWG_H1; SERVER_H2=$AWG_H2; SERVER_H3=$AWG_H3; SERVER_H4=$AWG_H4
         SERVER_PORT=$AWG_PORT
         SERVER_SUBNET=$AWG_SUBNET
         SERVER_MTU=$AWG_MTU
     }
     SERVER_ADDRESS=$(first_host "$AWG_SUBNET")
 
-    params_store "$SERVER_PARAMS_FILE" \
-        SERVER_PUBLIC_KEY SERVER_PORT SERVER_SUBNET SERVER_ADDRESS SERVER_MTU \
-        SERVER_JC SERVER_JMIN SERVER_JMAX SERVER_S1 SERVER_S2 SERVER_H1 SERVER_H2 SERVER_H3 SERVER_H4
+    # The panel reads these to render client profiles, so every parameter of the
+    # generation in force has to be mirrored here — including the ones that were
+    # cleared, so it stops handing out a profile the interface no longer speaks.
+    local stored=(SERVER_PUBLIC_KEY SERVER_PORT SERVER_SUBNET SERVER_ADDRESS SERVER_MTU SERVER_PROTOCOL)
+    local source_name
+    for suffix in $AWG_OBF_SUFFIXES; do
+        source_name="AWG_${suffix}"
+        printf -v "SERVER_${suffix}" '%s' "${!source_name:-}"
+        stored+=("SERVER_${suffix}")
+    done
+    params_store "$SERVER_PARAMS_FILE" "${stored[@]}"
 
     local conf="${AWG_CONFIG_DIR}/${AWG_IFACE}.conf"
     {
         echo "[Interface]"
         echo "PrivateKey = ${SERVER_PRIVATE_KEY}"
         echo "ListenPort = ${AWG_PORT}"
-        emit_obfuscation "AWG_"
+        emit_obfuscation "AWG_" "$SERVER_PROTOCOL"
         # Static peers (the cascade uplink on an exit node). Runtime clients are
         # managed by the panel over the UAPI socket and are deliberately not listed.
         if [ -n "${AWG_PEER_PUBLIC_KEY:-}" ]; then
@@ -92,12 +122,14 @@ setup_server_iface() {
     chmod 0600 "$conf"
 
     amneziawg-go -f "$AWG_IFACE" &
-    PIDS+=("$!")
-    wait_for_socket "$AWG_IFACE"
+    SERVER_PID=$!
+    PIDS+=("$SERVER_PID")
+    wait_for_socket "$AWG_IFACE" || die "timed out waiting for the ${AWG_IFACE} UAPI socket"
     awg setconf "$AWG_IFACE" "$conf"
-    iface_up "$AWG_IFACE" "$SERVER_ADDRESS" "$AWG_MTU"
+    iface_up "$AWG_IFACE" "$SERVER_ADDRESS" "$AWG_MTU" \
+        || die "could not bring ${AWG_IFACE} up on ${SERVER_ADDRESS}"
     ip -4 route replace "$AWG_SUBNET" dev "$AWG_IFACE"
-    log "${AWG_IFACE} up on ${SERVER_ADDRESS} port ${AWG_PORT} (pub ${SERVER_PUBLIC_KEY})"
+    log "${AWG_IFACE} up on ${SERVER_ADDRESS} port ${AWG_PORT} speaking AmneziaWG ${SERVER_PROTOCOL} (pub ${SERVER_PUBLIC_KEY})"
 }
 
 # ---------------------------------------------------------------------------
@@ -121,8 +153,12 @@ setup_exit_routing() {
 }
 
 teardown() {
+    local i
     log "shutting down"
     if [ "$AWG_ROLE" = "entry" ] && [ "$CASCADE_ENABLED" = "true" ]; then
+        for i in "${!UP_PID[@]}"; do
+            [ "${UP_PID[$i]}" -gt 0 ] 2>/dev/null && kill "${UP_PID[$i]}" 2>/dev/null
+        done
         uplinks_teardown
     fi
     ip link del "$AWG_IFACE" 2>/dev/null || true
@@ -146,8 +182,9 @@ do_run() {
         return
     fi
 
-    uplinks_parse
-    [ "$(uplink_count)" -gt 0 ] || die "CASCADE_ENABLED=true but no exit node is configured"
+    # An empty list still yields one unpaired uplink, so the panel comes up — and can
+    # be used to add the first exit node — before any exit node exists.
+    uplinks_parse || die "CASCADE_ENABLED=true but the exit node list is unusable: ${CONFIG_ERROR}"
 
     uplinks_setup_all
     uplinks_routing_base
@@ -160,12 +197,11 @@ do_run() {
     uplink_activate "$initial"
     uplinks_write_state
 
-    uplinks_monitor &
-    PIDS+=("$!")
-
     log "node ready (role=entry, uplinks=$(uplink_count))"
-    wait -n "${PIDS[@]}"
-    log "a node process exited, stopping container"
+    # The monitor stays in the foreground: it has to be the parent of every uplink
+    # process so it can restart and reap them while reconfiguring the cascade.
+    uplinks_monitor
+    log "the node monitor exited, stopping container"
 }
 
 do_healthcheck() {

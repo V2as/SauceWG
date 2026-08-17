@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 
 from .. import __version__
 from ..awg import device_for
+from ..awg import protocol as proto
 from ..awg.node import load_cascade_params, load_server_params
 from ..awg.uapi import UAPIError
 from ..awg.uplinks import load_uplink_state
@@ -180,6 +181,8 @@ async def node_settings(_: AdminDep) -> NodeSettings:
         client_dns=settings.client_dns,
         client_mtu=settings.client_mtu,
         client_allowed_ips=settings.client_allowed_ips,
+        protocol=server.protocol,
+        protocols_supported=list(proto.PROTOCOLS),
         obfuscation=server.obfuscation or {},
     )
 

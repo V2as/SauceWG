@@ -1,0 +1,20 @@
+# The panel and web images both build from the repository root, so keep the context
+# to what their Dockerfiles actually COPY.
+.git
+.github
+.idea
+.venv
+
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+
+# Never let a local deployment's secrets or state near a build context.
+.env
+.env.*
+!.env.example
+!.env.exit.example
+config/exit-nodes.json
+
+*.md

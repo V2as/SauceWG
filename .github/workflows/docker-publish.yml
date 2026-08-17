@@ -43,8 +43,9 @@ jobs:
           - name: awg
             context: docker/awg
             dockerfile: docker/awg/Dockerfile
+          # The panel image carries saucewg.sh, so it builds from the repository root.
           - name: panel
-            context: backend
+            context: .
             dockerfile: backend/Dockerfile
           - name: web
             context: .

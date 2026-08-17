@@ -38,6 +38,9 @@ class ExitNodeState:
     latency_ms: float | None = None
     rx_bytes: int = 0
     tx_bytes: int = 0
+    #: The AmneziaWG generation this uplink speaks. None from a node container that
+    #: predates generation selection, which is serving 1.0 either way.
+    protocol: str | None = None
 
     @property
     def paired(self) -> bool:
@@ -116,6 +119,7 @@ def load_uplink_state() -> UplinkState:
                     latency_ms=item.get("latency_ms"),
                     rx_bytes=int(item.get("rx_bytes", 0)),
                     tx_bytes=int(item.get("tx_bytes", 0)),
+                    protocol=item.get("protocol") or None,
                 )
             )
         except (KeyError, TypeError, ValueError) as exc:

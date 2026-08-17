@@ -3,14 +3,22 @@
 # project directory.
 #
 #   ./scripts/bootstrap-entry.sh --endpoint-host 203.0.113.10
+#   ./scripts/bootstrap-entry.sh --protocol 1.0     # for clients on older routers
 #
 # Writes .env if it does not exist, then builds and starts the whole stack. Exit
 # nodes are added afterwards with scripts/add-exit-node.sh — the entry node comes up
 # with one unpaired uplink so it can publish the key you need for the first one.
 # Secrets are generated locally on the server; only the admin password is printed.
+#
+# This is the git-checkout path; saucewg.sh is the installer for a real deployment.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# The obfuscation helpers come from the node image's own library, so the profile written
+# here is identical to one the container would have generated for itself.
+# shellcheck source=../docker/awg/lib.sh
+. docker/awg/lib.sh
 
 ENDPOINT_HOST=""
 PORT=443
@@ -18,6 +26,8 @@ SUBNET=10.8.0.0/24
 UPLINK_SUBNET=10.77.0.0/24
 HTTP_PORT=80
 ENV_FILE=.env
+PROTOCOL=$AWG_PROTOCOL_DEFAULT
+SIGNATURE=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -27,30 +37,40 @@ while [ $# -gt 0 ]; do
         --uplink-subnet) UPLINK_SUBNET=$2; shift 2 ;;
         --http-port) HTTP_PORT=$2; shift 2 ;;
         --env-file) ENV_FILE=$2; shift 2 ;;
+        --protocol) PROTOCOL=$2; shift 2 ;;
+        --signature) SIGNATURE=$2; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
-rand() { python3 -c "import random;print(random.randint($1,$2))"; }
+PROTOCOL=$(awg_protocol "$PROTOCOL") \
+    || { echo "unknown AmneziaWG generation: $PROTOCOL" >&2; exit 1; }
+
+# The .env spellings of the parameters this generation carries.
+emit_env_obfuscation() {
+    local suffix name
+    for suffix in $AWG_OBF_SUFFIXES; do
+        awg_protocol_has "$PROTOCOL" "$suffix" || continue
+        name="AWG_${suffix}"
+        printf 'AWG_%s=%s\n' "$suffix" "${!name:-}"
+    done
+}
 
 if [ ! -f "$ENV_FILE" ]; then
     [ -n "$ENDPOINT_HOST" ] || ENDPOINT_HOST=$(curl -fsS --max-time 5 https://api.ipify.org || echo "")
     [ -n "$ENDPOINT_HOST" ] || { echo "pass --endpoint-host" >&2; exit 1; }
 
-    S1=$(rand 15 150)
-    while :; do
-        S2=$(rand 15 150)
-        [ "$((S1 + 56))" -ne "$S2" ] && break
-    done
-    readarray -t H < <(python3 -c "import random;print('\n'.join(map(str, random.sample(range(5, 2147483647), 4))))")
+    # shellcheck disable=SC2034  # read indirectly by generate_obfuscation
+    AWG_I1=$SIGNATURE
+    generate_obfuscation AWG_ "$PROTOCOL" clients
 
     ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
 
     cat > "$ENV_FILE" <<EOF
 COMPOSE_PROJECT_NAME=saucewg
-IMAGE_AWG=saucewg/awg:1.1.0
-IMAGE_PANEL=saucewg/panel:1.1.0
-IMAGE_WEB=saucewg/web:1.1.0
+IMAGE_AWG=saucewg/awg:1.3.0
+IMAGE_PANEL=saucewg/panel:1.3.0
+IMAGE_WEB=saucewg/web:1.3.0
 
 PANEL_TITLE=SauceWG
 PANEL_HTTP_PORT=${HTTP_PORT}
@@ -74,15 +94,12 @@ AWG_PORT=${PORT}
 AWG_SUBNET=${SUBNET}
 AWG_MTU=1420
 AWG_ENDPOINT_HOST=${ENDPOINT_HOST}
-AWG_JC=$(rand 3 10)
-AWG_JMIN=50
-AWG_JMAX=1000
-AWG_S1=${S1}
-AWG_S2=${S2}
-AWG_H1=${H[0]}
-AWG_H2=${H[1]}
-AWG_H3=${H[2]}
-AWG_H4=${H[3]}
+
+# The generation clients connect with. 2.0 resists DPI best; 1.0 is what a router on
+# KeeneticOS 5.0.8 or older can load. Set AWG_S3 and AWG_S4 to 0 if AmneziaVPN app
+# users connect but pass no traffic — the profile stays 2.0 either way.
+AWG_PROTOCOL=${PROTOCOL}
+$(emit_env_obfuscation)
 
 CASCADE_ENABLED=true
 CASCADE_MTU=1380
@@ -106,6 +123,9 @@ CLIENT_KEEPALIVE=25
 CLIENT_JC=0
 CLIENT_JMIN=0
 CLIENT_JMAX=0
+# Junk and signature packets are sender-side only, so clients may wear a different
+# disguise from the server's own. Empty means "whatever the interface uses".
+CLIENT_SIGNATURE=
 
 COLLECTOR_INTERVAL_SECONDS=10
 SYNC_INTERVAL_SECONDS=30

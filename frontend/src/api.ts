@@ -55,6 +55,69 @@ export interface ExitNode {
   latency_ms: number | null
   rx_bytes: number
   tx_bytes: number
+  // Which AmneziaWG generation this uplink speaks. Null from a node container that
+  // predates generation selection, which is serving 1.0 either way.
+  protocol: string | null
+  managed: boolean
+  ssh_host: string | null
+  ssh_port: number | null
+  ssh_user: string | null
+  // True when the panel's own key is on that server, so managing it needs no password.
+  ssh_key: boolean
+  created_at: string | null
+  task_id: string | null
+}
+
+export interface PanelSshKey {
+  public_key: string
+  fingerprint: string
+  created_at: string | null
+  enabled: boolean
+}
+
+export interface NodeCheckResult {
+  reachable: boolean
+  error: string | null
+  root: boolean
+  os: string | null
+  kernel: string | null
+  arch: string | null
+  cpus: number
+  memory_mb: number
+  disk_free_mb: number
+  uptime_seconds: number
+  docker: boolean
+  saucewg: boolean
+  role: string | null
+  host_key: string | null
+  used_panel_key: boolean
+}
+
+export interface NodeStatus {
+  name: string
+  reachable: boolean
+  error: string | null
+  ssh_host: string | null
+  role: string | null
+  cli_version: string | null
+  dir: string | null
+  os: string | null
+  kernel: string | null
+  arch: string | null
+  cpus: number
+  memory_mb: number
+  disk_free_mb: number
+  uptime_seconds: number
+  docker: boolean
+  saucewg: boolean
+  containers: { name: string; state: string; status: string }[]
+}
+
+export interface NodeLogs {
+  name: string
+  service: string | null
+  lines: number
+  text: string
 }
 
 export interface ExitNodeList {
@@ -64,7 +127,24 @@ export interface ExitNodeList {
   killswitch: boolean
   stale: boolean
   updated_at: string | null
+  config_error: string | null
+  provisioning: boolean
   nodes: ExitNode[]
+}
+
+export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed'
+
+export interface NodeTask {
+  id: string
+  action: string
+  target: string
+  status: TaskStatus
+  step: string
+  error: string | null
+  result: Record<string, unknown> | null
+  created_at: string
+  finished_at: string | null
+  log: { at: string; text: string }[]
 }
 
 export interface SystemStats {
@@ -117,7 +197,11 @@ export interface NodeSettings {
   client_dns: string
   client_mtu: number
   client_allowed_ips: string
-  obfuscation: Record<string, number>
+  protocol: string
+  protocols_supported: string[]
+  // Only the parameters the generation in force carries. Values are strings because
+  // an H-parameter may be a range and I1-I5 are signature specs.
+  obfuscation: Record<string, string>
 }
 
 const TOKEN_KEY = 'saucewg.token'
@@ -196,6 +280,61 @@ export const api = {
   activateNode: (name: string) =>
     request<ExitNodeList>(`/nodes/${encodeURIComponent(name)}/activate`, { method: 'POST' }),
   autoFailover: () => request<ExitNodeList>('/nodes/auto', { method: 'POST' }),
+
+  // Installing a node takes minutes, so these return a task to poll rather than
+  // holding the request open.
+  createNode: (payload: Record<string, unknown>) =>
+    request<NodeTask>('/nodes', { method: 'POST', body: JSON.stringify(payload) }),
+  adoptNode: (payload: Record<string, unknown>) =>
+    request<ExitNodeList>('/nodes/adopt', { method: 'POST', body: JSON.stringify(payload) }),
+  updateNode: (name: string, payload: Record<string, unknown>) =>
+    request<ExitNodeList>(`/nodes/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  deleteNode: (name: string, payload: Record<string, unknown>) =>
+    request<NodeTask>(`/nodes/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+      body: JSON.stringify(payload),
+    }),
+  repairNode: (name: string, payload: Record<string, unknown>) =>
+    request<NodeTask>(`/nodes/${encodeURIComponent(name)}/repair`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  // Both ends have to move together, so this reconfigures the exit node over SSH and
+  // rebuilds the uplink with the profile it reports back.
+  setNodeProtocol: (name: string, payload: Record<string, unknown>) =>
+    request<NodeTask>(`/nodes/${encodeURIComponent(name)}/protocol`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  nodeTask: (id: string) => request<NodeTask>(`/nodes/tasks/${encodeURIComponent(id)}`),
+
+  // The panel's own SSH key. Adding it to a server before installing means the
+  // install, and everything after it, needs no root password.
+  panelSshKey: () => request<PanelSshKey>('/nodes/ssh-key'),
+  checkServer: (payload: Record<string, unknown>) =>
+    request<NodeCheckResult>('/nodes/check', { method: 'POST', body: JSON.stringify(payload) }),
+
+  nodeStatus: (name: string) => request<NodeStatus>(`/nodes/${encodeURIComponent(name)}/status`),
+  nodeLogs: (name: string, service?: string, lines = 200) => {
+    const query = new URLSearchParams({ lines: String(lines) })
+    if (service) query.set('service', service)
+    return request<NodeLogs>(`/nodes/${encodeURIComponent(name)}/logs?${query}`)
+  },
+  // Credentials are optional on a node that carries the panel's key, which is why
+  // these send a body at all rather than nothing.
+  nodeService: (name: string, action: 'start' | 'stop' | 'restart', payload: Record<string, unknown> = {}) =>
+    request<NodeTask>(`/nodes/${encodeURIComponent(name)}/${action}`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  upgradeNode: (name: string, payload: Record<string, unknown> = {}) =>
+    request<NodeTask>(`/nodes/${encodeURIComponent(name)}/upgrade`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   clients: (params: Record<string, string | number | undefined>) => {
     const query = new URLSearchParams()

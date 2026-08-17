@@ -11,7 +11,7 @@ Drop this file into the production repository that owns the central API.
 ## 1. What you are integrating with
 
 ```
-          ┌── client (AmneziaWG legacy profile)
+          ┌── client (AmneziaWG profile, generation set per node)
           │
           ▼   UDP, obfuscated
    ┌──────────────────────┐        ┌──────────────┐
@@ -207,7 +207,7 @@ delete and recreate, or the user's keys and config change.
 
 ## 4. Delivering a profile to the end user
 
-Three equivalent ways, all rendering the same AmneziaWG *legacy* `.conf`:
+Three equivalent ways, all rendering the same AmneziaWG `.conf`:
 
 | Endpoint | Auth | Returns |
 | --- | --- | --- |
@@ -225,11 +225,22 @@ Set `SUBSCRIPTION_URL_PREFIX` on the panel to the public base URL if the entry n
 sits behind your own domain or gateway, otherwise the link is built from the request
 host.
 
-The rendered config carries the server's `S1`, `S2` and `H1`–`H4` verbatim — the
-handshake fails if they differ — plus the panel's own `Jc/Jmin/Jmax` when
-`CLIENT_JC/JMIN/JMAX` are set. `GET /api/clients/{name}/config` returns `503` while
-the node container is still starting and `409` for a client created with an external
-public key only.
+Which parameters the profile contains is decided by the entry interface, not by the
+client: the config carries the server's `S1`–`S4` and `H1`–`H4` verbatim, because those
+are what each side decodes the other's packets with and a mismatch is a tunnel that never
+handshakes. The sender-side parameters are the panel's to choose — `Jc/Jmin/Jmax` from
+`CLIENT_JC/JMIN/JMAX`, and the `I1` signature packet from `CLIENT_SIGNATURE` — so clients
+can wear a different disguise from the server's own.
+
+The presence of those parameters *is* the AmneziaWG generation, so a profile from a 2.0
+entry node (with `S3`, `S4` and `I1`) needs a client that understands them: AmneziaVPN
+4.8.2 or newer, or a router on KeeneticOS 5.1 Alpha 3 or newer. `GET /api/settings`
+reports which generation the node is on before you hand a profile out; if the users you
+serve are on older routers, put the entry node on `1.0`
+([`SAUCEWG_USAGE.md` §2.2](SAUCEWG_USAGE.md#22-install-options)).
+
+`GET /api/clients/{name}/config` returns `503` while the node container is still starting
+and `409` for a client created with an external public key only.
 
 ---
 
@@ -298,6 +309,8 @@ GET /api/nodes
   "killswitch": true,
   "stale": false,
   "updated_at": "2026-08-14T14:31:02Z",
+  "config_error": null,
+  "provisioning": true,
   "nodes": [
     {
       "name": "eu-primary",
@@ -314,7 +327,14 @@ GET /api/nodes
       "last_handshake_at": "2026-08-14T14:30:58Z",
       "latency_ms": 47.08,
       "rx_bytes": 3092,
-      "tx_bytes": 87289
+      "tx_bytes": 87289,
+      "managed": true,
+      "ssh_host": "72.56.92.184",
+      "ssh_port": 22,
+      "ssh_user": "root",
+      "ssh_key": true,
+      "created_at": "2026-06-02T09:12:44Z",
+      "task_id": null
     },
     { "name": "eu-backup", "priority": 20, "healthy": true, "active": false, "…": "…" }
   ]
@@ -332,6 +352,12 @@ GET /api/nodes
 | `latency_ms` | round trip through the tunnel to `CASCADE_PROBE_TARGET` |
 | `killswitch` | when `true`, clients are cut off rather than leaked via the entry IP if every uplink dies |
 | `stale` | **check this.** `true` means the node container stopped publishing state, so every health field below is untrustworthy |
+| `config_error` | a complete sentence explaining why the cascade is not what this panel thinks it is — a list the node container refused, or a `CASCADE_NODES_JSON` overriding the file. `null` when all is well |
+| `provisioning` | `false` when this panel cannot edit the cascade, so the write calls below are refused — `403` when provisioning is switched off, `409` when `CASCADE_NODES_JSON` owns the list |
+| `managed` | the panel installed this node over SSH and can reach it again |
+| `ssh_host` / `ssh_port` / `ssh_user` | how it reaches it; `null` for a node added by hand |
+| `ssh_key` | the panel's own key is on that server, so calls about it need no credentials |
+| `task_id` | set while an install, removal or repair for this node is still running |
 
 ### How failover decides
 
@@ -371,28 +397,43 @@ Two things to internalise:
   up to `CASCADE_PROBE_INTERVAL` seconds later. Poll `GET /api/nodes` until `active`
   matches before reporting success to a user.
 
-### Adding an exit node
+### Adding and managing an exit node
 
-The node list is declarative configuration, not API state — adding a node restarts the
-node container, so it is an operational action rather than something to expose to end
-users. On the entry node:
-
-```bash
-# 1. On the new exit server: bring it up. It prints a ready-made JSON object.
-./scripts/bootstrap-exit.sh --name eu-fr
-
-# 2. On the entry server: add it and restart the node container.
-./scripts/add-exit-node.sh --json '{"name":"eu-fr","endpoint":"…","public_key":"…", …}'
-
-# 3. The script prints the entry node's uplink public key for the new slot.
-#    Install it on the exit server as AWG_PEER_PUBLIC_KEY and restart it.
+```http
+GET    /api/nodes/ssh-key         # the panel's key, to preload onto a new server
+POST   /api/nodes/check           # is this server reachable, and what is on it
+POST   /api/nodes                 # install one on a bare server over SSH
+POST   /api/nodes/adopt           # register one that was installed by hand
+DELETE /api/nodes/{name}          # detach it, optionally wiping the server
+POST   /api/nodes/{name}/repair   # reinstall the uplink key on an unpaired node
+GET    /api/nodes/{name}/status   # containers, version and host facts, live
+GET    /api/nodes/{name}/logs     # the tail of that server's container logs
+POST   /api/nodes/{name}/restart  # also /start, /stop and /upgrade
 ```
 
-`./scripts/add-exit-node.sh --list` and `--remove <name>` manage the rest.
+Installing takes minutes, so `POST` and `DELETE` answer `202` with a task to poll
+rather than holding the request open. A node the panel installed carries the panel's
+SSH key, so every call after the first needs no credentials — which is what makes
+running a fleet from one master panel practical. The full contract — request bodies,
+task polling, error codes and the equivalent CLI — is in
+[`SAUCEWG_USAGE.md` §5](SAUCEWG_USAGE.md#5-driving-it-from-a-bot).
 
-To automate this from a central system, write `config/exit-nodes.json` on the entry
-host and run `docker compose up -d --force-recreate awg`. The file is a JSON array;
-each object accepts:
+From a shell on the entry node, the same thing is:
+
+```bash
+saucewg add-node --json '{"name":"eu-fr","endpoint":"…","public_key":"…"}'
+saucewg remove-node eu-fr
+saucewg nodes
+```
+
+Adding or removing a node **does not restart anything**. The node container re-reads
+the list within a second and rebuilds only the interfaces that actually changed, so
+connected users are unaffected unless the node carrying their traffic is the one being
+removed.
+
+Writing `config/exit-nodes.json` on the entry host directly still works if you prefer
+to own it from configuration management — set `NODE_PROVISION_ENABLED=false` to stop
+the panel writing to it too. The file is a JSON array; each object accepts:
 
 ```json
 {
@@ -437,7 +478,7 @@ Host metrics, client totals, live throughput, and the cascade summary:
 
 ```json
 {
-  "panel_title": "SauceWG", "version": "1.1.0",
+  "panel_title": "SauceWG", "version": "1.3.0",
   "cpu_percent": 3.4, "cpu_cores": 2,
   "mem_total": 2084986880, "mem_used": 903168000,
   "disk_total": 41660260352, "disk_used": 9331159040,
@@ -501,9 +542,9 @@ defensively.
 | `401` | missing, expired or revoked token | re-authenticate once, then fail |
 | `403` | non-sudo token on an admin endpoint, or a disabled subscription | do not retry |
 | `404` | unknown client, admin or exit node | do not retry |
-| `409` | duplicate name/public key, or config for a key-only client | reconcile your state |
-| `422` | validation | fix the payload |
-| `503` | node container not ready, or control file unwritable | retry with backoff |
+| `409` | duplicate name/public key, config for a key-only client, another task still running for that exit node, or a cascade this panel does not own | reconcile your state |
+| `422` | validation, or missing SSH credentials for an operation that needs them | fix the payload |
+| `503` | node container not ready, or a control file unwritable | retry with backoff |
 
 Everything is served over plain HTTP on the entry node's IP by default. Put it behind
 your own TLS termination, or set `PANEL_SITE_ADDRESS` to a domain with
@@ -595,6 +636,7 @@ Values the central system may need to know about, set in the entry node's `.env`
 | `USAGE_BUCKET_MINUTES` / `USAGE_RETENTION_DAYS` | 60 / 90 | granularity and history of the usage series |
 | `CASCADE_PROBE_INTERVAL` / `CASCADE_FAIL_THRESHOLD` | 10 / 3 | failover detection time |
 | `CASCADE_KILLSWITCH` | `true` | whether a total uplink outage blocks users or leaks via the entry IP |
+| `NODE_PROVISION_ENABLED` | `true` | `false` makes the cascade read-only through the API — see [`SAUCEWG_USAGE.md` §6](SAUCEWG_USAGE.md#6-files-on-the-server) |
 | `CORS_ORIGINS` | `*` | tighten before exposing the panel |
 | `DOCS_ENABLED` | `true` | `/api/docs` serves live OpenAPI; `/api/openapi.json` is the machine-readable contract |
 
@@ -610,8 +652,9 @@ Values the central system may need to know about, set in the entry node's `.env`
 * **Deleting a client destroys its keys.** There is no undelete; suspend instead.
 * **Failover control is advisory and asynchronous.** Pins can be overridden by health,
   and take up to one probe interval to apply.
-* **The exit node list is config, not API state.** Adding or removing a node restarts
-  the node container and briefly interrupts traffic.
+* **Editing the exit node list restarts nothing.** The node container re-reads it
+  within a second and rebuilds only the interfaces that changed, so adding or removing
+  a node is invisible to everyone except the users on the node being removed.
 * **The panel has no rate limiting.** Keep your poll loops to the cadences in §5.
 * **There is no pagination cursor**, only offset/limit against a live table; a client
   created mid-scan can shift rows. Sort by `created_at asc` when you need a stable scan.

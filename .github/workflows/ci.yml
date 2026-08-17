@@ -42,6 +42,13 @@ jobs:
           AWG_ENDPOINT_HOST: 127.0.0.1
         run: python -c "from app.main import app; print(len(app.routes), 'routes registered')"
 
+      # Adding and removing an exit node is file exchange with the node container,
+      # so the whole path runs against a stub — no Docker and no database.
+      - name: The exit node API adds and removes nodes
+        run: |
+          pip install httpx
+          ./scripts/test-node-api.py
+
   shell:
     runs-on: ubuntu-latest
     steps:
@@ -49,13 +56,32 @@ jobs:
       - name: shellcheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck -x -S warning docker/awg/*.sh scripts/*.sh
+          shellcheck -x -S warning saucewg.sh docker/awg/*.sh scripts/*.sh
+      - name: saucewg.sh answers for every documented command
+        run: |
+          bash saucewg.sh help
+          bash saucewg.sh version --json | jq -e '.cli_version'
+          bash saucewg.sh --json signatures | jq -e '.presets | length >= 5'
+          # Commands that need an installation must say so rather than crash.
+          bash saucewg.sh --dir /tmp/nowhere status 2>&1 | grep -q "not installed"
+          bash saucewg.sh --dir /tmp/nowhere protocol 2>&1 | grep -q "not installed"
+
+      # The node container, the panel and the installer each carry their own copy of
+      # the generation table. When they disagree the tunnel comes up and never
+      # handshakes, which is not an error anywhere — so it is checked instead.
+      - name: The AmneziaWG generation tables agree
+        run: ./scripts/test-protocol-parity.sh
+
+      # The reload path decides whether a running tunnel survives an edit to the
+      # exit node list, so it is tested with the system calls stubbed out.
+      - name: The node container reloads without dropping uplinks
+        run: ./scripts/test-uplinks.sh
 
   compose:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate compose files
+      - name: Validate the repository compose files
         run: |
           cp .env.example .env
           sed -i 's/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=ci-password/;
@@ -65,3 +91,106 @@ jobs:
           docker compose --env-file .env config >/dev/null
           docker compose -f docker-compose.exit.yml --env-file .env.exit.example config >/dev/null
           echo "compose files are valid"
+
+      # saucewg.sh writes its own compose files so a bare server can be installed
+      # with nothing but curl. They have to stay valid and offer the same services
+      # as the ones in the repository.
+      - name: Validate the compose files saucewg.sh generates
+        run: |
+          sudo bash saucewg.sh --dir /tmp/entry --yes install \
+            --endpoint-host 127.0.0.1 --admin-password ci-password --no-start
+          sudo docker compose --project-directory /tmp/entry \
+            -f /tmp/entry/docker-compose.yml --env-file /tmp/entry/.env config >/dev/null
+          for service in postgres awg panel caddy; do
+            sudo docker compose --project-directory /tmp/entry \
+              -f /tmp/entry/docker-compose.yml --env-file /tmp/entry/.env config --services \
+              | grep -qx "$service" || { echo "::error::generated compose is missing $service"; exit 1; }
+          done
+          echo "the generated entry compose file is valid"
+
+          sudo bash saucewg.sh --dir /tmp/exit --yes install-node \
+            --name ci-exit --endpoint-host 127.0.0.1 --no-start
+          sudo docker compose --project-directory /tmp/exit \
+            -f /tmp/exit/docker-compose.yml --env-file /tmp/exit/.env config >/dev/null
+          echo "the generated exit compose file is valid"
+
+      # A generation is decided by which obfuscation parameters the .env carries, and
+      # an I1 signature spec contains spaces and angle brackets — so it has to survive
+      # both the .env writer and compose's own interpolation.
+      - name: The installer writes a loadable profile for every generation
+        run: |
+          for version in 1.0 1.5 2.0; do
+            sudo rm -rf /tmp/gen
+            sudo bash saucewg.sh --dir /tmp/gen --yes install-node \
+              --name ci-gen --endpoint-host 127.0.0.1 --protocol "$version" --no-start
+            sudo grep -qx "AWG_PROTOCOL=$version" /tmp/gen/.env \
+              || { echo "::error::$version was not recorded in .env"; exit 1; }
+            resolved=$(sudo docker compose --project-directory /tmp/gen \
+              -f /tmp/gen/docker-compose.yml --env-file /tmp/gen/.env config --format json \
+              | jq -r '.services.awg.environment')
+            for param in $(jq -rn --arg v "$version" '
+                  {"1.0": [], "1.5": ["AWG_I1"], "2.0": ["AWG_I1","AWG_S3","AWG_S4"]}[$v][]'); do
+              printf '%s' "$resolved" | jq -e --arg p "$param" '(.[$p] // "") != ""' >/dev/null \
+                || { echo "::error::$version is missing $param"; exit 1; }
+            done
+            for param in $(jq -rn --arg v "$version" '
+                  {"1.0": ["AWG_I1","AWG_S3","AWG_S4"], "1.5": ["AWG_S3","AWG_S4"], "2.0": []}[$v][]'); do
+              printf '%s' "$resolved" | jq -e --arg p "$param" '(.[$p] // "") == ""' >/dev/null \
+                || { echo "::error::$version should not carry $param"; exit 1; }
+            done
+            echo "AmneziaWG $version reaches the container intact"
+          done
+
+          # Moving a node between generations is the upgrade path, so it has to add and
+          # drop the right parameters rather than leave a mixture of the two.
+          sudo rm -rf /tmp/gen
+          sudo bash saucewg.sh --dir /tmp/gen --yes install-node \
+            --name ci-gen --endpoint-host 127.0.0.1 --protocol 1.0 --no-start
+          s1=$(sudo sed -n 's/^AWG_S1=//p' /tmp/gen/.env)
+          sudo bash saucewg.sh --dir /tmp/gen --yes set-protocol 2.0 --signature dns --no-restart
+          sudo grep -qx "AWG_S1=$s1" /tmp/gen/.env \
+            || { echo "::error::padding both ends agree on was regenerated"; exit 1; }
+          sudo grep -q '^AWG_S3=[0-9]' /tmp/gen/.env \
+            || { echo "::error::moving to 2.0 did not add S3"; exit 1; }
+          sudo bash saucewg.sh --dir /tmp/gen --yes set-protocol 1.0 --no-restart
+          sudo grep -qx 'AWG_S3=' /tmp/gen/.env \
+            || { echo "::error::moving back to 1.0 left S3 behind"; exit 1; }
+          sudo grep -qx 'AWG_I1=' /tmp/gen/.env \
+            || { echo "::error::moving back to 1.0 left a signature behind"; exit 1; }
+          echo "set-protocol moves a node cleanly in both directions"
+
+      # An interface app clients dial has to pad by zero: the AmneziaVPN app drops non-zero
+      # S3/S4, so the handshake completes and every transport packet it sends is discarded
+      # as malformed. A node-to-node hop runs amneziawg-go at both ends and keeps real
+      # padding, which is the hop a censor sees anyway.
+      - name: Client-facing padding stays zero while node-to-node padding does not
+        run: |
+          for param in S3 S4; do
+            sudo grep -qx "AWG_${param}=0" /tmp/entry/.env \
+              || { echo "::error::the entry node pads app clients with $param"; exit 1; }
+            sudo grep -qE "^AWG_${param}=[1-9][0-9]*$" /tmp/exit/.env \
+              || { echo "::error::the exit node does not pad its uplink with $param"; exit 1; }
+          done
+          echo "an entry node pads clients by zero and an exit node pads its uplink for real"
+
+          # A generation change must keep that split, or it breaks every app client at once.
+          sudo bash saucewg.sh --dir /tmp/entry --yes set-protocol 1.5 --no-restart
+          sudo bash saucewg.sh --dir /tmp/entry --yes set-protocol 2.0 --no-restart
+          for param in S3 S4; do
+            sudo grep -qx "AWG_${param}=0" /tmp/entry/.env \
+              || { echo "::error::set-protocol gave the entry node non-zero $param"; exit 1; }
+          done
+          echo "set-protocol keeps a client-facing interface padding by zero"
+
+      # The cascade list is what the panel and the CLI both edit, so the CLI has to
+      # keep producing entries the node container can actually parse.
+      - name: The CLI maintains the exit node list
+        run: |
+          sudo bash saucewg.sh --dir /tmp/entry --yes add-node \
+            --name ci-node --endpoint 198.51.100.10:51820 --public-key "$(head -c32 /dev/urandom | base64)" \
+            --no-reload
+          sudo jq -e '.[0].name == "ci-node" and (.[0].address | test("/32$"))' \
+            /tmp/entry/config/exit-nodes.json >/dev/null
+          sudo bash saucewg.sh --dir /tmp/entry --yes remove-node ci-node --no-reload
+          sudo jq -e 'length == 0' /tmp/entry/config/exit-nodes.json >/dev/null
+          echo "add-node and remove-node keep the list consistent"

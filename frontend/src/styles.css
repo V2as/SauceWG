@@ -446,6 +446,24 @@ tbody tr:last-child td {
   font-size: 12.5px;
 }
 
+/* For values with no spaces to break at, such as an I1 signature spec. */
+.wrap {
+  word-break: break-all;
+}
+
+/* An interoperability caveat rather than a misconfiguration: worth reading before
+   handing out configs, not worth stopping on. */
+.note-warn {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border-left: 2px solid var(--warning);
+  background: var(--warning-soft);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 /* ---------------------------------------------------------------- badges */
 
 .badge {

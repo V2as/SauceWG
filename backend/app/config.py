@@ -39,20 +39,58 @@ class Settings(BaseSettings):
 
     cascade_enabled: bool = True
     cascade_iface: str = "awg1"
+    cascade_uplink_subnet: str = "10.77.0.0/24"
     # The node container republishes uplinks.json on every health tick; anything
     # older than this means its monitor stopped.
     uplink_state_max_age_seconds: int = 60
+
+    # --- exit node provisioning ------------------------------------------
+    # The exit node list, bind-mounted read-write from the host so the panel can
+    # edit the same file the node container reads.
+    node_registry_file: str = "/etc/saucewg/host/exit-nodes.json"
+    # Set to false to make the panel read-only with respect to the cascade, e.g.
+    # when the node list is managed by configuration management.
+    node_provision_enabled: bool = True
+    node_default_port: int = 51820
+    node_ssh_port: int = 22
+    node_ssh_user: str = "root"
+    # A cold install pulls Docker and three images, which is minutes on a slow VPS.
+    node_ssh_timeout_seconds: int = 900
+    node_ssh_connect_timeout_seconds: int = 20
+    # Ceiling for the calls that answer inside one HTTP request — a status read, a
+    # log fetch, a reachability probe — rather than becoming a task.
+    node_ssh_query_timeout_seconds: int = 60
+    # The panel's own SSH key pair. It is enrolled on every node the panel installs,
+    # which is what lets a bot manage the fleet without holding root passwords.
+    node_ssh_key_file: str = "/etc/saucewg/host/panel-ssh-key"
+    # false stops the panel from enrolling its key, at the cost of having to supply
+    # credentials on every call that touches an exit server.
+    node_ssh_key_enabled: bool = True
+    # How long to wait for the node container to confirm it applied a new list.
+    node_reload_timeout_seconds: int = 90
+    # Uploaded to every exit node and executed there. Falls back to fetching the
+    # script from GitHub when the image does not carry a copy.
+    saucewg_installer_path: str = "/app/assets/saucewg.sh"
+    saucewg_repo: str = "V2as/SauceWG"
+    saucewg_ref: str = "main"
+    saucewg_namespace: str = "v2as"
+    saucewg_image_prefix: str = "saucewg-"
+    saucewg_tag: str = "latest"
 
     # --- generated client configs ---------------------------------------
     client_dns: str = "1.1.1.1, 1.0.0.1"
     client_mtu: int = 1280
     client_allowed_ips: str = "0.0.0.0/0, ::/0"
     client_keepalive: int = 25
-    # Junk-packet parameters are client-side only; the panel may hand out values
-    # that differ from the server's without breaking the handshake.
+    # Junk and signature packets are built by the sender alone, so the panel may
+    # hand out values that differ from the server's without breaking the handshake.
+    # Zero (or empty) means "use whatever the interface itself carries".
     client_jc: int = 0
     client_jmin: int = 0
     client_jmax: int = 0
+    # A preset name (quic, dns, random, short, none) or a literal spec, applied only
+    # on a generation that has I1 at all.
+    client_signature: str = ""
 
     # --- workers ---------------------------------------------------------
     collector_interval_seconds: int = 10
@@ -99,6 +137,10 @@ class Settings(BaseSettings):
     @property
     def uplink_control_file(self) -> str:
         return f"{self.awg_socket_dir}/uplink-control.json"
+
+    @property
+    def uplink_reload_file(self) -> str:
+        return f"{self.awg_socket_dir}/reload.request"
 
 
 @lru_cache

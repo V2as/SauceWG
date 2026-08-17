@@ -1,11 +1,11 @@
 name: ${COMPOSE_PROJECT_NAME:-saucewg-exit}
 
-# Exit node: a single AmneziaWG legacy interface that terminates the cascade uplink
-# from the entry node and NATs it out to the internet. No panel, no database.
+# Exit node: a single AmneziaWG interface that terminates the cascade uplink from the
+# entry node and NATs it out to the internet. No panel, no database.
 
 services:
   awg:
-    image: ${IMAGE_AWG:-saucewg/awg:1.1.0}
+    image: ${IMAGE_AWG:-saucewg/awg:1.3.0}
     build:
       context: ./docker/awg
       args:
@@ -23,15 +23,26 @@ services:
       AWG_SUBNET: ${AWG_SUBNET:-10.77.0.0/24}
       AWG_MTU: ${AWG_MTU:-1420}
       AWG_PRIVATE_KEY: ${AWG_PRIVATE_KEY:-}
+      # 1.0, 1.5 or 2.0. The entry node has to be told which one this is, since both
+      # ends of the uplink must pad and label packets the same way; `saucewg node-info`
+      # prints the object that carries it.
+      AWG_PROTOCOL: ${AWG_PROTOCOL:-}
       AWG_JC: ${AWG_JC:-}
       AWG_JMIN: ${AWG_JMIN:-}
       AWG_JMAX: ${AWG_JMAX:-}
       AWG_S1: ${AWG_S1:-}
       AWG_S2: ${AWG_S2:-}
+      AWG_S3: ${AWG_S3:-}
+      AWG_S4: ${AWG_S4:-}
       AWG_H1: ${AWG_H1:-}
       AWG_H2: ${AWG_H2:-}
       AWG_H3: ${AWG_H3:-}
       AWG_H4: ${AWG_H4:-}
+      AWG_I1: ${AWG_I1:-}
+      AWG_I2: ${AWG_I2:-}
+      AWG_I3: ${AWG_I3:-}
+      AWG_I4: ${AWG_I4:-}
+      AWG_I5: ${AWG_I5:-}
       AWG_PEER_PUBLIC_KEY: ${AWG_PEER_PUBLIC_KEY:-}
       AWG_PEER_PSK: ${AWG_PEER_PSK:-}
       # Each entry-node uplink terminates on its own address inside this subnet, so

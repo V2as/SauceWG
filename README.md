@@ -123,7 +123,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/V2as/SauceWG/main/saucewg.sh
 
 That installs Docker if it is missing, writes `/opt/saucewg`, starts everything and
 prints the panel URL with a generated admin password. `--domain` gets an automatic
-Let's Encrypt certificate; leave it out to serve the panel over plain HTTP by IP.
+Let's Encrypt certificate, so point the name at this server and leave TCP/80 reachable
+before running it — that is the address the certificate is issued over. Leave `--domain`
+out to serve the panel over plain HTTP by IP.
 
 The entry node comes up on AmneziaWG 2.0 with no exit nodes, so the panel is usable
 immediately. Add `--protocol 1.0` if the clients that will connect are routers on

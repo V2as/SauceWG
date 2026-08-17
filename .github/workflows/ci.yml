@@ -56,7 +56,7 @@ jobs:
       - name: shellcheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck -x -S warning saucewg.sh docker/awg/*.sh scripts/*.sh
+          shellcheck -x -S warning saucewg.sh docker/*/*.sh scripts/*.sh
       - name: saucewg.sh answers for every documented command
         run: |
           bash saucewg.sh help
@@ -113,6 +113,25 @@ jobs:
           sudo docker compose --project-directory /tmp/exit \
             -f /tmp/exit/docker-compose.yml --env-file /tmp/exit/.env config >/dev/null
           echo "the generated exit compose file is valid"
+
+          # --domain is the branch that shipped broken. It was never installed in CI, so
+          # the one value it writes differently was never handed to Caddy by anything.
+          sudo bash saucewg.sh --dir /tmp/entry-tls --yes install \
+            --domain panel.example.com --endpoint-host 127.0.0.1 \
+            --admin-password ci-password --no-start
+          sudo docker compose --project-directory /tmp/entry-tls \
+            -f /tmp/entry-tls/docker-compose.yml --env-file /tmp/entry-tls/.env config >/dev/null
+          sudo grep -qx 'PANEL_SITE_ADDRESS=panel.example.com' /tmp/entry-tls/.env \
+            || { echo "::error::--domain did not reach PANEL_SITE_ADDRESS"; exit 1; }
+          echo "installing with --domain writes a valid configuration"
+
+      # Whether that configuration is one Caddy will load is decided when the container
+      # starts, not when the image is built: a value the global options block rejects is
+      # `caddy run` exiting before it binds a port, restarted forever, while the panel and
+      # the database stay healthy. Nothing above would notice, so every value the
+      # installer and the documentation can produce is adapted against the real image.
+      - name: The web container accepts every CADDY_AUTO_HTTPS the tree writes
+        run: ./scripts/test-caddy-config.sh
 
       # A generation is decided by which obfuscation parameters the .env carries, and
       # an I1 signature spec contains spaces and angle brackets — so it has to survive

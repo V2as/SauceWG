@@ -841,12 +841,14 @@ EOF
     write_entry_compose
     install_cli
 
+    local healthy=true
     if [ "$start" = true ]; then
         step "Pulling images"
         compose pull --quiet >&2 || die "could not pull the images from ${REGISTRY}/${NAMESPACE}"
         step "Starting SauceWG"
         compose up -d >&2
         wait_for_panel
+        wait_for_containers || healthy=false
     fi
 
     local scheme=http url
@@ -862,8 +864,8 @@ EOF
         jq -n --arg role entry --arg dir "$APP_DIR" --arg url "$url" \
               --arg username "$admin_user" --arg password "$admin_password" \
               --arg endpoint "${endpoint_host}:${awg_port}" --arg version "$SAUCEWG_VERSION" \
-              --arg protocol "$protocol" \
-              '{ok: true, role: $role, dir: $dir, panel_url: $url, admin_username: $username,
+              --arg protocol "$protocol" --argjson healthy "$healthy" \
+              '{ok: $healthy, role: $role, dir: $dir, panel_url: $url, admin_username: $username,
                 admin_password: $password, endpoint: $endpoint, version: $version,
                 protocol: $protocol}'
     fi
@@ -877,6 +879,12 @@ EOF
     note ""
     note "Add exit nodes from the panel's Exit nodes page, or with:"
     note "  saucewg add-node --json '<object from: saucewg install-node --json>'"
+    if [ "$healthy" = false ]; then
+        warn ""
+        warn "Some containers are not running, so ${url} will not answer yet."
+        warn "The credentials above are already written to ${ENV_FILE} and stay valid."
+        warn "See what happened with: saucewg logs"
+    fi
     [ -n "$domain" ] || warn "The panel is served over plain HTTP. Re-run with --domain to enable TLS."
     if [ "$protocol" != "1.0" ]; then
         note ""
@@ -900,6 +908,36 @@ wait_for_panel() {
     done
     warn "the panel did not answer within two minutes; check: saucewg logs panel"
     return 0
+}
+
+# `compose up -d` returns once the containers are created, and the restart policy
+# then hides one that exits on startup: an unreadable config or a bad image reads
+# as a finished install right up until someone opens the URL. So the states are
+# read back, and a container still not running is named.
+wait_for_containers() {
+    local tries=0 broken=""
+    log "checking that every container stays up"
+    while [ "$tries" -lt 20 ]; do
+        broken=$(compose ps --format json 2>/dev/null | jq -rs '
+            map(select((.State // "") != "running"))
+            | map("\(.Service // .Name) (\(.State // "unknown"))") | join(", ")' 2>/dev/null) \
+            || broken=""
+        if [ -z "$broken" ]; then
+            log "every container is running"
+            return 0
+        fi
+        tries=$((tries + 1))
+        sleep 3
+    done
+    warn "not running a minute after startup: ${broken}"
+    for service in $(compose ps --services 2>/dev/null); do
+        compose ps --format json 2>/dev/null \
+            | jq -rs --arg s "$service" 'map(select((.Service // .Name) == $s
+                and (.State // "") != "running")) | length' 2>/dev/null | grep -qx 1 || continue
+        warn "  last words from ${service}:"
+        compose logs --tail 3 --no-log-prefix "$service" 2>&1 | sed 's/^/      /' >&2
+    done
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1746,15 +1784,22 @@ cmd_update() {
     step "Pulling images"
     compose pull --quiet >&2
 
+    local healthy=true
     if [ "$restart" = true ]; then
         step "Restarting"
         compose up -d --remove-orphans >&2
         [ "$(role)" = "entry" ] && wait_for_panel
+        wait_for_containers || healthy=false
     fi
 
-    log "updated to ${IMAGE_TAG}"
+    if [ "$healthy" = false ]; then
+        warn "the pulled images are running worse than the ones they replaced"
+        warn "roll back by pinning the previous tag in ${ENV_FILE}, then: saucewg restart"
+    else
+        log "updated to ${IMAGE_TAG}"
+    fi
     [ "$JSON_OUTPUT" = false ] || jq -n --arg tag "$IMAGE_TAG" --arg version "$SAUCEWG_VERSION" \
-        '{ok: true, tag: $tag, cli_version: $version}'
+        --argjson healthy "$healthy" '{ok: $healthy, tag: $tag, cli_version: $version}'
 }
 
 cmd_uninstall() {

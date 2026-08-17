@@ -1,6 +1,9 @@
 {
 	admin off
-	auto_https {$CADDY_AUTO_HTTPS:off}
+	# entrypoint.sh derives this from CADDY_AUTO_HTTPS: "auto_https off" to serve plain
+	# HTTP, or nothing at all, since automatic HTTPS is Caddy's default and has no
+	# opt-in token. Expanding an empty value leaves the block with just `admin off`.
+	{$CADDY_GLOBAL_OPTIONS:auto_https off}
 }
 
 # Defaults to plain ":80" so the panel is reachable by IP with no domain configured.

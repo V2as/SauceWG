@@ -12,4 +12,9 @@ RUN npm run build
 FROM caddy:2.9-alpine
 COPY --from=build /app/dist /srv/panel
 COPY docker/caddy/Caddyfile /etc/caddy/Caddyfile
+COPY docker/caddy/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh \
+ && caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 EXPOSE 80 443
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]

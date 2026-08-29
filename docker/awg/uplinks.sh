@@ -5,16 +5,26 @@
 # private key and its own obfuscation profile. All of them stay up and keep
 # handshaking, so a failover is a single route swap rather than a tunnel rebuild.
 #
-# Only the interface named in the client policy-routing table carries traffic:
+# Client traffic is steered entirely with policy routing, in two tables consulted in
+# this order:
 #
-#     ip rule from <client subnet> lookup 451
-#     ip route default dev <active uplink> table 451
+#     ip rule from <client subnet> lookup 450   # destinations that bypass the cascade
+#     ip rule from <client subnet> lookup 451   # everything else
+#
+#     table 450   one route per direct prefix, out of the entry node's own interface
+#     table 451   default dev <active uplink>
+#
+# A destination on the direct list matches in table 450 and leaves through the entry
+# node itself; anything else finds nothing there, falls through to table 451 and goes
+# to an exit node. When no exit node is usable, CASCADE_FALLBACK decides what happens
+# to table 451: `direct` empties it so the lookup carries on to the main table and the
+# entry node carries the traffic, `block` fills it with an unreachable route.
 #
 # The monitor loop re-evaluates health every CASCADE_PROBE_INTERVAL seconds and
 # rewrites that one route when a better uplink is available. It also watches the
-# exit node list and applies additions and removals in place — only the interfaces
-# that actually changed are rebuilt, so adding an exit node never disturbs the one
-# currently carrying client traffic.
+# exit node list and the direct route list and applies changes in place — only the
+# interfaces that actually changed are rebuilt, so adding an exit node never disturbs
+# the one currently carrying client traffic.
 
 UPLINK_STATE_FILE=${UPLINK_STATE_FILE:-/var/run/amneziawg/uplinks.json}
 UPLINK_CONTROL_FILE=${UPLINK_CONTROL_FILE:-/var/run/amneziawg/uplink-control.json}
@@ -28,6 +38,12 @@ CASCADE_UPLINK_SUBNET=${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
 # sourceable on its own, which is what the reload tests do.
 CASCADE_TABLE=${CASCADE_TABLE:-451}
 CASCADE_RULE_PRIORITY=${CASCADE_RULE_PRIORITY:-451}
+
+# Destinations that bypass the cascade. Lower priority number than the cascade rule,
+# so this table is consulted first and a listed prefix wins over the default route.
+CASCADE_DIRECT_FILE=${CASCADE_DIRECT_FILE:-/etc/amnezia/host/direct-routes.json}
+CASCADE_DIRECT_TABLE=${CASCADE_DIRECT_TABLE:-450}
+CASCADE_DIRECT_RULE_PRIORITY=${CASCADE_DIRECT_RULE_PRIORITY:-450}
 
 CASCADE_PROBE_ENABLED=${CASCADE_PROBE_ENABLED:-true}
 CASCADE_PROBE_TARGET=${CASCADE_PROBE_TARGET:-1.1.1.1}
@@ -59,7 +75,6 @@ declare -A UPLINK_SLOT_OF=()
 ACTIVE_INDEX=-1
 UPLINK_MODE=auto
 UPLINK_PIN=""
-NO_HEALTHY_LOGGED=false
 # The id of the last reload request the monitor finished applying. Whoever wrote
 # the request polls for it in uplinks.json to know the change went live.
 RELOAD_ID=0
@@ -67,6 +82,26 @@ CONFIG_ERROR=""
 # Where the exit node list was read from on the last parse: file, env, legacy-env or
 # none. Published so the panel can warn when its writes are being overridden.
 CONFIG_SOURCE="file"
+
+# What happens to client traffic while no exit node can carry it: `direct` lets the
+# entry node carry it, `block` drops it. Resolved from configuration once here and
+# again on every reload, so the mode can be changed without recreating the container.
+FALLBACK_MODE=direct
+# Whether that is happening right now.
+FALLBACK_ACTIVE=false
+
+# Destinations routed past the cascade, canonicalised to `network/bits`.
+DIRECT_PREFIXES=()
+DIRECT_SOURCE=none
+DIRECT_ERROR=""
+DIRECT_APPLIED=0
+# The entry node's own way out, as an `ip route` next hop, and the interface it uses.
+# Kept from the last apply so a DHCP lease change can be noticed and followed.
+DIRECT_NEXTHOP=""
+DIRECT_WAN=""
+# The interface the entry node's NAT and forwarding rules currently name, so they can
+# be moved rather than duplicated if it changes.
+DIRECT_RULES_IFACE=""
 
 uplink_slug() {
     printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
@@ -90,6 +125,27 @@ uplink_index_of() {
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+# CASCADE_KILLSWITCH is the old spelling of this choice and only had the two states
+# "block" and "leak". It is still honoured when CASCADE_FALLBACK is unset, so an .env
+# written before this existed keeps behaving the way its author asked for: a node that
+# was told to block on failure goes on blocking until someone says otherwise.
+uplinks_resolve_fallback() {
+    case $(printf '%s' "${CASCADE_FALLBACK:-}" | tr '[:upper:]' '[:lower:]') in
+        direct|entry) printf 'direct'; return 0 ;;
+        block|blocked|killswitch) printf 'block'; return 0 ;;
+        '') ;;
+        *)
+            log "CASCADE_FALLBACK=${CASCADE_FALLBACK} is not one of direct|block; using direct"
+            printf 'direct'
+            return 0
+            ;;
+    esac
+    case $(printf '%s' "${CASCADE_KILLSWITCH:-}" | tr '[:upper:]' '[:lower:]') in
+        true|1|yes|on) printf 'block' ;;
+        *) printf 'direct' ;;
+    esac
+}
 
 # Which of the ways of supplying the exit node list is in effect. The panel edits the
 # file, so it has to be able to tell when something else is taking precedence.
@@ -239,6 +295,7 @@ uplinks_allocate_ifaces() {
 uplinks_parse() {
     local json idx=0 base
 
+    FALLBACK_MODE=$(uplinks_resolve_fallback)
     CONFIG_SOURCE=$(uplinks_config_source)
     json=$(uplinks_source_json)
     if ! printf '%s' "$json" | jq -e 'type == "array"' >/dev/null 2>&1; then
@@ -320,8 +377,8 @@ uplinks_parse() {
         | join("\u001f")')
 
     # Nothing configured yet: bring up one unpaired uplink anyway so the entry node
-    # publishes a public key to pair the first exit node with, and so the kill
-    # switch is already in force.
+    # publishes a public key to pair the first exit node with, and so the fallback —
+    # blocking or direct — is already in force rather than starting later.
     if [ "$idx" -eq 0 ]; then
         log "no exit node is configured; starting a single unpaired uplink"
         UP_NAME[0]="exit-1"
@@ -363,6 +420,228 @@ uplink_signature() {
     for suffix in $AWG_OBF_SUFFIXES; do
         printf '|%s' "${UP_OBF[$i,$suffix]:-}"
     done
+}
+
+# ---------------------------------------------------------------------------
+# Direct routes
+# ---------------------------------------------------------------------------
+
+# Turns one list entry into either {ok: "network/bits"} or {bad: "<as written>"}.
+#
+# Entries are accepted as bare strings or as objects, and a bare address means a /32,
+# so a list can be pasted from anywhere that emits prefixes. The address is masked to
+# its network — the kernel rejects 10.0.0.1/24 as a route, and the operator meant the
+# range. A /0 is refused: it would take every destination off the cascade, which is
+# what CASCADE_FALLBACK is for.
+readonly DIRECT_JQ='
+def entry:
+    if type == "object" then with_entries(.key |= ascii_downcase)
+    else {cidr: (. | tostring)} end;
+def text:
+    ((.cidr // .prefix // .network // .subnet // .ip // .address // "") | tostring)
+    | gsub("^\\s+|\\s+$"; "");
+def canonical:
+    . as $raw
+    | (if test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}(/[0-9]{1,2})?$") then . else "" end) as $ok
+    | if $ok == "" then {bad: $raw}
+      else
+        ($ok | split("/")) as $parts
+        | (if ($parts | length) == 2 then ($parts[1] | tonumber) else 32 end) as $bits
+        | ($parts[0] | split(".") | map(tonumber)) as $o
+        | if $bits < 1 or $bits > 32 or ([$o[] | select(. > 255)] | length) > 0
+          then {bad: $raw}
+          else
+            ($o[0] * 16777216 + $o[1] * 65536 + $o[2] * 256 + $o[3]) as $addr
+            | (pow(2; 32 - $bits) | floor) as $size
+            | ($addr - ($addr % $size)) as $net
+            | {ok: "\(($net / 16777216) | floor).\((($net % 16777216) / 65536) | floor).\((($net % 65536) / 256) | floor).\($net % 256)/\($bits)"}
+          end
+      end;
+map(entry)
+| map(select(if has("enabled") then .enabled != false else true end))
+| map(text)
+| map(select(length > 0))
+| map(canonical)[]
+| if has("ok") then "ok\u001f\(.ok)" else "bad\u001f\(.bad)" end'
+
+direct_config_source() {
+    if [ -n "${CASCADE_DIRECT_ROUTES:-}" ]; then
+        printf 'env'
+    elif [ -f "$CASCADE_DIRECT_FILE" ]; then
+        printf 'file'
+    else
+        printf 'none'
+    fi
+}
+
+# The environment form is a plain list — "1.2.3.0/24, 5.6.7.8" — because that is what
+# fits in an .env; the file form is the JSON the panel writes.
+direct_source_json() {
+    case $(direct_config_source) in
+        env) printf '%s' "$CASCADE_DIRECT_ROUTES" | jq -R -s 'split("[,;[:space:]]+"; "") | map(select(length > 0))' ;;
+        file) cat "$CASCADE_DIRECT_FILE" 2>/dev/null || printf '[]' ;;
+        *) printf '[]' ;;
+    esac
+}
+
+# Fills DIRECT_PREFIXES. A malformed entry is dropped and reported rather than taken
+# as a reason to discard the rest: one bad line in a list of a thousand prefixes
+# should not put every other destination back on the cascade unannounced.
+direct_parse() {
+    local json kind value bad=0 first=""
+
+    DIRECT_SOURCE=$(direct_config_source)
+    DIRECT_ERROR=""
+    json=$(direct_source_json 2>/dev/null) || json=""
+    [ -n "$json" ] || json='[]'
+
+    if ! printf '%s' "$json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        DIRECT_ERROR="the direct route list is not a JSON array; keeping the routes that are already applied"
+        log "direct routes: $DIRECT_ERROR"
+        return 1
+    fi
+
+    DIRECT_PREFIXES=()
+    while IFS=$'\x1f' read -r kind value; do
+        case $kind in
+            ok) DIRECT_PREFIXES+=("$value") ;;
+            bad)
+                bad=$((bad + 1))
+                [ -n "$first" ] || first=$value
+                ;;
+        esac
+    done < <(printf '%s' "$json" | jq -r "$DIRECT_JQ" 2>/dev/null)
+
+    if [ "$bad" -gt 0 ]; then
+        DIRECT_ERROR="skipped ${bad} entr$([ "$bad" -eq 1 ] && printf 'y' || printf 'ies') that are not IPv4 prefixes, starting with '${first}'"
+        log "direct routes: $DIRECT_ERROR"
+    fi
+    return 0
+}
+
+# The interface the entry node reaches the internet through, and the next hop to use
+# for it. A route in table 450 cannot say "look this up in the main table", so it has
+# to name the gateway itself — and re-read it every time, because a DHCP lease change
+# moves it and the direct prefixes would otherwise keep pointing at a dead gateway.
+direct_wan_iface() {
+    local iface=${WAN_IFACE:-}
+    [ -n "$iface" ] || iface=$(wan_iface 2>/dev/null) || iface=""
+    printf '%s' "$iface"
+}
+
+direct_nexthop() {
+    local nexthop
+    nexthop=$(wan_nexthop 2>/dev/null) || nexthop=""
+    if [ -n "${WAN_IFACE:-}" ]; then
+        case " $nexthop " in
+            *" dev ${WAN_IFACE} "*) ;;
+            *) nexthop="dev ${WAN_IFACE}" ;;
+        esac
+    fi
+    printf '%s' "$nexthop"
+}
+
+# Writes DIRECT_PREFIXES into their own routing table, adding and removing only what
+# changed — a full rewrite on every tick would break the connections of prefixes that
+# did not. One table lookup covers any number of prefixes, which is why this is a
+# table and not an `ip rule` per entry.
+direct_routes_apply() {
+    local prefix desired=" " keep=" " nexthop applied=0
+
+    nexthop=$(direct_nexthop)
+    if [ -n "$DIRECT_NEXTHOP" ] && [ "$nexthop" != "$DIRECT_NEXTHOP" ]; then
+        log "direct routes: the entry node's route out changed (${DIRECT_NEXTHOP} -> ${nexthop:-none}); rebuilding"
+        ip route flush table "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
+    fi
+    DIRECT_NEXTHOP=$nexthop
+    DIRECT_WAN=$(direct_wan_iface)
+
+    for prefix in ${DIRECT_PREFIXES[@]+"${DIRECT_PREFIXES[@]}"}; do
+        desired="${desired}${prefix} "
+    done
+
+    while read -r prefix; do
+        [ -n "$prefix" ] || continue
+        case $prefix in */*) ;; *) prefix="${prefix}/32" ;; esac
+        case "$desired" in
+            *" ${prefix} "*) keep="${keep}${prefix} " ;;
+            *) ip route del "$prefix" table "$CASCADE_DIRECT_TABLE" 2>/dev/null || true ;;
+        esac
+    done < <(ip -4 route show table "$CASCADE_DIRECT_TABLE" 2>/dev/null | awk 'NF {print $1}')
+
+    if [ -n "$nexthop" ]; then
+        for prefix in ${DIRECT_PREFIXES[@]+"${DIRECT_PREFIXES[@]}"}; do
+            case "$keep" in
+                *" ${prefix} "*)
+                    applied=$((applied + 1))
+                    continue
+                    ;;
+            esac
+            # shellcheck disable=SC2086  # the next hop is deliberately several words
+            if ip route replace "$prefix" $nexthop table "$CASCADE_DIRECT_TABLE" 2>/dev/null; then
+                applied=$((applied + 1))
+            fi
+        done
+    elif [ "${#DIRECT_PREFIXES[@]}" -gt 0 ]; then
+        log "direct routes: the entry node has no default route of its own; ${#DIRECT_PREFIXES[@]} prefix(es) stay on the cascade"
+    fi
+    DIRECT_APPLIED=$applied
+
+    # The rule is what makes the table consulted at all, and it is only worth having
+    # while something is in the table.
+    ip rule del from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
+    if [ "$applied" -gt 0 ]; then
+        ip rule add from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE" \
+            priority "$CASCADE_DIRECT_RULE_PRIORITY" 2>/dev/null || true
+        log "direct routes: ${applied} prefix(es) bypass the cascade via ${DIRECT_WAN:-the entry node}"
+    fi
+
+    direct_path_rules
+}
+
+# Client traffic leaves through the entry node's own interface in two cases: a
+# destination on the direct list, and — with CASCADE_FALLBACK=direct — everything,
+# while no exit node is usable. Both need the same NAT and forwarding rules, so they
+# are installed while either applies and withdrawn when neither does.
+direct_path_rules() {
+    local iface needed=false
+    iface=$(direct_wan_iface)
+
+    if [ "$DIRECT_APPLIED" -gt 0 ]; then
+        needed=true
+    elif [ "$FALLBACK_ACTIVE" = "true" ] && [ "$FALLBACK_MODE" = "direct" ]; then
+        needed=true
+    fi
+
+    if [ "$needed" = "true" ]; then
+        if [ -z "$iface" ]; then
+            log "cannot find the interface the entry node routes through; not installing its NAT rules"
+            return 0
+        fi
+        if [ -n "$DIRECT_RULES_IFACE" ] && [ "$DIRECT_RULES_IFACE" != "$iface" ]; then
+            path_rules_del "$DIRECT_RULES_IFACE"
+        fi
+        path_rules_add "$iface"
+        DIRECT_RULES_IFACE=$iface
+    elif [ -n "$DIRECT_RULES_IFACE" ]; then
+        path_rules_del "$DIRECT_RULES_IFACE"
+        DIRECT_RULES_IFACE=""
+    fi
+}
+
+direct_reload() {
+    direct_parse || true
+    direct_routes_apply
+}
+
+# What an operator needs to be told about the direct list, if anything: entries that
+# were skipped, or an entry node with no route of its own to send them out of.
+direct_error() {
+    if [ -z "$DIRECT_NEXTHOP" ] && [ "${#DIRECT_PREFIXES[@]}" -gt 0 ]; then
+        printf 'the entry node has no default route of its own, so the direct routes are not in effect'
+        return 0
+    fi
+    printf '%s' "$DIRECT_ERROR"
 }
 
 # ---------------------------------------------------------------------------
@@ -500,7 +779,11 @@ uplinks_setup_all() {
 uplinks_teardown() {
     local i
     ip rule del from "$AWG_SUBNET" lookup "$CASCADE_TABLE" 2>/dev/null || true
+    ip rule del from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
     ip route flush table "$CASCADE_TABLE" 2>/dev/null || true
+    ip route flush table "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
+    [ -z "$DIRECT_RULES_IFACE" ] || path_rules_del "$DIRECT_RULES_IFACE"
+    DIRECT_RULES_IFACE=""
     for i in "${!UP_NAME[@]}"; do
         ip link del "${UP_IFACE[$i]}" 2>/dev/null || true
     done
@@ -510,18 +793,20 @@ uplinks_teardown() {
 # Routing
 # ---------------------------------------------------------------------------
 
-uplink_rules_add() {
+# NAT and forwarding for one sanctioned way out of the entry node: an uplink to an
+# exit node, or the entry node's own interface when it is carrying traffic itself.
+path_rules_add() {
     local iface=$1
     iptables -t nat -C POSTROUTING -s "$AWG_SUBNET" -o "$iface" -j MASQUERADE 2>/dev/null \
         || iptables -t nat -A POSTROUTING -s "$AWG_SUBNET" -o "$iface" -j MASQUERADE
-    # Inserted at the top so the kill switch's REJECT rule stays last in the chain.
+    # Inserted at the top so the catch-all REJECT rule stays last in the chain.
     iptables -C FORWARD -i "$AWG_IFACE" -o "$iface" -j ACCEPT 2>/dev/null \
         || iptables -I FORWARD 1 -i "$AWG_IFACE" -o "$iface" -j ACCEPT
     iptables -C FORWARD -i "$iface" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
         || iptables -I FORWARD 1 -i "$iface" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 }
 
-uplink_rules_del() {
+path_rules_del() {
     local iface=$1
     iptables -t nat -D POSTROUTING -s "$AWG_SUBNET" -o "$iface" -j MASQUERADE 2>/dev/null || true
     iptables -D FORWARD -i "$AWG_IFACE" -o "$iface" -j ACCEPT 2>/dev/null || true
@@ -537,15 +822,20 @@ uplinks_routing_base() {
     ip rule add from "$AWG_SUBNET" lookup "$CASCADE_TABLE" priority "$CASCADE_RULE_PRIORITY"
 
     for i in "${!UP_NAME[@]}"; do
-        uplink_rules_add "${UP_IFACE[$i]}"
+        path_rules_add "${UP_IFACE[$i]}"
     done
 
-    if [ "${CASCADE_KILLSWITCH:-true}" = "true" ]; then
-        # Nothing else may forward client traffic, so a dead uplink cannot leak
-        # through the entry node's own address.
-        iptables -C FORWARD -i "$AWG_IFACE" -j REJECT --reject-with icmp-net-unreachable 2>/dev/null \
-            || iptables -A FORWARD -i "$AWG_IFACE" -j REJECT --reject-with icmp-net-unreachable
-    fi
+    # Destinations that skip the cascade, plus the NAT the entry node needs to carry
+    # traffic itself — for those destinations, or for all of them while
+    # CASCADE_FALLBACK=direct has no exit node left to use.
+    direct_routes_apply
+
+    # Client traffic may only leave through a path something above put there. The
+    # rule is kept in both fallback modes: in `direct` the way out is an explicit
+    # ACCEPT for the entry node's own interface, not the absence of a guard, so a
+    # route appearing on some third interface still cannot carry client traffic.
+    iptables -C FORWARD -i "$AWG_IFACE" -j REJECT --reject-with icmp-net-unreachable 2>/dev/null \
+        || iptables -A FORWARD -i "$AWG_IFACE" -j REJECT --reject-with icmp-net-unreachable
 
     iptables -t mangle -C FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
         || iptables -t mangle -A FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
@@ -555,20 +845,61 @@ uplinks_routing_base() {
 # rebuild, when the route has to be rewritten even though the choice is unchanged.
 uplink_activate() {
     local i=$1 force=${2:-}
-    local previous=$ACTIVE_INDEX
+    local previous=$ACTIVE_INDEX was_fallback=$FALLBACK_ACTIVE
 
-    [ "$i" -ne "$previous" ] || [ "$force" = "force" ] || return 0
+    [ "$i" -ne "$previous" ] || [ "$force" = "force" ] || [ "$was_fallback" = "true" ] || return 0
 
     ip route replace default dev "${UP_IFACE[$i]}" table "$CASCADE_TABLE"
     ACTIVE_INDEX=$i
+    FALLBACK_ACTIVE=false
+    # Traffic that was leaving through the entry node no longer needs its NAT, unless
+    # a direct route still uses it.
+    direct_path_rules
 
-    if [ "$previous" -ge 0 ] && [ "$previous" -ne "$i" ]; then
+    if [ "$was_fallback" = "true" ]; then
+        conntrack -D -s "$AWG_SUBNET" >/dev/null 2>&1 || true
+        log "recovered: client traffic is back on the cascade via ${UP_NAME[$i]} (${UP_IFACE[$i]} -> ${UP_ENDPOINT[$i]:-<unpaired>})"
+    elif [ "$previous" -ge 0 ] && [ "$previous" -ne "$i" ]; then
         # Established flows are NATed to the old exit address and would otherwise
         # black-hole until their conntrack entries expire.
         conntrack -D -s "$AWG_SUBNET" >/dev/null 2>&1 || true
         log "failover: ${UP_NAME[$previous]} -> ${UP_NAME[$i]} (${UP_IFACE[$i]} -> ${UP_ENDPOINT[$i]:-<unpaired>})"
     else
         log "active uplink: ${UP_NAME[$i]} (${UP_IFACE[$i]} -> ${UP_ENDPOINT[$i]:-<unpaired>})"
+    fi
+}
+
+# No exit node can carry client traffic. Either the entry node carries it until one
+# comes back, or nobody does — whichever CASCADE_FALLBACK asked for.
+uplinks_fallback() {
+    local previous=$ACTIVE_INDEX
+
+    if [ "$FALLBACK_ACTIVE" = "true" ]; then
+        return 0
+    fi
+
+    ACTIVE_INDEX=-1
+    FALLBACK_ACTIVE=true
+
+    if [ "$FALLBACK_MODE" = "direct" ]; then
+        # The way out has to exist before traffic is pointed down it, or the packets
+        # in between meet the catch-all REJECT.
+        direct_path_rules
+        # An empty cascade table means the lookup carries on to the main table, which
+        # is the entry node's own route to the internet.
+        ip route del default table "$CASCADE_TABLE" 2>/dev/null || true
+        log "every exit node is down; client traffic is leaving through this entry node until one recovers"
+    else
+        # An unreachable route rather than an empty table: without it the lookup would
+        # fall through to the main table and leave through the entry node, which is
+        # the one thing this mode exists to prevent.
+        ip route replace unreachable default table "$CASCADE_TABLE" 2>/dev/null \
+            || ip route del default table "$CASCADE_TABLE" 2>/dev/null || true
+        log "every exit node is down; blocking client traffic (CASCADE_FALLBACK=block)"
+    fi
+
+    if [ "$previous" -ge 0 ]; then
+        conntrack -D -s "$AWG_SUBNET" >/dev/null 2>&1 || true
     fi
 }
 
@@ -633,7 +964,7 @@ uplinks_refresh_health() {
         if [ "$pid" -le 0 ] 2>/dev/null || ! kill -0 "$pid" 2>/dev/null; then
             log "uplink ${UP_NAME[$i]} is not running; restarting ${UP_IFACE[$i]}"
             if uplink_setup "$i"; then
-                uplink_rules_add "${UP_IFACE[$i]}"
+                path_rules_add "${UP_IFACE[$i]}"
                 [ "$i" -ne "$ACTIVE_INDEX" ] || uplink_activate "$i" force
             fi
         fi
@@ -698,6 +1029,10 @@ uplinks_write_state() {
         active_name=${UP_NAME[$ACTIVE_INDEX]}
     fi
 
+    local direct_json
+    direct_json=$(printf '%s\n' ${DIRECT_PREFIXES[@]+"${DIRECT_PREFIXES[@]}"} \
+        | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null) || direct_json='[]'
+
     if for i in "${!UP_NAME[@]}"; do
         if [ "$i" -eq "$ACTIVE_INDEX" ]; then is_active=true; else is_active=false; fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -713,8 +1048,14 @@ uplinks_write_state() {
         --arg error "$CONFIG_ERROR" \
         --arg reload "$RELOAD_ID" \
         --arg source "${CONFIG_SOURCE:-file}" \
-        --argjson now "$(date -u +%s)" \
-        --argjson killswitch "$([ "${CASCADE_KILLSWITCH:-true}" = "true" ] && echo true || echo false)" '
+        --arg fallback "$FALLBACK_MODE" \
+        --arg direct_source "$DIRECT_SOURCE" \
+        --arg direct_error "$(direct_error)" \
+        --arg direct_wan "$DIRECT_WAN" \
+        --argjson direct_routes "$direct_json" \
+        --argjson direct_applied "${DIRECT_APPLIED:-0}" \
+        --argjson fallback_active "$([ "$FALLBACK_ACTIVE" = "true" ] && echo true || echo false)" \
+        --argjson now "$(date -u +%s)" '
         {
             updated_at: $now,
             reload_id: $reload,
@@ -723,7 +1064,18 @@ uplinks_write_state() {
             mode: $mode,
             pinned: (if $pin == "" then null else $pin end),
             active: (if $active == "" then null else $active end),
-            killswitch: $killswitch,
+            fallback: $fallback,
+            fallback_active: $fallback_active,
+            # The old name for the same choice, still published so that a panel
+            # older than the container it is talking to keeps working.
+            killswitch: ($fallback == "block"),
+            direct: {
+                source: $direct_source,
+                routes: $direct_routes,
+                applied: $direct_applied,
+                via: (if $direct_wan == "" then null else $direct_wan end),
+                error: (if $direct_error == "" then null else $direct_error end)
+            },
             nodes: (
                 split("\n") | map(select(length > 0)) | map(split("\t")) | map({
                     name: .[0],
@@ -767,6 +1119,11 @@ uplinks_config_mtime() {
     stat -c %Y "$CASCADE_NODES_FILE" 2>/dev/null || printf '0'
 }
 
+direct_config_mtime() {
+    [ -f "$CASCADE_DIRECT_FILE" ] || { printf '0'; return; }
+    stat -c %Y "$CASCADE_DIRECT_FILE" 2>/dev/null || printf '0'
+}
+
 # Applies the current exit node list to the running node. Interfaces whose
 # configuration did not change keep running untouched, so adding or removing an
 # exit node does not interrupt the one carrying client traffic.
@@ -803,7 +1160,7 @@ uplinks_reload() {
     for name in "${!old_iface[@]}"; do
         uplink_index_of "$name" >/dev/null && continue
         log "removing uplink ${name} (${old_iface[$name]})"
-        uplink_rules_del "${old_iface[$name]}"
+        path_rules_del "${old_iface[$name]}"
         uplink_stop_raw "${old_iface[$name]}" "${old_pid[$name]}"
         removed=$((removed + 1))
     done
@@ -833,7 +1190,7 @@ uplinks_reload() {
 
         if [ -n "${old_iface[$name]:-}" ]; then
             log "reconfiguring uplink ${name}"
-            uplink_rules_del "${old_iface[$name]}"
+            path_rules_del "${old_iface[$name]}"
             uplink_stop_raw "${old_iface[$name]}" "${old_pid[$name]}"
             rebuilt=$((rebuilt + 1))
         else
@@ -849,15 +1206,16 @@ uplinks_reload() {
         UP_FAILS[i]=0
 
         if uplink_setup "$i"; then
-            uplink_rules_add "${UP_IFACE[$i]}"
+            path_rules_add "${UP_IFACE[$i]}"
         fi
     done
 
     log "reload applied: ${added} added, ${rebuilt} reconfigured, ${removed} removed"
 
-    # The kill switch REJECT rule must stay at the bottom of FORWARD even after
-    # rules were added and removed around it, and the ip rule may have been lost
-    # with a deleted interface.
+    # The catch-all REJECT rule must stay at the bottom of FORWARD even after rules
+    # were added and removed around it, the ip rule may have been lost with a deleted
+    # interface, and the direct list may be what the reload was requested for.
+    direct_parse || true
     uplinks_routing_base
 
     uplinks_refresh_health
@@ -866,9 +1224,10 @@ uplinks_reload() {
     if [ "$want" -ge 0 ]; then
         uplink_activate "$want" force
     else
-        ACTIVE_INDEX=-1
-        ip route del default table "$CASCADE_TABLE" 2>/dev/null || true
-        log "no healthy uplink after the reload; the kill switch keeps clients blocked"
+        # Force the fallback to be re-applied: the reload may have changed which mode
+        # is in effect, and the route in the cascade table has to match it.
+        FALLBACK_ACTIVE=false
+        uplinks_fallback
     fi
     return 0
 }
@@ -882,10 +1241,11 @@ uplinks_reload() {
 # what keeps a long-lived reload cycle from filling the container with zombies.
 uplinks_monitor() {
     local want now next_health=0
-    local seen_request seen_mtime requested mtime
+    local seen_request seen_mtime seen_direct requested mtime direct_mtime
 
     seen_request=$(uplinks_reload_request_id)
     seen_mtime=$(uplinks_config_mtime)
+    seen_direct=$(direct_config_mtime)
     RELOAD_ID=$seen_request
 
     while :; do
@@ -897,6 +1257,7 @@ uplinks_monitor() {
         now=$(date -u +%s)
         requested=$(uplinks_reload_request_id)
         mtime=$(uplinks_config_mtime)
+        direct_mtime=$(direct_config_mtime)
 
         if [ "$requested" != "$seen_request" ] || [ "$mtime" != "$seen_mtime" ]; then
             if [ "$requested" != "$seen_request" ]; then
@@ -906,10 +1267,18 @@ uplinks_monitor() {
             fi
             seen_request=$requested
             seen_mtime=$mtime
+            # The reload re-reads the direct list too, so this edit is already applied.
+            seen_direct=$direct_mtime
             uplinks_reload || true
             RELOAD_ID=$requested
             uplinks_write_state
             next_health=$((now + CASCADE_PROBE_INTERVAL))
+        elif [ "$direct_mtime" != "$seen_direct" ]; then
+            # Only the bypass list changed: the cascade itself does not need touching.
+            log "the direct route list changed on disk"
+            seen_direct=$direct_mtime
+            direct_reload
+            uplinks_write_state
         fi
 
         if [ "$now" -ge "$next_health" ]; then
@@ -918,11 +1287,15 @@ uplinks_monitor() {
             want=$(uplinks_select)
 
             if [ "$want" -ge 0 ]; then
-                NO_HEALTHY_LOGGED=false
                 uplink_activate "$want"
-            elif [ "$NO_HEALTHY_LOGGED" = "false" ]; then
-                NO_HEALTHY_LOGGED=true
-                log "every uplink is down; the kill switch keeps client traffic blocked"
+            else
+                uplinks_fallback
+            fi
+
+            # A DHCP lease change moves the entry node's own gateway, which the direct
+            # routes name explicitly and would otherwise keep pointing at.
+            if [ "$(direct_nexthop)" != "$DIRECT_NEXTHOP" ]; then
+                direct_routes_apply
             fi
 
             uplinks_write_state

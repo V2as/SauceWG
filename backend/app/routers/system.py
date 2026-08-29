@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from .. import __version__
 from ..awg import device_for
 from ..awg import protocol as proto
+from ..awg import routes as route_registry
 from ..awg.node import load_cascade_params, load_server_params
 from ..awg.uapi import UAPIError
 from ..awg.uplinks import load_uplink_state
@@ -40,6 +41,9 @@ async def build_cascade_status() -> CascadeStatus:
         mode=state.mode,
         nodes_total=len(state.nodes),
         nodes_healthy=sum(1 for node in state.nodes if node.healthy),
+        fallback=state.fallback,
+        fallback_active=state.fallback_active and not state.stale,
+        direct_routes=len(route_registry.state()["applied"]),
     )
     if not settings.cascade_enabled:
         return status
@@ -49,6 +53,9 @@ async def build_cascade_status() -> CascadeStatus:
 
     active = state.active_node
     if active is None:
+        # No exit node is carrying traffic. Whether clients are online depends on the
+        # fallback, and `connected` is about the cascade either way — it is false here
+        # even when the entry node is keeping them online by itself.
         return status
 
     status.node = active.name

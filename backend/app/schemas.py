@@ -142,6 +142,14 @@ class CascadeStatus(BaseModel):
     mode: str = "auto"
     nodes_total: int = 0
     nodes_healthy: int = 0
+    # What happens while no exit node can carry traffic: "direct" lets the entry node
+    # carry it, "block" drops it.
+    fallback: str = "direct"
+    # True while that is what is happening: clients are online through the entry
+    # node's own address, or cut off, depending on the mode above.
+    fallback_active: bool = False
+    # Destinations deliberately routed past the cascade.
+    direct_routes: int = 0
 
 
 class ExitNode(BaseModel):
@@ -181,7 +189,11 @@ class ExitNodeList(BaseModel):
     mode: str
     active: str | None = None
     pinned: str | None = None
+    # Kept for clients written before the fallback had two modes; it is exactly
+    # `fallback == "block"`.
     killswitch: bool = True
+    fallback: str = "direct"
+    fallback_active: bool = False
     # True when the node container stopped refreshing its state file.
     stale: bool = False
     updated_at: datetime | None = None
@@ -316,6 +328,49 @@ class ExitNodeDelete(NodeCredentials):
     # back to a provider should not keep an authorised key for a machine that no
     # longer manages it.
     revoke_key: bool = True
+
+
+class DirectRoute(BaseModel):
+    """One destination that leaves through the entry node instead of an exit node."""
+
+    cidr: str = Field(description="an IPv4 address or range; a bare address means /32")
+    note: str | None = Field(default=None, max_length=512)
+    enabled: bool = True
+    # True once the node container has this prefix in its routing table. False means
+    # the change has not been applied yet, or could not be.
+    active: bool = False
+
+
+class DirectRouteCreate(BaseModel):
+    """Adds one or more destinations to the bypass list.
+
+    A list is accepted because these normally arrive in groups — every range a
+    service resolves to, exported from somewhere that already knows them.
+    """
+
+    cidr: list[str] = Field(min_length=1, max_length=4096)
+    note: str | None = Field(default=None, max_length=512)
+    enabled: bool = True
+
+
+class DirectRouteUpdate(BaseModel):
+    note: str | None = Field(default=None, max_length=512)
+    # Turning a route off leaves it in the list but puts the destination back on the
+    # cascade, which is the reversible way to test whether it was the cause.
+    enabled: bool | None = None
+
+
+class DirectRouteList(BaseModel):
+    routes: list[DirectRoute]
+    # The interface the entry node sends these out of, once it has applied them.
+    via: str | None = None
+    # False when the node container is not publishing route state: it is down, or
+    # older than this feature.
+    live: bool = False
+    # False when the panel cannot edit the list.
+    editable: bool = True
+    # Why the list on file is not the list in effect, if it is not.
+    config_error: str | None = None
 
 
 class PanelSshKey(BaseModel):

@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 AUTO = "auto"
 MANUAL = "manual"
 
+#: Fallback modes, as CASCADE_FALLBACK spells them.
+FALLBACK_DIRECT = "direct"
+FALLBACK_BLOCK = "block"
+
 
 @dataclass
 class ExitNodeState:
@@ -58,8 +62,22 @@ class UplinkState:
     pinned: str | None = None
     active: str | None = None
     killswitch: bool = True
+    #: What the node container does while no exit node can carry traffic: "direct"
+    #: hands it to the entry node's own uplink, "block" drops it.
+    fallback: str = FALLBACK_DIRECT
+    #: Whether that is happening right now.
+    fallback_active: bool = False
     updated_at: datetime | None = None
     nodes: list[ExitNodeState] = field(default_factory=list)
+
+    @property
+    def serving(self) -> bool:
+        """True when a client's traffic is reaching the internet at all.
+
+        Either an exit node is carrying it, or the entry node is while the cascade
+        is down — which is a degraded state, not an outage.
+        """
+        return self.active is not None or (self.fallback_active and self.fallback == FALLBACK_DIRECT)
 
     @property
     def stale(self) -> bool:
@@ -126,11 +144,21 @@ def load_uplink_state() -> UplinkState:
             logger.warning("skipping a malformed uplink entry: %s", exc)
 
     nodes.sort(key=lambda n: (n.priority, n.name))
+
+    # A node container that predates the fallback modes only published "killswitch",
+    # which said the same thing in fewer words.
+    killswitch = bool(raw.get("killswitch", True))
+    fallback = str(raw.get("fallback") or (FALLBACK_BLOCK if killswitch else FALLBACK_DIRECT))
+    if fallback not in (FALLBACK_DIRECT, FALLBACK_BLOCK):
+        fallback = FALLBACK_DIRECT
+
     return UplinkState(
         mode=raw.get("mode") or AUTO,
         pinned=raw.get("pinned"),
         active=raw.get("active"),
-        killswitch=bool(raw.get("killswitch", True)),
+        killswitch=killswitch,
+        fallback=fallback,
+        fallback_active=bool(raw.get("fallback_active", False)),
         updated_at=_timestamp(raw.get("updated_at")),
         nodes=nodes,
     )

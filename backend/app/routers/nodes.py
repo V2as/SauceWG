@@ -114,6 +114,8 @@ def _snapshot(mode: str | None = None, pinned: str | None = None) -> ExitNodeLis
         active=state.active,
         pinned=pinned if mode is not None else state.pinned,
         killswitch=state.killswitch,
+        fallback=state.fallback,
+        fallback_active=state.fallback_active,
         stale=state.stale,
         updated_at=state.updated_at,
         config_error=registry.config_error(),

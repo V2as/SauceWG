@@ -10,7 +10,13 @@ WireGuard to a DPI box.
 
 Any number of exit nodes can be configured. All of them stay connected; one carries
 traffic, and the node fails over to the next healthy one within about 30 seconds when it
-stops answering.
+stops answering. If none of them is usable, the entry node carries the traffic itself
+rather than cutting clients off, and picks the cascade back up as soon as an exit node
+recovers.
+
+Chosen destinations can be sent past the cascade on purpose: a range listed in
+`config/direct-routes.json` leaves through the entry node's own address while everything
+else still goes abroad, which is how a service that has to see a local IP keeps working.
 
 ```
    client                 entry node (unblocked IP)                exit nodes
@@ -19,8 +25,10 @@ stops answering.
  │ laptop │   1.0 – 2.0  │ awg1  10.77.0.2/32    │  awg2  ├──────────────┤
  └────────┘              │ awg2  10.77.0.3/32    │╌╌╌╌╌╌▶ │ eu-de  prio 20│  (standby)
                          │ panel · api · caddy   │  awgN  ├──────────────┤
-                         └───────────────────────┘╌╌╌╌╌╌▶ │ …             │  (standby)
-                                                          └──────────────┘
+                         └───────────┬───────────┘╌╌╌╌╌╌▶ │ …             │  (standby)
+                                     │                    └──────────────┘
+                                     └──▶ internet    listed prefixes, and everything
+                                          (this IP)   else while no exit node is up
 ```
 
 Integrating this into a larger system? [`AWG_USAGE.md`](AWG_USAGE.md) is the reference
@@ -194,6 +202,8 @@ saucewg start | stop | restart
 saucewg logs -f awg            # awg, panel, postgres, caddy
 saucewg update                 # pull newer images and recreate
 saucewg nodes                  # the cascade, with health
+saucewg routes                 # destinations that bypass the cascade
+saucewg fallback               # what happens while every exit node is down
 saucewg protocol               # which AmneziaWG generation this node serves
 saucewg set-protocol 2.0       # move it to another one
 saucewg admin-password         # reset panel credentials
@@ -257,6 +267,8 @@ curl -H "Authorization: Bearer $TOKEN" http://<host>/api/clients
 | `GET` | `/api/nodes/tasks[/{id}]` | progress and logs of a provisioning operation |
 | `POST` | `/api/nodes/{name}/activate` | prefer one exit node |
 | `POST` | `/api/nodes/auto` | drop the preference, back to priority order |
+| `GET/POST` | `/api/routes` | destinations that bypass the cascade / add some |
+| `PUT/DELETE` | `/api/routes/{cidr}` | relabel or disable one / put it back on the cascade |
 | `GET` | `/api/system` | host stats, client counts, live speed, cascade state |
 | `GET` | `/api/system/usage?hours=` | node-wide traffic history |
 | `POST` | `/api/system/sync` | force peer reconciliation |
@@ -326,6 +338,83 @@ three, and `saucewg update-node <name> --protocol …` moves an existing uplink.
 Setting `CASCADE_NODES_JSON` puts the list in the environment instead, which takes
 precedence over the file and makes the panel read-only with respect to the cascade —
 it says so on the Exit nodes page rather than silently ignoring your edits.
+
+### When every exit node is down
+
+`CASCADE_FALLBACK` decides what a total outage looks like to a client:
+
+| Value | While no exit node is usable |
+| --- | --- |
+| `direct` (default) | the entry node carries the traffic; clients stay online, from its address |
+| `block` | client traffic is dropped, as `CASCADE_KILLSWITCH=true` used to do |
+
+Either way it is temporary and automatic: the moment an uplink passes its health check
+again, traffic moves back onto the cascade without touching a tunnel. The node container
+publishes `fallback` and `fallback_active` in `uplinks.json`, so `saucewg fallback`,
+`GET /api/nodes` and the panel all show whether it is in use right now.
+
+`direct` is the default because an entry node that is reachable is more useful than one
+that is silent, but it does mean a client's traffic appears from the entry node's own
+address during an outage. Where that is the thing being avoided, choose `block`:
+
+```bash
+saucewg fallback          # what is configured, and whether it is active
+saucewg fallback block    # recreate the node container with the other mode
+```
+
+An installation made before this existed keeps its behaviour until `saucewg update`,
+which writes `CASCADE_FALLBACK=direct` into `.env` and says so, since it changes what an
+outage looks like. Setting it beforehand — by hand or with `saucewg fallback block` —
+is respected and left alone.
+
+## Routing past the cascade
+
+Some destinations are better off never reaching the exit node: a bank that refuses a
+foreign address, a service that is only fast from the entry node's country, a video
+platform whose CDN answers from the wrong continent. `config/direct-routes.json` lists
+them, and they leave through the entry node's own uplink while everything else still goes
+through the cascade.
+
+```json
+[
+  { "cidr": "142.250.0.0/15", "note": "youtube", "enabled": true },
+  { "cidr": "64.233.160.0/19", "note": "youtube", "enabled": true },
+  { "cidr": "192.0.2.10/32", "note": "one host; a bare address means /32" }
+]
+```
+
+A bare string works too, so `["142.250.0.0/15", "8.8.8.8"]` is a valid file. `enabled:
+false` keeps an entry in the list without routing it, which is the reversible way to
+test whether a prefix was the cause of something.
+
+From the CLI, from the **Routing** page in the panel, or through `/api/routes`:
+
+```bash
+saucewg routes                                        # with which ones are in effect
+saucewg add-route 142.250.0.0/15 --note youtube
+saucewg add-route --from-file youtube-ranges.txt --note youtube
+saucewg remove-route --note youtube                   # the whole group
+```
+
+The node container applies changes within a second, without disturbing a tunnel: each
+prefix becomes one route in table `450`, which is consulted before the cascade table.
+Traffic leaving that way is NATed to the entry node's address, so no configuration is
+needed on the client.
+
+Three things to know:
+
+- **IPv4 only, and no names.** The cascade routes IPv4; a hostname is not resolved, so
+  add the ranges a service actually uses. `scripts/keenetic/gen-routes.py` in this
+  repository resolves a domain list into prefixes if you need a starting point.
+- **`0.0.0.0/0` is refused.** Taking every destination off the cascade is what
+  `saucewg fallback direct` does during an outage; as a route it would silently disable
+  the cascade entirely.
+- **A prefix can be listed and not in effect.** The `active` field, the `direct` column
+  in `saucewg routes` and the badge in the panel all come from what the node container
+  actually installed, not from the file.
+
+`CASCADE_DIRECT_ROUTES` puts the list in the environment instead, with the same
+precedence and the same read-only consequence for the panel as `CASCADE_NODES_JSON`.
 
 ## Monitoring
 
@@ -401,12 +490,15 @@ workflow does.
 
 ## Operating notes
 
-- **Kill switch.** With `CASCADE_KILLSWITCH=true` the entry node only forwards client
-  traffic into an uplink interface. If every exit node is unreachable, clients lose
-  connectivity instead of leaking through the entry node's own address.
-- **Routing.** The entry node uses policy routing (`ip rule from <subnet> lookup 451`)
-  rather than a default route, so SSH and the panel keep using the normal route.
-  Failover is a single `ip route replace default dev awgN table 451`.
+- **Routing.** The entry node uses policy routing rather than a default route, so SSH and
+  the panel keep using the normal one. Client traffic is looked up in table `450`
+  (destinations that bypass the cascade) and then table `451` (everything else);
+  failover is a single `ip route replace default dev awgN table 451`.
+- **Fallback.** `CASCADE_FALLBACK` decides what happens while no exit node is usable:
+  `direct` (the default) empties table 451 so the entry node carries the traffic itself,
+  `block` fills it with an unreachable route so clients are cut off instead. The old
+  `CASCADE_KILLSWITCH=true` is still read on an installation that has no
+  `CASCADE_FALLBACK`, and means `block`.
 - **Performance.** Both hops run the userspace `amneziawg-go`, which is CPU-bound. On a
   2-core VPS expect tens of Mbit/s per node. Installing the AmneziaWG kernel module on the
   host and pointing `WG_QUICK_USERSPACE_IMPLEMENTATION` at it is the usual next step if you
@@ -424,7 +516,7 @@ frontend/         Vue 3 + Vite single-page UI
 docker/awg/       AmneziaWG node image: entrypoint, generations, uplinks + failover monitor
 docker/caddy/     frontend build + Caddy reverse proxy image
 scripts/          bootstrap helpers, the exit node list manager, CI test harnesses
-config/           exit-nodes.json, bind-mounted into the node container
+config/           exit-nodes.json and direct-routes.json, bind-mounted into the node
 .github/workflows/  CI checks and the Docker Hub publish pipeline
 AWG_USAGE.md      integration reference for managing users from a central API
 SAUCEWG_USAGE.md  installing and managing servers, from a shell or a bot

@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # The exit node list, bind-mounted read-write from the host so the panel can
     # edit the same file the node container reads.
     node_registry_file: str = "/etc/saucewg/host/exit-nodes.json"
+    # Destinations that bypass the cascade, in the same bind-mounted directory. The
+    # node container reads it from its own side of the mount.
+    routes_registry_file: str = "/etc/saucewg/host/direct-routes.json"
     # Set to false to make the panel read-only with respect to the cascade, e.g.
     # when the node list is managed by configuration management.
     node_provision_enabled: bool = True

@@ -36,6 +36,7 @@ COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
 ROLE_FILE="${APP_DIR}/.role"
 CONFIG_DIR="${APP_DIR}/config"
 NODES_FILE="${CONFIG_DIR}/exit-nodes.json"
+ROUTES_FILE="${CONFIG_DIR}/direct-routes.json"
 
 JSON_OUTPUT=false
 ASSUME_YES=false
@@ -512,9 +513,14 @@ services:
       CASCADE_PROTOCOL_DEFAULT: ${CASCADE_PROTOCOL_DEFAULT:-}
       CASCADE_MTU: ${CASCADE_MTU:-1380}
       CASCADE_KEEPALIVE: ${CASCADE_KEEPALIVE:-25}
-      CASCADE_KILLSWITCH: ${CASCADE_KILLSWITCH:-true}
+      # Both empty by default so the node can tell "not chosen" from "chosen": an
+      # .env written before CASCADE_FALLBACK existed keeps its kill switch.
+      CASCADE_FALLBACK: ${CASCADE_FALLBACK:-}
+      CASCADE_KILLSWITCH: ${CASCADE_KILLSWITCH:-}
       CASCADE_NODES_JSON: ${CASCADE_NODES_JSON:-}
       CASCADE_NODES_FILE: ${CASCADE_NODES_FILE:-/etc/amnezia/host/exit-nodes.json}
+      CASCADE_DIRECT_ROUTES: ${CASCADE_DIRECT_ROUTES:-}
+      CASCADE_DIRECT_FILE: ${CASCADE_DIRECT_FILE:-/etc/amnezia/host/direct-routes.json}
       CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
       CASCADE_PROBE_ENABLED: ${CASCADE_PROBE_ENABLED:-true}
       CASCADE_PROBE_TARGET: ${CASCADE_PROBE_TARGET:-1.1.1.1}
@@ -572,6 +578,7 @@ services:
       USAGE_RETENTION_DAYS: ${USAGE_RETENTION_DAYS:-90}
       SUBSCRIPTION_URL_PREFIX: ${SUBSCRIPTION_URL_PREFIX:-}
       NODE_REGISTRY_FILE: ${NODE_REGISTRY_FILE:-/etc/saucewg/host/exit-nodes.json}
+      ROUTES_REGISTRY_FILE: ${ROUTES_REGISTRY_FILE:-/etc/saucewg/host/direct-routes.json}
       NODE_PROVISION_ENABLED: ${NODE_PROVISION_ENABLED:-true}
       NODE_DEFAULT_PORT: ${NODE_DEFAULT_PORT:-51820}
       NODE_SSH_TIMEOUT_SECONDS: ${NODE_SSH_TIMEOUT_SECONDS:-900}
@@ -802,8 +809,13 @@ CASCADE_ENABLED=true
 CASCADE_PROTOCOL_DEFAULT=${protocol}
 CASCADE_MTU=1380
 CASCADE_KEEPALIVE=25
-CASCADE_KILLSWITCH=true
+# While every exit node is down: direct = this entry node carries client traffic
+# until one recovers, block = drop it. See: saucewg fallback
+CASCADE_FALLBACK=direct
 CASCADE_NODES_FILE=/etc/amnezia/host/exit-nodes.json
+# Destinations that skip the cascade. See: saucewg routes
+CASCADE_DIRECT_FILE=/etc/amnezia/host/direct-routes.json
+CASCADE_DIRECT_ROUTES=
 CASCADE_UPLINK_SUBNET=${uplink_subnet}
 CASCADE_PROBE_ENABLED=true
 CASCADE_PROBE_TARGET=1.1.1.1
@@ -830,6 +842,7 @@ USAGE_RETENTION_DAYS=90
 SUBSCRIPTION_URL_PREFIX=
 
 NODE_REGISTRY_FILE=/etc/saucewg/host/exit-nodes.json
+ROUTES_REGISTRY_FILE=/etc/saucewg/host/direct-routes.json
 NODE_PROVISION_ENABLED=true
 NODE_DEFAULT_PORT=51820
 NODE_SSH_TIMEOUT_SECONDS=900
@@ -1529,6 +1542,275 @@ cmd_update_node() {
 }
 
 # ---------------------------------------------------------------------------
+# Direct routes and the fallback (entry node)
+# ---------------------------------------------------------------------------
+
+routes_file() {
+    mkdir -p "$CONFIG_DIR"
+    [ -f "$ROUTES_FILE" ] || { printf '[]\n' > "$ROUTES_FILE"; chmod 600 "$ROUTES_FILE"; }
+    printf '%s' "$ROUTES_FILE"
+}
+
+# The list as it stands, for reading. An absent file is an empty list rather than
+# something to create: listing should not need write access to anything.
+routes_json() {
+    [ -f "$ROUTES_FILE" ] && jq '.' "$ROUTES_FILE" 2>/dev/null || printf '[]'
+}
+
+# The same masking the node container applies, so what is written here is what shows
+# up in the routing table: a bare address is a single host, and an address inside a
+# range is recorded as the range. Prints nothing for anything that is not an IPv4
+# prefix.
+normalize_prefix() {
+    printf '%s' "$1" | jq -Rr '
+        gsub("^\\s+|\\s+$"; "")
+        | if (test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}(/[0-9]{1,2})?$") | not) then ""
+          else
+            split("/") as $parts
+            | (if ($parts | length) == 2 then ($parts[1] | tonumber) else 32 end) as $bits
+            | ($parts[0] | split(".") | map(tonumber)) as $o
+            | if $bits < 1 or $bits > 32 or ([$o[] | select(. > 255)] | length) > 0 then ""
+              else
+                ($o[0] * 16777216 + $o[1] * 65536 + $o[2] * 256 + $o[3]) as $addr
+                | (pow(2; 32 - $bits) | floor) as $size
+                | ($addr - ($addr % $size)) as $net
+                | "\(($net / 16777216) | floor).\((($net % 16777216) / 65536) | floor).\((($net % 65536) / 256) | floor).\($net % 256)/\($bits)"
+              end
+          end'
+}
+
+cmd_add_route() {
+    need_root add-route
+    require_entry
+
+    local note="" reload=true from_file="" args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --note) note=$2; shift 2 ;;
+            --from-file) from_file=$2; shift 2 ;;
+            --no-reload) reload=false; shift ;;
+            -*) die "unknown option for add-route: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+
+    # A list of prefixes generated elsewhere — resolved from domain names, exported
+    # from a router — is the usual way these arrive, so a whole file can be handed
+    # over at once. Blank lines and comments are skipped.
+    if [ -n "$from_file" ]; then
+        [ -f "$from_file" ] || die "no such file: ${from_file}"
+        local line
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=${line%%#*}
+            line=$(printf '%s' "$line" | tr -d '[:space:]')
+            [ -n "$line" ] && args+=("$line")
+        done < "$from_file"
+    fi
+
+    [ "${#args[@]}" -gt 0 ] || die "add-route needs at least one address or range"
+
+    # Everything is validated before anything is written: half of a pasted list is
+    # worse than none of it, since the half that landed is not obvious afterwards.
+    local prefix normalized wanted='[]'
+    for prefix in "${args[@]}"; do
+        # A /0 is every destination, which is the cascade turned off rather than a
+        # route past it — worth naming, because the alternative really does exist.
+        case "$prefix" in
+            */0) die "${prefix} would take every destination off the cascade; you may want: saucewg fallback direct" ;;
+        esac
+        normalized=$(normalize_prefix "$prefix")
+        [ -n "$normalized" ] || die "not an IPv4 address or range: ${prefix}"
+        wanted=$(printf '%s' "$wanted" | jq --arg c "$normalized" '. + [$c]')
+    done
+
+    local file before after added skipped
+    file=$(routes_file)
+    before=$(jq 'length' "$file")
+    # Appended one at a time against the list as it grows, so a prefix that is already
+    # there — or repeated in the input — is left alone rather than duplicated. An
+    # existing entry keeps its own label: re-importing a group that has grown should
+    # add what is new, not rewrite what is not.
+    jq --argjson wanted "$wanted" --arg note "$note" '
+        reduce $wanted[] as $cidr (.;
+            if [.[] | (.cidr // .)] | index($cidr) then .
+            else . + [{cidr: $cidr, enabled: true}
+                      + (if $note == "" then {} else {note: $note} end)]
+            end)' "$file" > "${file}.tmp"
+    mv "${file}.tmp" "$file"
+    chmod 600 "$file"
+    after=$(jq 'length' "$file")
+    added=$((after - before))
+    skipped=$(( ${#args[@]} - added ))
+
+    log "added ${added} direct route(s)$([ "$skipped" -gt 0 ] && printf ', %s already listed' "$skipped")"
+    if [ "$reload" = true ]; then
+        request_reload
+    else
+        note "not applied yet; apply it with: saucewg reload"
+    fi
+
+    [ "$JSON_OUTPUT" = false ] || jq -n --argjson added "$added" --argjson skipped "$skipped" \
+        --slurpfile routes "$file" '{ok: true, added: $added, skipped: $skipped, routes: $routes[0]}'
+}
+
+cmd_remove_route() {
+    need_root remove-route
+    require_entry
+
+    local note="" reload=true args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --note) note=$2; shift 2 ;;
+            --no-reload) reload=false; shift ;;
+            -*) die "unknown option for remove-route: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -gt 0 ] || [ -n "$note" ] \
+        || die "remove-route needs an address, a range, or --note <group>"
+
+    local file prefix normalized wanted='[]' before after
+    file=$(routes_file)
+    for prefix in ${args[@]+"${args[@]}"}; do
+        normalized=$(normalize_prefix "$prefix")
+        [ -n "$normalized" ] || die "not an IPv4 address or range: ${prefix}"
+        wanted=$(printf '%s' "$wanted" | jq --arg c "$normalized" '. + [$c]')
+    done
+
+    before=$(jq 'length' "$file")
+    jq --argjson wanted "$wanted" --arg note "$note" '
+        map(select(
+            ((.cidr // .) as $c | $wanted | index($c) | not)
+            and (if $note == "" then true else (.note // "") != $note end)))' "$file" > "${file}.tmp"
+    mv "${file}.tmp" "$file"
+    chmod 600 "$file"
+    after=$(jq 'length' "$file")
+
+    [ "$before" -ne "$after" ] || die "nothing matched; see: saucewg routes"
+    log "removed $((before - after)) direct route(s)"
+
+    if [ "$reload" = true ]; then
+        request_reload
+    else
+        note "not applied yet; apply it with: saucewg reload"
+    fi
+
+    [ "$JSON_OUTPUT" = false ] || jq -n --argjson removed "$((before - after))" \
+        --slurpfile routes "$file" '{ok: true, removed: $removed, routes: $routes[0]}'
+}
+
+cmd_routes() {
+    require_entry
+    local routes state applied='[]' live=false
+    routes=$(routes_json)
+
+    # What the node container actually installed, which is the answer that matters:
+    # an entry can be listed here and still not be in effect.
+    state=$(compose exec -T awg cat /var/run/amneziawg/uplinks.json 2>/dev/null) || state=""
+    if printf '%s' "$state" | jq -e 'has("direct")' >/dev/null 2>&1; then
+        live=true
+        applied=$(printf '%s' "$state" | jq -c '.direct.routes // []')
+    fi
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        printf '%s' "$routes" | jq --argjson applied "$applied" --argjson live "$live" \
+            '{routes: ., applied: $applied, live: $live}'
+        return
+    fi
+
+    if [ "$(printf '%s' "$routes" | jq 'length')" -eq 0 ]; then
+        note "no direct routes; every destination goes through the cascade"
+        note "add one with: saucewg add-route 142.250.0.0/15 --note youtube"
+        return
+    fi
+
+    # A hand-written list may hold bare strings, and `.enabled // true` would read an
+    # explicit false as true, so each entry is normalised to an object first. The
+    # prefix is shown the way the node container states it — a bare address is a /32
+    # there — or nothing would ever match what it reports as applied.
+    printf '%s' "$routes" | jq -r --argjson applied "$applied" --argjson live "$live" '
+        "PREFIX\tSTATUS\tNOTE",
+        (.[]
+         | (if type == "string" then {cidr: .} else . end) as $r
+         | (if ($r.cidr | test("/")) then $r.cidr else "\($r.cidr)/32" end) as $cidr
+         | "\($cidr)\t" +
+           (if $r.enabled == false then "off"
+            elif ($live | not) then "unknown"
+            elif ($applied | index($cidr)) then "direct"
+            else "pending" end) +
+           "\t\($r.note // "-")")' | column -t -s "$(printf '\t')"
+
+    local error
+    error=$(printf '%s' "$state" | jq -r '.direct.error // ""' 2>/dev/null) || error=""
+    [ -z "$error" ] || warn "$error"
+}
+
+# What happens to client traffic while every exit node is down.
+cmd_fallback() {
+    require_entry
+
+    local mode="${1:-}" restart=true
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-restart) restart=false; shift ;;
+            *) die "unknown option for fallback: $1" ;;
+        esac
+    done
+
+    if [ -z "$mode" ]; then
+        local configured legacy state active=""
+        configured=$(env_get "$ENV_FILE" CASCADE_FALLBACK || true)
+        legacy=$(env_get "$ENV_FILE" CASCADE_KILLSWITCH || true)
+        if [ -z "$configured" ]; then
+            case "$legacy" in
+                true|1|yes|on) configured=block ;;
+                *) configured=direct ;;
+            esac
+        fi
+        state=$(compose exec -T awg jq -r '"\(.fallback) \(.fallback_active)"' \
+            /var/run/amneziawg/uplinks.json 2>/dev/null) || state=""
+        [ -z "$state" ] || active=${state#* }
+
+        if [ "$JSON_OUTPUT" = true ]; then
+            jq -n --arg mode "$configured" --arg active "$active" \
+                '{fallback: $mode, active: (if $active == "" then null else $active == "true" end)}'
+        else
+            note "fallback  ${configured}"
+            case "$configured" in
+                direct) note "          while every exit node is down, clients leave through this entry node" ;;
+                *) note "          while every exit node is down, client traffic is dropped" ;;
+            esac
+            [ "$active" != "true" ] || warn "it is in use right now: no exit node is carrying traffic"
+        fi
+        return
+    fi
+
+    case "$mode" in
+        direct|block) ;;
+        *) die "fallback takes direct or block" ;;
+    esac
+    need_root "fallback ${mode}"
+
+    env_set "$ENV_FILE" CASCADE_FALLBACK "$mode"
+    # The legacy name would win on a node whose .env still carries it, and it can
+    # only say "block".
+    grep -q '^CASCADE_KILLSWITCH=' "$ENV_FILE" && env_set "$ENV_FILE" CASCADE_KILLSWITCH ""
+    log "fallback set to ${mode}"
+
+    if [ "$restart" = true ]; then
+        step "Applying"
+        # An environment change only reaches the process through a new container.
+        compose up -d awg >&2
+        note "connected clients reconnect on their own within a few seconds"
+    else
+        note "not applied yet; apply it with: saucewg restart"
+    fi
+
+    [ "$JSON_OUTPUT" = false ] || jq -n --arg mode "$mode" '{ok: true, fallback: $mode}'
+}
+
+# ---------------------------------------------------------------------------
 # AmneziaWG generation
 # ---------------------------------------------------------------------------
 
@@ -1767,6 +2049,21 @@ cmd_update() {
             || env_set "$ENV_FILE" NODE_SSH_KEY_FILE /etc/saucewg/host/panel-ssh-key
         grep -q '^NODE_SSH_KEY_ENABLED=' "$ENV_FILE" \
             || env_set "$ENV_FILE" NODE_SSH_KEY_ENABLED true
+        grep -q '^ROUTES_REGISTRY_FILE=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" ROUTES_REGISTRY_FILE /etc/saucewg/host/direct-routes.json
+        grep -q '^CASCADE_DIRECT_FILE=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" CASCADE_DIRECT_FILE /etc/amnezia/host/direct-routes.json
+
+        # Before this release the only choice was to block client traffic while every
+        # exit node was down. Carrying it through the entry node instead keeps clients
+        # online, so it becomes the default here — but it is written into the .env and
+        # announced rather than assumed, because it changes which address a client's
+        # traffic appears from during an outage.
+        if ! grep -q '^CASCADE_FALLBACK=' "$ENV_FILE"; then
+            env_set "$ENV_FILE" CASCADE_FALLBACK direct
+            note "while every exit node is down, clients now leave through this entry node instead of being cut off"
+            note "  keep the old behaviour with: saucewg fallback block"
+        fi
     else
         write_exit_compose
         env_set "$ENV_FILE" IMAGE_AWG "$(image_ref awg)"
@@ -1950,6 +2247,13 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
     reload                   Re-read the exit node list without a restart
     admin-password           Reset the panel admin password
 
+  Routing (entry node)
+    routes                   Destinations that bypass the cascade
+    add-route CIDR…          Send an address or range through this entry node
+                             (--note GROUP labels them, --from-file PATH reads a list)
+    remove-route CIDR…       Put them back on the cascade (--note GROUP removes a group)
+    fallback [direct|block]  What happens while every exit node is down
+
   Exit node
     node-info                Print this node's pairing object
     node-pair --peer-key K   Install the entry node's uplink key here
@@ -2027,6 +2331,7 @@ main() {
     ROLE_FILE="${APP_DIR}/.role"
     CONFIG_DIR="${APP_DIR}/config"
     NODES_FILE="${CONFIG_DIR}/exit-nodes.json"
+    ROUTES_FILE="${CONFIG_DIR}/direct-routes.json"
 
     set -- ${args[@]+"${args[@]}"}
 
@@ -2049,6 +2354,10 @@ main() {
         uplink-key)       cmd_uplink_key "$@" ;;
         reload)           cmd_reload "$@" ;;
         admin-password)   cmd_admin_password "$@" ;;
+        routes|list-routes) cmd_routes "$@" ;;
+        add-route)        cmd_add_route "$@" ;;
+        remove-route)     cmd_remove_route "$@" ;;
+        fallback)         cmd_fallback "$@" ;;
         node-info)        cmd_node_info "$@" ;;
         node-pair)        cmd_node_pair "$@" ;;
         protocol)         cmd_protocol "$@" ;;

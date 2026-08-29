@@ -1,0 +1,14 @@
+route ADD 64.233.160.0 MASK 255.255.224.0 0.0.0.0 :: rem Gemini Google
+route ADD 66.102.0.0 MASK 255.255.240.0 0.0.0.0 :: rem Gemini Google
+route ADD 66.249.64.0 MASK 255.255.224.0 0.0.0.0 :: rem Gemini Google
+route ADD 72.14.192.0 MASK 255.255.192.0 0.0.0.0 :: rem Gemini Google
+route ADD 74.125.0.0 MASK 255.255.0.0 0.0.0.0 :: rem Gemini Google
+route ADD 108.177.0.0 MASK 255.255.128.0 0.0.0.0 :: rem Gemini Google
+route ADD 142.250.0.0 MASK 255.254.0.0 0.0.0.0 :: rem Gemini Google
+route ADD 172.217.0.0 MASK 255.255.0.0 0.0.0.0 :: rem Gemini Google
+route ADD 172.253.0.0 MASK 255.255.0.0 0.0.0.0 :: rem Gemini Google
+route ADD 173.194.0.0 MASK 255.255.0.0 0.0.0.0 :: rem Gemini Google
+route ADD 192.178.0.0 MASK 255.254.0.0 0.0.0.0 :: rem Gemini Google
+route ADD 209.85.128.0 MASK 255.255.128.0 0.0.0.0 :: rem Gemini Google
+route ADD 216.58.192.0 MASK 255.255.224.0 0.0.0.0 :: rem Gemini Google
+route ADD 216.239.32.0 MASK 255.255.224.0 0.0.0.0 :: rem Gemini Google

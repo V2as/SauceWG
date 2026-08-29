@@ -72,11 +72,21 @@ services:
       CASCADE_PROTOCOL_DEFAULT: ${CASCADE_PROTOCOL_DEFAULT:-}
       CASCADE_MTU: ${CASCADE_MTU:-1380}
       CASCADE_KEEPALIVE: ${CASCADE_KEEPALIVE:-25}
-      CASCADE_KILLSWITCH: ${CASCADE_KILLSWITCH:-true}
+      # What happens while no exit node is usable: `direct` carries client traffic out
+      # of this entry node until one recovers, `block` drops it. Both are passed empty
+      # by default so the node can tell "unset" from "chosen": an .env that predates
+      # CASCADE_FALLBACK and asked for the kill switch keeps blocking.
+      CASCADE_FALLBACK: ${CASCADE_FALLBACK:-}
+      CASCADE_KILLSWITCH: ${CASCADE_KILLSWITCH:-}
       # The exit node list. CASCADE_NODES_JSON wins when set; otherwise the file is
       # read from the bind-mounted ./config directory.
       CASCADE_NODES_JSON: ${CASCADE_NODES_JSON:-}
       CASCADE_NODES_FILE: ${CASCADE_NODES_FILE:-/etc/amnezia/host/exit-nodes.json}
+      # Destinations that bypass the cascade and leave through this entry node.
+      # CASCADE_DIRECT_ROUTES wins when set; otherwise the file the panel edits is
+      # read from the same bind-mounted ./config directory.
+      CASCADE_DIRECT_ROUTES: ${CASCADE_DIRECT_ROUTES:-}
+      CASCADE_DIRECT_FILE: ${CASCADE_DIRECT_FILE:-/etc/amnezia/host/direct-routes.json}
       CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
       # Failover tuning.
       CASCADE_PROBE_ENABLED: ${CASCADE_PROBE_ENABLED:-true}
@@ -166,6 +176,9 @@ services:
       # Exit node management. The panel edits the same exit-nodes.json the node
       # container reads and then asks it to reload — no Docker socket needed.
       NODE_REGISTRY_FILE: ${NODE_REGISTRY_FILE:-/etc/saucewg/host/exit-nodes.json}
+      # The direct route list, edited by the panel and read by the node container from
+      # the other side of the same bind mount.
+      ROUTES_REGISTRY_FILE: ${ROUTES_REGISTRY_FILE:-/etc/saucewg/host/direct-routes.json}
       NODE_PROVISION_ENABLED: ${NODE_PROVISION_ENABLED:-true}
       NODE_DEFAULT_PORT: ${NODE_DEFAULT_PORT:-51820}
       NODE_SSH_TIMEOUT_SECONDS: ${NODE_SSH_TIMEOUT_SECONDS:-900}

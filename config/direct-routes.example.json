@@ -1,0 +1,22 @@
+[
+  {
+    "cidr": "64.233.160.0/19",
+    "note": "youtube - leaves through the entry node, not the exit node",
+    "enabled": true
+  },
+  {
+    "cidr": "142.250.0.0/15",
+    "note": "youtube",
+    "enabled": true
+  },
+  {
+    "cidr": "192.0.2.10/32",
+    "note": "a single host; a bare address means /32",
+    "enabled": true
+  },
+  {
+    "cidr": "198.51.100.0/24",
+    "note": "kept in the list but not routed while enabled is false",
+    "enabled": false
+  }
+]

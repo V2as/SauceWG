@@ -306,7 +306,9 @@ GET /api/nodes
   "mode": "auto",
   "active": "eu-primary",
   "pinned": null,
-  "killswitch": true,
+  "killswitch": false,
+  "fallback": "direct",
+  "fallback_active": false,
   "stale": false,
   "updated_at": "2026-08-14T14:31:02Z",
   "config_error": null,
@@ -350,7 +352,9 @@ GET /api/nodes
 | `public_key` | the **entry node's** key for this uplink — this is what you install on the exit node |
 | `peer_public_key` | the exit node's key |
 | `latency_ms` | round trip through the tunnel to `CASCADE_PROBE_TARGET` |
-| `killswitch` | when `true`, clients are cut off rather than leaked via the entry IP if every uplink dies |
+| `fallback` | what happens if every uplink dies: `direct` carries client traffic through the entry node, `block` drops it |
+| `fallback_active` | **check this too.** `true` means that is happening now: with `direct`, users are online but leaving from the entry node's address; with `block`, they are cut off |
+| `killswitch` | the same thing for clients written before there were two modes; exactly `fallback == "block"` |
 | `stale` | **check this.** `true` means the node container stopped publishing state, so every health field below is untrustworthy |
 | `config_error` | a complete sentence explaining why the cascade is not what this panel thinks it is — a list the node container refused, or a `CASCADE_NODES_JSON` overriding the file. `null` when all is well |
 | `provisioning` | `false` when this panel cannot edit the cascade, so the write calls below are refused — `403` when provisioning is switched off, `409` when `CASCADE_NODES_JSON` owns the list |
@@ -377,6 +381,44 @@ On a switch the container rewrites one route and drops stale NAT conntrack entri
 existing flows re-establish instead of black-holing. Users keep their tunnel to the
 entry node throughout — they see a new exit IP and broken TCP sessions, not a
 disconnect.
+
+### When there is nothing to fail over to
+
+If no uplink passes its checks, `CASCADE_FALLBACK` on the entry node decides what users
+experience:
+
+| Value | Effect | `GET /api/nodes` |
+| --- | --- | --- |
+| `direct` (default) | the entry node carries client traffic itself | `active: null`, `fallback_active: true` |
+| `block` | client traffic is dropped | `active: null`, `fallback_active: true` |
+
+Either way `active` is `null` and `cascade.connected` in `GET /api/system` is `false`:
+those describe the cascade, which is down in both cases. `fallback` tells the two apart,
+and it matters to a central API for a reason worth stating plainly — under `direct`,
+users are **online, from the entry node's address**, which for an entry node in a
+censored country is exactly the exposure the cascade exists to avoid. It is temporary
+and reverts on its own the moment an uplink recovers, but a status page that reports
+"connected" without saying which address the traffic is leaving from is lying by
+omission.
+
+An alert worth having:
+
+```python
+state = get("/api/nodes")
+if state["fallback_active"] and not state["stale"]:
+    if state["fallback"] == "direct":
+        alert("every exit node is down; users are leaving via the entry node's IP")
+    else:
+        alert("every exit node is down; users are cut off")
+```
+
+`killswitch` is still published and is exactly `fallback == "block"`, so an integration
+written before this existed keeps working. A node container older than the panel
+publishes only `killswitch`, and the panel reports `fallback` accordingly.
+
+The mode is set on the entry node, not through the API — `saucewg fallback direct|block`,
+or `CASCADE_FALLBACK` in `.env` — because it is a property of that node's deployment
+rather than something to toggle per request.
 
 ### Steering it
 
@@ -468,7 +510,84 @@ variable, which takes precedence over the file.
 
 ---
 
-## 7. Node information
+## 7. Routing past the cascade
+
+Individual destinations can be taken off the cascade and sent out of the entry node's own
+uplink: a service that refuses a foreign address, one that is only fast locally, or one
+you would simply rather not carry abroad. Everything not listed still goes to the active
+exit node.
+
+```http
+GET    /api/routes            # the list, with what is actually in effect
+POST   /api/routes            # add one or more prefixes
+PUT    /api/routes/{cidr}     # relabel one, or turn it off without losing it
+DELETE /api/routes/{cidr}     # put that destination back on the cascade
+```
+
+```json
+{
+  "routes": [
+    { "cidr": "142.250.0.0/15", "note": "youtube", "enabled": true, "active": true },
+    { "cidr": "8.8.8.8/32", "note": "youtube", "enabled": true, "active": false }
+  ],
+  "via": "eth0",
+  "live": true,
+  "editable": true,
+  "config_error": null
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `cidr` | the destination, always masked to its network — `8.8.8.8` is stored as `8.8.8.8/32` |
+| `enabled` | `false` keeps the entry in the list without routing it |
+| `active` | **the one that matters.** `true` when the node container has it in its routing table; `false` means listed but not in effect |
+| `via` | the entry node's own interface these leave through |
+| `live` | `false` when the node container is not publishing routing state — stopped, or older than this feature — so every `active` above is unknown rather than false |
+| `editable` | `false` when this panel cannot write the list (`NODE_PROVISION_ENABLED=false`) |
+| `config_error` | why the list on file is not the list in effect, as a sentence, or `null` |
+
+Adding takes an array, because these arrive in groups — every range a service resolves
+to:
+
+```http
+POST /api/routes
+{ "cidr": ["142.250.0.0/15", "64.233.160.0/19", "8.8.8.8"], "note": "youtube" }
+```
+
+Prefixes already listed are skipped rather than rejected, so re-posting a group after it
+has grown adds only what is new. The response is the whole list, in the same shape as
+`GET`. A `note` is free text and is the handle for removing a group later — the panel and
+the CLI both group by it.
+
+The path parameter contains a slash and is taken literally: `DELETE /api/routes/142.250.0.0/15`.
+Encoding it as `%2F` works too.
+
+**Rules the API enforces:**
+
+* **IPv4 only.** An IPv6 prefix is a `400`: the cascade routes IPv4, so an IPv6
+  destination bypasses it already.
+* **No hostnames.** Nothing is resolved. Resolve in your own system and post the
+  addresses — which is also the only honest way to do it, since a name that answers with
+  a different address tomorrow would silently stop being routed.
+* **`0.0.0.0/0` is a `400`.** Taking every destination off the cascade is
+  `CASCADE_FALLBACK=direct`, not a route.
+* **Host bits are masked, not rejected.** `10.20.30.40/24` is stored as `10.20.30.0/24`,
+  because that is what it means and the kernel would refuse the literal form.
+
+Changes reach the node container within a second and disturb no tunnel. `active` is what
+to poll if you need to confirm one landed; a prefix that stays `false` with `live: true`
+and a `config_error` means the container could not install it — most often because the
+entry node has no default route of its own to send it out of.
+
+Writes answer `409` when the list is not the panel's to edit, with the reason in
+`detail`: `NODE_PROVISION_ENABLED=false`, or a `CASCADE_DIRECT_ROUTES` environment
+variable overriding the file. The equivalent on the entry node itself is
+`saucewg routes`, `saucewg add-route` and `saucewg remove-route`.
+
+---
+
+## 8. Node information
 
 ```http
 GET /api/system
@@ -495,10 +614,17 @@ Host metrics, client totals, live throughput, and the cascade summary:
     "peer_public_key": "ASPc…=", "last_handshake_at": "2026-08-14T14:23:06Z",
     "rx_bytes": 3092, "tx_bytes": 87289,
     "node": "eu-primary", "mode": "auto",
-    "nodes_total": 2, "nodes_healthy": 2
+    "nodes_total": 2, "nodes_healthy": 2,
+    "fallback": "direct", "fallback_active": false,
+    "direct_routes": 3
   }
 }
 ```
+
+`cascade.connected` describes the cascade only: it is `false` whenever no exit node is
+carrying traffic, including while `fallback_active` is `true` and users are online
+through the entry node. `direct_routes` counts the prefixes actually installed in the
+bypass table.
 
 `node_ready` is `false` while the node container is still starting; config rendering
 fails with `503` until it flips. `total_up`/`total_down` are lifetime sums across all
@@ -526,7 +652,7 @@ as a liveness probe.
 
 ---
 
-## 8. Errors
+## 9. Errors
 
 FastAPI's shape throughout:
 
@@ -553,7 +679,7 @@ Restrict `CORS_ORIGINS` too — it defaults to `*`.
 
 ---
 
-## 9. Integration recipes
+## 10. Integration recipes
 
 **Provision a user**
 
@@ -595,10 +721,15 @@ resets.
 Alert when any of these hold for more than a couple of poll cycles:
 
 * `GET /api/nodes` → `stale == true` — the node container's monitor died.
-* `nodes_healthy == 0` — every exit is down; with the kill switch armed all users are
-  offline by design.
+* `nodes_healthy == 0` — every exit is down. What that means for users depends on
+  `fallback`: they are either online from the entry node's own address or offline by
+  design, and both deserve an alert.
+* `fallback_active == true` while `stale == false` — the same thing, stated by the node
+  container itself rather than inferred.
 * `active` differs from the lowest-priority healthy node for a sustained period.
 * `GET /api/system` → `node_ready == false` after startup.
+* `GET /api/routes` → an entry with `enabled: true`, `active: false` and `live: true`
+  for more than a poll cycle — a bypass route that is configured but not in force.
 
 **Move users off an exit node for maintenance**
 
@@ -618,7 +749,7 @@ must not block operations on the others.
 
 ---
 
-## 10. Configuration reference
+## 11. Configuration reference
 
 Values the central system may need to know about, set in the entry node's `.env`.
 
@@ -635,14 +766,16 @@ Values the central system may need to know about, set in the entry node's `.env`
 | `ONLINE_TIMEOUT_SECONDS` | 180 | how long after the last handshake a client still reads as online |
 | `USAGE_BUCKET_MINUTES` / `USAGE_RETENTION_DAYS` | 60 / 90 | granularity and history of the usage series |
 | `CASCADE_PROBE_INTERVAL` / `CASCADE_FAIL_THRESHOLD` | 10 / 3 | failover detection time |
-| `CASCADE_KILLSWITCH` | `true` | whether a total uplink outage blocks users or leaks via the entry IP |
+| `CASCADE_FALLBACK` | `direct` | during a total uplink outage: `direct` carries users through the entry node, `block` cuts them off |
+| `CASCADE_KILLSWITCH` | — | the previous name for the same choice; read only when `CASCADE_FALLBACK` is unset, where `true` means `block` |
+| `CASCADE_DIRECT_ROUTES` | — | a JSON array of prefixes to route past the cascade, overriding the file and making §7 read-only |
 | `NODE_PROVISION_ENABLED` | `true` | `false` makes the cascade read-only through the API — see [`SAUCEWG_USAGE.md` §6](SAUCEWG_USAGE.md#6-files-on-the-server) |
 | `CORS_ORIGINS` | `*` | tighten before exposing the panel |
 | `DOCS_ENABLED` | `true` | `/api/docs` serves live OpenAPI; `/api/openapi.json` is the machine-readable contract |
 
 ---
 
-## 11. Things that will surprise you
+## 12. Things that will surprise you
 
 * **`name` is the primary key in the API.** Renaming a client changes every URL. Use
   immutable IDs from your system as names.
@@ -655,6 +788,11 @@ Values the central system may need to know about, set in the entry node's `.env`
 * **Editing the exit node list restarts nothing.** The node container re-reads it
   within a second and rebuilds only the interfaces that changed, so adding or removing
   a node is invisible to everyone except the users on the node being removed.
+* **A total outage does not mean users are offline.** With the default
+  `CASCADE_FALLBACK=direct` they stay connected and leave through the entry node's own
+  address until an exit node recovers. Read `fallback_active`, not just `active`.
+* **A direct route is a destination, not a client setting.** It applies to every client
+  on the node, needs nothing on their side, and is invisible in their profile.
 * **The panel has no rate limiting.** Keep your poll loops to the cadences in §5.
 * **There is no pagination cursor**, only offset/limit against a live table; a client
   created mid-scan can shift rows. Sort by `created_at asc` when you need a stable scan.

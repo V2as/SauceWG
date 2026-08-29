@@ -207,6 +207,8 @@ surface, available on both roles:
 | `saucewg update [--tag T]` | Pull newer images, regenerate the compose file, restart |
 | `saucewg uninstall [--purge]` | Remove containers and volumes; `--purge` also deletes the directory and the CLI |
 | `saucewg info` | Machine-readable status — always JSON, whatever the flags |
+| `saucewg routes` | *(entry node)* Destinations that bypass the cascade — see §4.5 |
+| `saucewg fallback [direct\|block]` | *(entry node)* What happens while every exit node is down — see §4.6 |
 | `saucewg protocol` | Which AmneziaWG generation this node serves, and what it is carrying |
 | `saucewg set-protocol V [--signature N]` | Move it to another generation and restart the node container |
 | `saucewg signatures` | The `I1` presets, with what each one imitates |
@@ -248,10 +250,11 @@ account had issued.
 
 ---
 
-## 4. Adding and removing exit nodes
+## 4. The cascade: exit nodes and routing
 
-There are three ways to do it. They all end up writing the same file, so they can be
-mixed freely.
+Exit nodes can be added and removed in three ways. They all end up writing the same
+file, so they can be mixed freely. Which destinations use the cascade at all (§4.5) and
+what happens when none of it is available (§4.6) are set on the entry node.
 
 ### 4.1 From the panel (what an operator sees)
 
@@ -335,6 +338,98 @@ node never renumbers the others.
 
 Connected users are unaffected by any of this unless the node carrying their traffic is
 the one being removed, in which case they fail over.
+
+### 4.5 Routing past the cascade
+
+Some destinations are better off leaving through the entry node itself: a service that
+refuses a foreign address, one that is only fast from the entry node's country, or one
+you would rather not carry abroad. Listing a prefix takes it off the cascade; everything
+else still goes to the active exit node.
+
+```bash
+saucewg routes                                       # with which ones are in effect
+saucewg add-route 142.250.0.0/15 --note youtube      # a range
+saucewg add-route 8.8.8.8                            # a single host
+saucewg add-route --from-file ranges.txt --note youtube
+saucewg remove-route 8.8.8.8
+saucewg remove-route --note youtube                  # the whole group
+```
+
+| Command | Purpose |
+| --- | --- |
+| `saucewg routes` | The bypass list, and whether each entry is actually installed (alias `list-routes`) |
+| `saucewg add-route CIDR…` | Route one or more destinations through this entry node |
+| `saucewg add-route --from-file PATH` | The same, reading one prefix per line; `#` comments and blank lines are ignored |
+| `saucewg remove-route CIDR…` | Put those destinations back on the cascade |
+| `saucewg remove-route --note GROUP` | Remove every route carrying that label |
+
+Both take `--note` to label a group and `--no-reload` to batch several edits, exactly
+like the node commands. `saucewg routes` prints what the node container actually
+installed, so a prefix that stays `pending` is one it could not apply:
+
+```
+PREFIX           STATUS   NOTE
+142.250.0.0/15   direct   youtube
+64.233.160.0/19  direct   youtube
+8.8.8.8/32       pending  dns
+198.51.100.0/24  off      paused
+```
+
+`direct` is in the routing table, `pending` is listed but not installed, `off` is
+`enabled: false`, and `unknown` means the node container is not answering, so nothing
+about the routing table is known either way.
+
+A bare address means one host, and an address inside a range is stored as the range —
+`10.20.30.40/24` becomes `10.20.30.0/24`, which is what it means and what the kernel
+will accept. Names are never resolved: add the ranges a service actually uses.
+`0.0.0.0/0` is refused, because taking every destination off the cascade is §4.6 rather
+than a route.
+
+Underneath, `config/direct-routes.json` is the source of truth, in the same directory
+and with the same live-reload behaviour as the exit node list. It accepts bare strings
+as well as objects:
+
+```json
+[
+  "1.1.1.1",
+  { "cidr": "142.250.0.0/15", "note": "youtube", "enabled": true },
+  { "cidr": "198.51.100.0/24", "note": "kept but not routed", "enabled": false }
+]
+```
+
+Each enabled prefix becomes one route in policy table `450`, which the entry node
+consults before the cascade table, and traffic leaving that way is NATed to the entry
+node's own address. Nothing changes on the client. `CASCADE_DIRECT_ROUTES` in `.env`
+puts the list in the environment instead, which overrides the file and makes the panel's
+**Routing** page read-only.
+
+### 4.6 When every exit node is down
+
+`CASCADE_FALLBACK` decides what a client experiences while no uplink is usable:
+
+```bash
+saucewg fallback           # what is configured, and whether it is in use right now
+saucewg fallback direct    # keep clients online through this entry node (the default)
+saucewg fallback block     # drop their traffic instead
+```
+
+| Mode | While no exit node is usable |
+| --- | --- |
+| `direct` | the entry node carries client traffic; users stay online, from its address |
+| `block` | client traffic is dropped, which is what `CASCADE_KILLSWITCH=true` used to do |
+
+It reverts on its own: the moment an uplink passes its health check again, traffic moves
+back onto the cascade without touching a tunnel. Changing the mode recreates the node
+container, so connected clients reconnect within a few seconds; `--no-restart` writes
+the value and leaves that for later.
+
+`direct` is the default because a reachable entry node is more useful than a silent one,
+but during an outage a client's traffic does appear from the entry node's address —
+choose `block` where that is the thing being avoided.
+
+An installation from before this existed keeps its old behaviour until `saucewg update`,
+which writes `CASCADE_FALLBACK=direct` into `.env` and prints a note saying so. Setting
+it beforehand, by hand or with `saucewg fallback`, is respected and left alone.
 
 ---
 
@@ -531,6 +626,20 @@ and needs one when the node does not carry the panel's key.
 `{"revoke_key": false}` to leave it there, which is what you want when the machine is
 being rebuilt rather than handed back.
 
+Which destinations use the cascade is a separate list on the same panel:
+
+| Call | Body | Result |
+| --- | --- | --- |
+| `GET /api/routes` | — | The bypass list, with `active` saying which entries are really installed |
+| `POST /api/routes` | `{"cidr": ["142.250.0.0/15", "8.8.8.8"], "note": "youtube"}` | `201`. Prefixes already listed are skipped, not rejected |
+| `PUT /api/routes/{cidr}` | `{"enabled": false}` or `{"note": "…"}` | Turns one off without losing it, or relabels it |
+| `DELETE /api/routes/{cidr}` | — | Puts that destination back on the cascade |
+
+The prefix goes in the path with its slash intact: `DELETE /api/routes/142.250.0.0/15`.
+Full field semantics are in [`AWG_USAGE.md` §7](AWG_USAGE.md#7-routing-past-the-cascade);
+the fallback that applies when the whole cascade is down is set on the entry node itself
+(§4.6), not through the API.
+
 ### 5.6 Managing the servers themselves
 
 The calls above change the cascade. These change the exit server behind a node, and
@@ -695,6 +804,7 @@ images.
 | `/opt/saucewg/.env` | Every setting. Edit with `saucewg edit`, or by hand followed by `saucewg restart` |
 | `/opt/saucewg/docker-compose.yml` | Generated; regenerated on every `saucewg update` |
 | `/opt/saucewg/config/exit-nodes.json` | The cascade. Written by the panel and the CLI |
+| `/opt/saucewg/config/direct-routes.json` | Destinations that bypass the cascade, written the same way |
 | `/opt/saucewg/config/panel-ssh-key` | The panel's SSH identity, mode `0600`, with its `.pub` beside it |
 | `/opt/saucewg/.role` | `entry` or `exit` |
 | `/usr/local/bin/saucewg` | The CLI, which is a copy of the installer |
@@ -709,8 +819,12 @@ Settings that matter for node management specifically:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `NODE_PROVISION_ENABLED` | `true` | `false` makes the panel read-only with respect to the cascade — set it when the node list is owned by configuration management |
-| `NODE_REGISTRY_FILE` | `/etc/saucewg/host/exit-nodes.json` | Where the panel sees the list *inside its container* |
+| `NODE_PROVISION_ENABLED` | `true` | `false` makes the panel read-only with respect to the cascade and to routing — set it when both lists are owned by configuration management |
+| `NODE_REGISTRY_FILE` | `/etc/saucewg/host/exit-nodes.json` | Where the panel sees the node list *inside its container* |
+| `ROUTES_REGISTRY_FILE` | `/etc/saucewg/host/direct-routes.json` | The same for the bypass list |
+| `CASCADE_FALLBACK` | `direct` | What happens while every exit node is down — see §4.6 |
+| `CASCADE_DIRECT_FILE` | `/etc/amnezia/host/direct-routes.json` | Where the *node container* reads the bypass list |
+| `CASCADE_DIRECT_ROUTES` | | The same list inline, overriding the file |
 | `NODE_SSH_KEY_FILE` | `/etc/saucewg/host/panel-ssh-key` | The panel's own SSH key, generated on first use |
 | `NODE_SSH_KEY_ENABLED` | `true` | `false` stops the panel keeping a key, so every call carries credentials |
 | `NODE_SSH_TIMEOUT_SECONDS` | `900` | Ceiling for one remote command |
@@ -765,5 +879,14 @@ Settings that matter for node management specifically:
   from a pinned node that dies, and returns when it recovers.
 * **Removing a node does not touch the server** unless you ask for `uninstall`. This is
   deliberate: a node is often removed *because* its server is already unreachable.
+* **An outage no longer means users are offline.** With the default
+  `CASCADE_FALLBACK=direct` the entry node carries their traffic while every exit node
+  is down, so they stay connected — from the entry node's address. `saucewg fallback`
+  says whether that is happening right now, and `saucewg fallback block` restores the
+  old cut-off behaviour.
+* **A direct route is a destination, not a client setting.** It applies to every client
+  on the node, needs nothing on their side, and does not appear in their profile. It is
+  also only as good as the addresses in it: a service that answers from a range you did
+  not list keeps going through the exit node.
 * **`saucewg` on an exit node has no panel commands** and will say so rather than
   guessing; `saucewg status` and `saucewg logs` work everywhere.

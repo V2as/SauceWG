@@ -213,3 +213,59 @@ jobs:
           sudo bash saucewg.sh --dir /tmp/entry --yes remove-node ci-node --no-reload
           sudo jq -e 'length == 0' /tmp/entry/config/exit-nodes.json >/dev/null
           echo "add-node and remove-node keep the list consistent"
+
+      # Direct routes are the second list the node container reads, and a prefix it
+      # cannot install is a route that silently does nothing.
+      - name: The CLI maintains the direct route list
+        run: |
+          sudo bash saucewg.sh --dir /tmp/entry --yes add-route 142.250.0.0/15 8.8.8.8 \
+            --note youtube --no-reload
+          sudo jq -e '.[0].cidr == "142.250.0.0/15" and .[0].note == "youtube"' \
+            /tmp/entry/config/direct-routes.json >/dev/null
+          # A bare address is one host, and an address inside a range is the range:
+          # the kernel rejects a route whose destination has host bits set.
+          sudo jq -e '.[1].cidr == "8.8.8.8/32"' /tmp/entry/config/direct-routes.json >/dev/null
+          sudo bash saucewg.sh --dir /tmp/entry --yes add-route 10.20.30.40/24 --no-reload
+          sudo jq -e '.[2].cidr == "10.20.30.0/24"' /tmp/entry/config/direct-routes.json >/dev/null
+
+          printf '# a generated list\n1.1.1.0/24\n\n9.9.9.9\n' > /tmp/routes.txt
+          sudo bash saucewg.sh --dir /tmp/entry --yes add-route --from-file /tmp/routes.txt \
+            --note dns --no-reload
+          sudo jq -e '[.[] | select(.note == "dns")] | length == 2' \
+            /tmp/entry/config/direct-routes.json >/dev/null
+
+          # /0 is the cascade turned off rather than a route past it, and there is a
+          # supported way to ask for that.
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes add-route 0.0.0.0/0 --no-reload
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes add-route youtube.com --no-reload
+
+          sudo bash saucewg.sh --dir /tmp/entry --yes remove-route --note dns --no-reload
+          sudo jq -e 'length == 3' /tmp/entry/config/direct-routes.json >/dev/null
+          sudo bash saucewg.sh --dir /tmp/entry --yes remove-route 8.8.8.8 --no-reload
+          sudo jq -e 'all(.[]; .cidr != "8.8.8.8/32")' /tmp/entry/config/direct-routes.json >/dev/null
+          echo "add-route and remove-route keep the list routable"
+
+      # An installation made before the fallback had two modes must come out of an
+      # update with the new default written down rather than assumed. Only the .env
+      # migration is under test, so docker is stubbed out: pulling three images to
+      # find out what `update` writes into a text file would be a slow way to learn it.
+      - name: Updating an older installation writes the fallback it will use
+        run: |
+          mkdir -p /tmp/shim && printf '#!/bin/sh\nexit 0\n' > /tmp/shim/docker
+          chmod +x /tmp/shim/docker
+          sudo bash saucewg.sh --dir /tmp/legacy --yes install \
+            --endpoint-host 127.0.0.1 --admin-password ci-password --no-start
+          sudo sed -i '/^CASCADE_FALLBACK=/d' /tmp/legacy/.env
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/legacy --yes update \
+            --no-restart 2>&1 | tee /tmp/update.log
+          sudo grep -qx 'CASCADE_FALLBACK=direct' /tmp/legacy/.env \
+            || { echo "::error::update left the fallback unset"; exit 1; }
+          grep -q 'leave through this entry node' /tmp/update.log \
+            || { echo "::error::the change in behaviour was not announced"; exit 1; }
+
+          # An operator who chose to block traffic keeps that choice.
+          sudo bash saucewg.sh --dir /tmp/legacy --yes fallback block --no-restart
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/legacy --yes update --no-restart
+          sudo grep -qx 'CASCADE_FALLBACK=block' /tmp/legacy/.env \
+            || { echo "::error::update overwrote a deliberate choice"; exit 1; }
+          echo "the fallback survives an update in both directions"

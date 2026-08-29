@@ -48,6 +48,7 @@ app.dependency_overrides[get_sudo_admin] = lambda: FakeAdmin()
 
 workdir = tempfile.mkdtemp(prefix="saucewg-nodes-")
 settings.node_registry_file = os.path.join(workdir, "exit-nodes.json")
+settings.routes_registry_file = os.path.join(workdir, "direct-routes.json")
 settings.awg_socket_dir = workdir
 # Where the node container would persist the entry interface's profile.
 settings.awg_config_dir = workdir
@@ -68,8 +69,21 @@ def check(label: str, condition: bool, detail: object = "") -> None:
     print(f"  ok  {label}")
 
 
-def publish(*, age: float = 0.0, reload_id: str = "0", source: str = "file", nodes=()) -> None:
-    """Writes the state file the way the node container would."""
+def publish(
+    *,
+    age: float = 0.0,
+    reload_id: str = "0",
+    source: str = "file",
+    nodes=(),
+    fallback: str | None = "direct",
+    fallback_active: bool = False,
+    direct: dict | None = None,
+) -> None:
+    """Writes the state file the way the node container would.
+
+    ``fallback=None`` and ``direct=None`` leave those keys out entirely, which is what
+    a node container older than this panel publishes.
+    """
     state = {
         "updated_at": time.time() - age,
         "reload_id": reload_id,
@@ -78,9 +92,14 @@ def publish(*, age: float = 0.0, reload_id: str = "0", source: str = "file", nod
         "mode": "auto",
         "pinned": None,
         "active": None,
-        "killswitch": True,
+        "killswitch": fallback != "direct",
         "nodes": list(nodes),
     }
+    if fallback is not None:
+        state["fallback"] = fallback
+        state["fallback_active"] = fallback_active
+    if direct is not None:
+        state["direct"] = direct
     with open(settings.uplink_state_file, "w", encoding="utf-8") as handle:
         json.dump(state, handle)
 
@@ -355,6 +374,115 @@ async def main() -> None:
         check("without waiting out the timeout", elapsed < 15, f"{elapsed:.1f}s")
         check("saying it will apply on startup", "will be applied" in task["log"][-1]["text"], task["log"])
         check("and the list is empty", registry.load_nodes() == [], registry.load_nodes())
+
+        print("the fallback while every exit node is down")
+        publish(fallback="direct", fallback_active=True)
+        body = (await client.get("/api/nodes")).json()
+        check("the mode is reported", body["fallback"] == "direct", body)
+        check("and that it is in use", body["fallback_active"] is True, body)
+        check("the old flag agrees with it", body["killswitch"] is False, body)
+
+        publish(fallback="block", fallback_active=True)
+        body = (await client.get("/api/nodes")).json()
+        check("blocking is reported too", body["fallback"] == "block", body)
+        check("and the old flag follows", body["killswitch"] is True, body)
+
+        # A node container that predates the fallback modes only publishes the flag.
+        publish(fallback=None)
+        body = (await client.get("/api/nodes")).json()
+        check("an older container still reads as blocking", body["fallback"] == "block", body)
+
+        print("direct routes")
+        publish()
+        response = await client.get("/api/routes")
+        body = response.json()
+        check("the bypass list is readable", response.status_code == 200, response.text)
+        check("and starts empty", body["routes"] == [], body)
+        check("with nothing applied yet", body["live"] is False, body)
+
+        response = await client.post(
+            "/api/routes", json={"cidr": ["142.250.0.0/15", "8.8.8.8"], "note": "youtube"}
+        )
+        body = response.json()
+        check("a group of destinations is accepted", response.status_code == 201, response.text)
+        check("both are listed", len(body["routes"]) == 2, body)
+        check("a bare address became a host route", body["routes"][1]["cidr"] == "8.8.8.8/32", body)
+        check("the label is kept", body["routes"][0]["note"] == "youtube", body)
+        check("but nothing is active until the node says so", body["routes"][0]["active"] is False, body)
+
+        response = await client.post("/api/routes", json={"cidr": ["10.20.30.40/24"]})
+        body = response.json()
+        check("an address inside a range is masked", body["routes"][2]["cidr"] == "10.20.30.0/24", body)
+
+        response = await client.post("/api/routes", json={"cidr": ["8.8.8.8/32"]})
+        check("adding one twice is not an error", response.status_code == 201, response.text)
+        check("and does not duplicate it", len(response.json()["routes"]) == 3, response.json())
+
+        for bad, why in (
+            ("youtube.com", "a name is not a prefix"),
+            ("10.0.0.0/33", "an impossible mask"),
+            ("2001:db8::/32", "IPv6"),
+        ):
+            response = await client.post("/api/routes", json={"cidr": [bad]})
+            check(f"{why} is refused", response.status_code == 400, response.text)
+
+        response = await client.post("/api/routes", json={"cidr": ["0.0.0.0/0"]})
+        check("so is everything at once", response.status_code == 400, response.text)
+        check("pointing at the fallback instead", "fallback" in response.text, response.text)
+
+        # What the node container reports is what decides whether a route is in force.
+        publish(direct={"source": "file", "routes": ["142.250.0.0/15"], "applied": 1,
+                        "via": "eth0", "error": None})
+        body = (await client.get("/api/routes")).json()
+        check("an applied route is marked active", body["routes"][0]["active"] is True, body)
+        check("one still pending is not", body["routes"][1]["active"] is False, body)
+        check("and the interface is reported", body["via"] == "eth0", body)
+        check("the panel knows the node is answering", body["live"] is True, body)
+
+        # A list written by hand may use bare strings and bare addresses. The container
+        # routes them as /32, so the panel has to read them the same way or they would
+        # look permanently unapplied.
+        with open(settings.routes_registry_file, "w", encoding="utf-8") as handle:
+            json.dump(["1.1.1.1", {"cidr": "9.9.9.9", "note": "quad9"}], handle)
+        publish(direct={"source": "file", "routes": ["1.1.1.1/32"], "applied": 1,
+                        "via": "eth0", "error": None})
+        body = (await client.get("/api/routes")).json()
+        check("a bare string entry is read", body["routes"][0]["cidr"] == "1.1.1.1/32", body)
+        check("and matches what the node installed", body["routes"][0]["active"] is True, body)
+        check("as does a bare address in an object", body["routes"][1]["cidr"] == "9.9.9.9/32", body)
+
+        # Back to the three the removal checks below expect.
+        with open(settings.routes_registry_file, "w", encoding="utf-8") as handle:
+            json.dump(
+                [
+                    {"cidr": "142.250.0.0/15", "note": "youtube", "enabled": True},
+                    {"cidr": "8.8.8.8/32", "note": "youtube", "enabled": True},
+                    {"cidr": "10.20.30.0/24", "enabled": True},
+                ],
+                handle,
+            )
+        publish(direct={"source": "file", "routes": ["142.250.0.0/15"], "applied": 1,
+                        "via": "eth0", "error": None})
+
+        response = await client.put("/api/routes/8.8.8.8/32", json={"enabled": False})
+        body = response.json()
+        check("a route can be turned off", response.status_code == 200, response.text)
+        check("without being lost", len(body["routes"]) == 3, body)
+        check("and it is recorded", body["routes"][1]["enabled"] is False, body)
+
+        response = await client.delete("/api/routes/142.250.0.0/15")
+        check("a route can be removed", response.status_code == 200, response.text)
+        check("leaving the others", len(response.json()["routes"]) == 2, response.json())
+        response = await client.delete("/api/routes/203.0.113.0/24")
+        check("removing one that is not there is a 404", response.status_code == 404, response.text)
+
+        print("when the environment overrides the direct routes")
+        publish(direct={"source": "env", "routes": ["1.2.3.0/24"], "applied": 1,
+                        "via": "eth0", "error": None})
+        body = (await client.get("/api/routes")).json()
+        check("the panel says which one is in charge", "CASCADE_DIRECT_ROUTES" in (body["config_error"] or ""), body)
+        response = await client.post("/api/routes", json={"cidr": ["9.9.9.9"]})
+        check("and refuses writes that would not take effect", response.status_code == 409, response.text)
 
         print("when the panel is not in charge")
         publish(source="env")

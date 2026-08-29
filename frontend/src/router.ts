@@ -6,6 +6,7 @@ const routes = [
   { path: '/', name: 'dashboard', component: () => import('./views/DashboardView.vue') },
   { path: '/clients', name: 'clients', component: () => import('./views/ClientsView.vue') },
   { path: '/exit-nodes', name: 'exit-nodes', component: () => import('./views/ExitNodesView.vue') },
+  { path: '/routing', name: 'routing', component: () => import('./views/RoutingView.vue') },
   { path: '/admins', name: 'admins', component: () => import('./views/AdminsView.vue') },
   { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },
   { path: '/:pathMatch(.*)*', redirect: '/' },

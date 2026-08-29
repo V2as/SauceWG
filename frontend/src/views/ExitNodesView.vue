@@ -422,6 +422,18 @@ onUnmounted(() => {
       probably not running.
     </div>
 
+    <div v-else-if="state.fallback_active" class="alert alert-warn" style="margin-bottom: 14px">
+      <template v-if="state.fallback === 'direct'">
+        No exit node can carry traffic, so clients are leaving through this entry node
+        and their traffic appears from its address. They are moved back onto the cascade
+        as soon as an exit node recovers.
+      </template>
+      <template v-else>
+        No exit node can carry traffic and the fallback is set to block, so clients are
+        cut off until one recovers.
+      </template>
+    </div>
+
     <div v-if="!state.provisioning && !state.config_error" class="alert alert-warn" style="margin-bottom: 14px">
       Exit node management is turned off, so the list below is read-only. Set
       <span class="mono">NODE_PROVISION_ENABLED=true</span> to add and remove nodes from here.
@@ -454,13 +466,21 @@ onUnmounted(() => {
         </div>
 
         <div class="card">
-          <div class="stat-label">Kill switch</div>
+          <div class="stat-label">If every node fails</div>
           <div class="stat-value row" style="gap: 9px">
-            <i class="dot" :class="{ on: state.killswitch }"></i>
-            <span>{{ state.killswitch ? 'Armed' : 'Off' }}</span>
+            <i class="dot" :class="{ on: !state.fallback_active }"></i>
+            <span>{{ state.fallback === 'direct' ? 'Via entry node' : 'Blocked' }}</span>
           </div>
           <div class="stat-sub">
-            {{ state.killswitch ? 'clients drop when every uplink is down' : 'traffic may leave via the entry IP' }}
+            {{
+              state.fallback_active
+                ? (state.fallback === 'direct'
+                    ? 'in use now: clients are on this server\'s address'
+                    : 'in use now: client traffic is being dropped')
+                : (state.fallback === 'direct'
+                    ? 'clients stay online through this server'
+                    : 'clients drop rather than leave via the entry IP')
+            }}
           </div>
         </div>
 

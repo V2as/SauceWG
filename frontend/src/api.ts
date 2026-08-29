@@ -37,6 +37,10 @@ export interface CascadeStatus {
   mode: string
   nodes_total: number
   nodes_healthy: number
+  // What happens while no exit node can carry traffic, and whether it is happening.
+  fallback: 'direct' | 'block'
+  fallback_active: boolean
+  direct_routes: number
 }
 
 export interface ExitNode {
@@ -125,11 +129,29 @@ export interface ExitNodeList {
   active: string | null
   pinned: string | null
   killswitch: boolean
+  fallback: 'direct' | 'block'
+  fallback_active: boolean
   stale: boolean
   updated_at: string | null
   config_error: string | null
   provisioning: boolean
   nodes: ExitNode[]
+}
+
+export interface DirectRoute {
+  cidr: string
+  note: string | null
+  enabled: boolean
+  // True once the node container has it in its routing table.
+  active: boolean
+}
+
+export interface DirectRouteList {
+  routes: DirectRoute[]
+  via: string | null
+  live: boolean
+  editable: boolean
+  config_error: string | null
 }
 
 export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed'
@@ -335,6 +357,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+
+  // Destinations that bypass the cascade. The prefix is part of the path and
+  // contains a slash, which the API takes as-is.
+  routes: () => request<DirectRouteList>('/routes'),
+  addRoutes: (payload: { cidr: string[]; note?: string | null }) =>
+    request<DirectRouteList>('/routes', { method: 'POST', body: JSON.stringify(payload) }),
+  updateRoute: (cidr: string, payload: { note?: string | null; enabled?: boolean }) =>
+    request<DirectRouteList>(`/routes/${cidr}`, { method: 'PUT', body: JSON.stringify(payload) }),
+  deleteRoute: (cidr: string) => request<DirectRouteList>(`/routes/${cidr}`, { method: 'DELETE' }),
 
   clients: (params: Record<string, string | number | undefined>) => {
     const query = new URLSearchParams()

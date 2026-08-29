@@ -13,7 +13,7 @@ from . import __version__
 from .config import settings
 from .db import SessionLocal, init_db
 from .models import Admin
-from .routers import admins, auth, clients, nodes, subscription, system
+from .routers import admins, auth, clients, nodes, routes, subscription, system
 from .security import hash_password
 from .services.collector import collect, purge_old_usage
 from .services.sync import sync_peers
@@ -131,6 +131,7 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(admins.router, prefix="/api")
 app.include_router(clients.router, prefix="/api")
 app.include_router(nodes.router, prefix="/api")
+app.include_router(routes.router, prefix="/api")
 app.include_router(system.router, prefix="/api")
 app.include_router(subscription.router)
 

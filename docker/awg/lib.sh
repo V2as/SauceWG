@@ -27,6 +27,27 @@ wan_iface() {
     ip -4 route show default | awk '/default/ {print $5; exit}'
 }
 
+# The host's own way to the internet, as the tail of an `ip route` command:
+# "via 203.0.113.1 dev eth0" or, on a point-to-point link, "dev eth0".
+#
+# A route in another table cannot say "resolve this in the main table", so anything
+# the entry node sends out of its own uplink instead of into the cascade has to name
+# the next hop explicitly. Re-read rather than cached: a DHCP lease change moves it.
+wan_nexthop() {
+    ip -4 route show default | awk '
+        /^default/ {
+            gw = ""; dev = ""
+            for (i = 2; i < NF; i++) {
+                if ($i == "via") gw = $(i + 1)
+                else if ($i == "dev") dev = $(i + 1)
+            }
+            if (dev == "") next
+            if (gw == "") print "dev " dev
+            else print "via " gw " dev " dev
+            exit
+        }'
+}
+
 # KEY=VALUE state file that survives container restarts. Everything the panel needs
 # to hand out client configs is mirrored here.
 params_load() {

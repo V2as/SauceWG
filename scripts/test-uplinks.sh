@@ -19,6 +19,7 @@ export AWG_SOCKET_DIR="$WORK/run"
 export AWG_IFACE=awg0
 export AWG_SUBNET=10.8.0.0/24
 export CASCADE_NODES_FILE="$WORK/exit-nodes.json"
+export CASCADE_DIRECT_FILE="$WORK/direct-routes.json"
 export CASCADE_UPLINK_SUBNET=10.77.0.0/24
 export UPLINK_STATE_FILE="$WORK/run/uplinks.json"
 export UPLINK_CONTROL_FILE="$WORK/run/uplink-control.json"
@@ -31,8 +32,108 @@ mkdir -p "$AWG_CONFIG_DIR" "$AWG_SOCKET_DIR"
 # --- stubs -----------------------------------------------------------------
 VERBOSE=${VERBOSE:-false}
 log() { [ "$VERBOSE" != true ] || printf '    [awg] %s\n' "$*" >&2; }
-ip() { :; }
-iptables() { :; }
+
+# `ip` and `iptables` are modelled rather than swallowed: which table holds which
+# route, and where the REJECT rule sits in FORWARD, is exactly what decides whether
+# client traffic leaves through an exit node, through the entry node or nowhere.
+ROUTES="$WORK/routes"   # table <TAB> destination <TAB> as `ip route show` would print
+RULES="$WORK/rules"     # one policy rule per line
+IPT="$WORK/iptables"    # table|chain|rule, in chain order
+: > "$ROUTES"; : > "$RULES"; : > "$IPT"
+
+# What the entry node's own default route looks like. Reassigned by the tests that
+# move it.
+FAKE_DEFAULT="default via 192.0.2.1 dev eth0"
+
+ip() {
+    local args=() x table=main i
+    for x in "$@"; do
+        case $x in -4|-6) ;; *) args+=("$x") ;; esac
+    done
+    for ((i = 0; i < ${#args[@]}; i++)); do
+        [ "${args[$i]}" = table ] && table=${args[$((i + 1))]}
+    done
+
+    case "${args[0]:-}" in
+        route)
+            local dest=${args[2]:-} display
+            case "${args[1]:-}" in
+                show)
+                    if [ "$dest" = default ] && [ "$table" = main ]; then
+                        printf '%s\n' "$FAKE_DEFAULT"
+                    else
+                        awk -F'\t' -v t="$table" '$1 == t {print $3}' "$ROUTES"
+                    fi
+                    ;;
+                replace|add)
+                    # "unreachable default" names the type before the destination.
+                    [ "$dest" != unreachable ] || dest=${args[3]:-}
+                    display=$(printf '%s' "${args[*]:2}" | sed 's/ table [0-9]*$//')
+                    ip route del "$dest" table "$table" >/dev/null 2>&1
+                    printf '%s\t%s\t%s\n' "$table" "$dest" "$display" >> "$ROUTES"
+                    ;;
+                del)
+                    awk -F'\t' -v t="$table" -v d="$dest" \
+                        '!($1 == t && $2 == d)' "$ROUTES" > "$ROUTES.tmp" || true
+                    mv "$ROUTES.tmp" "$ROUTES"
+                    ;;
+                flush)
+                    awk -F'\t' -v t="$table" '$1 != t' "$ROUTES" > "$ROUTES.tmp" || true
+                    mv "$ROUTES.tmp" "$ROUTES"
+                    ;;
+            esac
+            ;;
+        rule)
+            local selector="${args[*]:2}"
+            selector=${selector% priority *}
+            case "${args[1]:-}" in
+                add) printf '%s\n' "${args[*]:2}" >> "$RULES" ;;
+                del)
+                    awk -v s="$selector" 'index($0, s) != 1' "$RULES" > "$RULES.tmp" || true
+                    mv "$RULES.tmp" "$RULES"
+                    ;;
+            esac
+            ;;
+    esac
+    return 0
+}
+
+iptables() {
+    local table=filter args=() key rest
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -t) table=$2; shift 2 ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    local op=${args[0]:-} chain=${args[1]:-}
+    case $op in
+        -I) rest="${args[*]:3}" ;;
+        -C|-A|-D) rest="${args[*]:2}" ;;
+        *) return 0 ;;
+    esac
+    key="${table}|${chain}|${rest}"
+
+    case $op in
+        -C) grep -Fxq -- "$key" "$IPT" || return 1 ;;
+        -A) grep -Fxq -- "$key" "$IPT" || printf '%s\n' "$key" >> "$IPT" ;;
+        -I)
+            grep -Fxq -- "$key" "$IPT" && return 0
+            # Only position 1 is ever used, and it has to land above the catch-all.
+            awk -v k="$key" -v p="${table}|${chain}|" '
+                !placed && index($0, p) == 1 { print k; placed = 1 }
+                { print }
+                END { if (!placed) print k }' "$IPT" > "$IPT.tmp"
+            mv "$IPT.tmp" "$IPT"
+            ;;
+        -D)
+            grep -Fxv -- "$key" "$IPT" > "$IPT.tmp" 2>/dev/null || true
+            mv "$IPT.tmp" "$IPT"
+            ;;
+    esac
+    return 0
+}
+
 conntrack() { :; }
 ping() { return 1; }
 awg() {
@@ -129,13 +230,62 @@ conf_value() {
     sed -n "s/^$2 = //p" "${AWG_CONFIG_DIR}/${iface}.conf"
 }
 
+# --- routing accessors -----------------------------------------------------
+
+# What the cascade table sends client traffic to: an uplink interface, "unreachable",
+# or nothing at all (which means the lookup falls through to the entry node's own
+# routes).
+cascade_default() {
+    local line
+    line=$(awk -F'\t' -v t="$CASCADE_TABLE" '$1 == t && $2 == "default" {print $3}' "$ROUTES")
+    case $line in
+        "") printf 'none' ;;
+        unreachable*) printf 'unreachable' ;;
+        *) printf '%s' "${line##* dev }" ;;
+    esac
+}
+
+# The destinations in the bypass table, sorted, plus where each is sent.
+direct_table() {
+    awk -F'\t' -v t="$CASCADE_DIRECT_TABLE" '$1 == t {print $2}' "$ROUTES" | sort | tr '\n' ' ' | sed 's/ $//'
+}
+
+direct_route_of() {
+    awk -F'\t' -v t="$CASCADE_DIRECT_TABLE" -v d="$1" '$1 == t && $2 == d {print $3}' "$ROUTES"
+}
+
+# The routing tables client traffic is looked up in, in the order the kernel would
+# consult them.
+rule_tables() {
+    sed -n 's/.*lookup \([0-9]*\) priority \([0-9]*\)/\2 \1/p' "$RULES" \
+        | sort -n | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//'
+}
+
+forward_chain() {
+    sed -n 's/^filter|FORWARD|//p' "$IPT"
+}
+
+forward_last() {
+    forward_chain | tail -n1
+}
+
+has_rule() {
+    forward_chain | grep -Fxq -- "$1" && printf 'yes' || printf 'no'
+}
+
+has_nat() {
+    sed -n 's/^nat|POSTROUTING|//p' "$IPT" | grep -Fxq -- "$1" && printf 'yes' || printf 'no'
+}
+
+routes() { printf '%s\n' "$1" > "$CASCADE_DIRECT_FILE"; }
+
+# Every stub tunnel, including the ones a re-parse dropped from the arrays: `wait`
+# would otherwise block on a process nothing is left holding a pid for.
 cleanup() {
-    local i
-    for i in "${!UP_NAME[@]}"; do
-        if [ "${UP_PID[$i]:-0}" -gt 0 ] 2>/dev/null; then
-            kill "${UP_PID[$i]}" 2>/dev/null || true
-        fi
-    done
+    local running
+    running=$(jobs -pr) || running=""
+    # shellcheck disable=SC2086  # deliberately word-split into one argument per pid
+    [ -z "$running" ] || kill $running 2>/dev/null || true
     wait 2>/dev/null || true
     rm -rf "$WORK"
 }
@@ -281,6 +431,134 @@ uplinks_reload
 uplinks_write_state
 check "and it survives a no-op reload" "2.0" \
     "$(jq -r '.nodes[] | select(.name == "v-one") | .protocol' "$UPLINK_STATE_FILE")"
+
+echo "17. a healthy uplink carries client traffic through the cascade"
+nodes "[$(node eu-nl 198.51.100.20:51820 2 10),$(node eu-de 203.0.113.31:51820 3 20)]"
+uplinks_reload
+uplinks_routing_base
+UP_HEALTHY[0]=true
+uplink_activate 0 force
+check "the cascade table points at the active uplink" "awg1" "$(cascade_default)"
+check "client traffic is looked up in the cascade table" "451" "$(rule_tables)"
+check "the uplink may forward" "yes" "$(has_rule "-i awg0 -o awg1 -j ACCEPT")"
+check "nothing else may" "-i awg0 -j REJECT --reject-with icmp-net-unreachable" "$(forward_last)"
+
+echo "18. with every uplink down, the entry node carries the traffic itself"
+UP_HEALTHY[0]=false; UP_HEALTHY[1]=false
+uplinks_fallback
+check "the cascade table has no route left" "none" "$(cascade_default)"
+check "so the lookup falls through to the entry node's own" "yes" \
+    "$(has_rule "-i awg0 -o eth0 -j ACCEPT")"
+check "and the entry node NATs it" "yes" "$(has_nat "-s 10.8.0.0/24 -o eth0 -j MASQUERADE")"
+check "the catch-all is still last" "-i awg0 -j REJECT --reject-with icmp-net-unreachable" \
+    "$(forward_last)"
+
+echo "19. a recovered uplink takes the traffic back"
+UP_HEALTHY[1]=true
+uplink_activate 1
+check "the cascade table points at it again" "awg2" "$(cascade_default)"
+check "and the entry node stops forwarding for clients" "no" \
+    "$(has_rule "-i awg0 -o eth0 -j ACCEPT")"
+
+echo "20. CASCADE_FALLBACK=block keeps the old kill switch"
+CASCADE_FALLBACK=block uplinks_parse
+check "the mode is resolved from the environment" "block" "$FALLBACK_MODE"
+FALLBACK_ACTIVE=false
+uplinks_fallback
+check "the cascade table blackholes instead of falling through" "unreachable" "$(cascade_default)"
+check "the entry node does not forward for clients" "no" "$(has_rule "-i awg0 -o eth0 -j ACCEPT")"
+
+echo "21. an .env written before CASCADE_FALLBACK existed keeps its behaviour"
+check "kill switch on means block" "block" \
+    "$(CASCADE_KILLSWITCH=true uplinks_resolve_fallback)"
+check "kill switch off means direct" "direct" \
+    "$(CASCADE_KILLSWITCH=false uplinks_resolve_fallback)"
+check "neither set means direct" "direct" "$(uplinks_resolve_fallback)"
+check "an explicit choice wins over the old name" "direct" \
+    "$(CASCADE_FALLBACK=direct CASCADE_KILLSWITCH=true uplinks_resolve_fallback)"
+check "and a typo does not silently block anyone" "direct" \
+    "$(CASCADE_FALLBACK=nonsense uplinks_resolve_fallback)"
+
+echo "22. listed destinations bypass the cascade"
+FALLBACK_MODE=$(uplinks_resolve_fallback)
+routes '["203.0.113.0/24", "198.51.100.7", {"cidr": "192.0.2.128/25", "note": "youtube"}]'
+direct_reload
+check "each one is in the bypass table" "192.0.2.128/25 198.51.100.7/32 203.0.113.0/24" \
+    "$(direct_table)"
+check "a bare address is a single host" "198.51.100.7/32 via 192.0.2.1 dev eth0" \
+    "$(direct_route_of 198.51.100.7/32)"
+check "the bypass table is consulted first" "450 451" "$(rule_tables)"
+check "the entry node NATs what it sends out" "yes" "$(has_nat "-s 10.8.0.0/24 -o eth0 -j MASQUERADE")"
+
+echo "23. an address inside a range is stored as the range"
+routes '["10.20.30.40/24"]'
+direct_reload
+check "it is masked to its network" "10.20.30.0/24" "$(direct_table)"
+
+echo "24. a disabled entry is not routed"
+routes '[{"cidr": "203.0.113.0/24", "enabled": false}, {"cidr": "198.51.100.0/24"}]'
+direct_reload
+check "only the enabled one is applied" "198.51.100.0/24" "$(direct_table)"
+
+echo "25. a bad entry is skipped, the rest still apply"
+routes '["203.0.113.0/24", "not-an-address", "10.0.0.0/33", "0.0.0.0/0"]'
+direct_reload
+check "the good one is routed" "203.0.113.0/24" "$(direct_table)"
+check "the others are reported" "true" \
+    "$(case "$DIRECT_ERROR" in *"skipped 3 entries"*) echo true ;; *) echo "$DIRECT_ERROR" ;; esac)"
+
+echo "26. removing the list takes the rules down with it"
+routes '[]'
+direct_reload
+check "the bypass table is empty" "" "$(direct_table)"
+check "and clients are no longer looked up in it" "451" "$(rule_tables)"
+
+echo "27. an unusable list keeps the routes that were working"
+routes '["203.0.113.0/24"]'
+direct_reload
+routes '{"not":"an array"}'
+direct_reload
+check "the previous routes are still in place" "203.0.113.0/24" "$(direct_table)"
+check "the reason is recorded" "true" \
+    "$(case "$DIRECT_ERROR" in *"not a JSON array"*) echo true ;; *) echo "$DIRECT_ERROR" ;; esac)"
+
+echo "28. the direct routes follow the entry node's own gateway"
+routes '["203.0.113.0/24"]'
+direct_reload
+FAKE_DEFAULT="default via 192.0.2.254 dev eth1"
+direct_routes_apply
+check "the route is rebuilt on the new gateway" "203.0.113.0/24 via 192.0.2.254 dev eth1" \
+    "$(direct_route_of 203.0.113.0/24)"
+check "and the NAT moves with it" "yes" "$(has_nat "-s 10.8.0.0/24 -o eth1 -j MASQUERADE")"
+check "the old NAT rule is withdrawn" "no" "$(has_nat "-s 10.8.0.0/24 -o eth0 -j MASQUERADE")"
+FAKE_DEFAULT="default via 192.0.2.1 dev eth0"
+direct_routes_apply
+
+echo "29. the environment form overrides the file"
+export CASCADE_DIRECT_ROUTES="8.8.8.8, 9.9.9.0/24"
+direct_reload
+check "both entries are applied" "8.8.8.8/32 9.9.9.0/24" "$(direct_table)"
+check "the source says env" "env" "$DIRECT_SOURCE"
+unset CASCADE_DIRECT_ROUTES
+
+echo "30. all of it reaches the panel through the state file"
+routes '["203.0.113.0/24", "198.51.100.7"]'
+direct_reload
+# shellcheck disable=SC2034  # both are read by the code under test
+UP_HEALTHY[0]=false
+# shellcheck disable=SC2034
+FALLBACK_ACTIVE=false
+FALLBACK_MODE=direct
+uplinks_fallback
+uplinks_write_state
+check "the fallback mode is published" "direct" "$(jq -r .fallback "$UPLINK_STATE_FILE")"
+check "so is the fact that it is in use" "true" "$(jq -r .fallback_active "$UPLINK_STATE_FILE")"
+check "an older panel still sees a kill switch flag" "false" \
+    "$(jq -r .killswitch "$UPLINK_STATE_FILE")"
+check "the direct routes are published" "198.51.100.7/32 203.0.113.0/24" \
+    "$(jq -r '.direct.routes | sort | join(" ")' "$UPLINK_STATE_FILE")"
+check "with the count actually installed" "2" "$(jq -r .direct.applied "$UPLINK_STATE_FILE")"
+check "and where they leave through" "eth0" "$(jq -r .direct.via "$UPLINK_STATE_FILE")"
 
 echo
 printf '%s passed, %s failed\n' "$PASSED" "$FAILED"

@@ -185,16 +185,22 @@ do_run() {
     # An empty list still yields one unpaired uplink, so the panel comes up — and can
     # be used to add the first exit node — before any exit node exists.
     uplinks_parse || die "CASCADE_ENABLED=true but the exit node list is unusable: ${CONFIG_ERROR}"
+    direct_parse || true
 
     uplinks_setup_all
     uplinks_routing_base
 
     # Start on the highest-priority uplink; the monitor corrects the choice as soon
-    # as it has enough health samples to know better.
+    # as it has enough health samples to know better. Nothing usable yet — a fresh
+    # entry node with no exit node paired to it, or a restart while every exit node
+    # is down — goes straight to the fallback.
     uplinks_read_control
     initial=$(uplinks_select)
-    [ "$initial" -ge 0 ] || initial=0
-    uplink_activate "$initial"
+    if [ "$initial" -ge 0 ]; then
+        uplink_activate "$initial"
+    else
+        uplinks_fallback
+    fi
     uplinks_write_state
 
     log "node ready (role=entry, uplinks=$(uplink_count))"
@@ -208,9 +214,13 @@ do_healthcheck() {
     [ -S "/var/run/amneziawg/${AWG_IFACE}.sock" ] || exit 1
     ip link show "$AWG_IFACE" >/dev/null 2>&1 || exit 1
     if [ "$AWG_ROLE" = "entry" ] && [ "$CASCADE_ENABLED" = "true" ]; then
-        # The uplinks are only healthy as a group: at least the active one must exist.
+        # The uplinks are only healthy as a group: either one of them is carrying
+        # client traffic, or the entry node is carrying it itself because it was
+        # configured to. Blocking is the one state that is not healthy — the node is
+        # up but no client is getting anywhere.
         [ -f "$UPLINK_STATE_FILE" ] || exit 1
-        jq -e '.active != null' "$UPLINK_STATE_FILE" >/dev/null 2>&1 || exit 1
+        jq -e '.active != null or (.fallback_active == true and .fallback == "direct")' \
+            "$UPLINK_STATE_FILE" >/dev/null 2>&1 || exit 1
     fi
     exit 0
 }

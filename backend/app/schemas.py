@@ -150,6 +150,32 @@ class CascadeStatus(BaseModel):
     fallback_active: bool = False
     # Destinations deliberately routed past the cascade.
     direct_routes: int = 0
+    # Destinations the entry node is reopening for itself right now, and how many.
+    # Zero with bypass_active false is the normal state of a healthy cascade.
+    bypass_active: bool = False
+    bypass_routes: int = 0
+
+
+class NodeRecovery(BaseModel):
+    """What the panel has done about an exit node that stopped handshaking.
+
+    The cascade routes around a failed node on its own, so this is about the server:
+    the panel restarts its service and, if that is not enough, re-installs the uplink
+    key. A server that does not answer SSH at all cannot be fixed from here, which is
+    what ``blocked`` says.
+    """
+
+    attempts: int = 0
+    # What the last attempt got as far as: probe, restart or repair.
+    last_action: str | None = None
+    last_error: str | None = None
+    # `unreachable` means the server does not answer and needs a human — usually a
+    # VPS that has been suspended or deleted. `exhausted` means the attempt budget
+    # is spent. Null means it is still being worked on.
+    blocked: str | None = None
+    down_for_seconds: int = 0
+    since_last_attempt_seconds: int | None = None
+    recovered: bool = False
 
 
 class ExitNode(BaseModel):
@@ -183,6 +209,9 @@ class ExitNode(BaseModel):
     created_at: datetime | None = None
     # Set while an install or removal is still running for this node.
     task_id: str | None = None
+    # Present only while the panel is trying to put this node back, or has stopped
+    # trying. Absent for a healthy node.
+    recovery: NodeRecovery | None = None
 
 
 class ExitNodeList(BaseModel):
@@ -365,6 +394,89 @@ class DirectRouteList(BaseModel):
     # The interface the entry node sends these out of, once it has applied them.
     via: str | None = None
     # False when the node container is not publishing route state: it is down, or
+    # older than this feature.
+    live: bool = False
+    # False when the panel cannot edit the list.
+    editable: bool = True
+    # Why the list on file is not the list in effect, if it is not.
+    config_error: str | None = None
+
+
+class BypassEntry(BaseModel):
+    """One destination the entry node opens the outbound half of itself.
+
+    For destinations blocked at connection establishment rather than by route: the
+    SYN to their IPv4 is dropped, so no route change reaches them.
+    """
+
+    cidr: str = Field(description="an IPv4 address or range; a bare address means /32")
+    # The IPv6 address of the same server, tried first when it is known. Without one
+    # the destination's own IPv4 is dialled until a handshake lands.
+    v6: str | None = None
+    note: str | None = Field(default=None, max_length=512)
+    enabled: bool = True
+    # True once the node container is redirecting this prefix into the relay. In
+    # `auto` every entry reads false while an exit node is carrying client traffic,
+    # which is the normal state and not a fault.
+    active: bool = False
+    # True when the entry comes from a group the node image ships rather than from
+    # the file this panel edits, so the UI can say why it cannot be deleted.
+    built_in: bool = False
+
+
+class BypassEntryCreate(BaseModel):
+    """Adds one or more destinations to the bypass list."""
+
+    cidr: list[str] = Field(min_length=1, max_length=4096)
+    # Only meaningful for a single destination: an IPv6 address is one server, and
+    # sending a range of unrelated destinations to it would reach the wrong one.
+    v6: str | None = Field(default=None, max_length=64)
+    note: str | None = Field(default=None, max_length=512)
+    enabled: bool = True
+
+
+class BypassEntryUpdate(BaseModel):
+    v6: str | None = Field(default=None, max_length=64)
+    note: str | None = Field(default=None, max_length=512)
+    # Turning an entry off stops it being redirected without losing it, which is the
+    # reversible way to find out whether the relay was making things worse.
+    enabled: bool | None = None
+
+
+class BypassRelay(BaseModel):
+    """What the relay itself reports, which is where the counters live."""
+
+    listen: str | None = None
+    prefixes: int = 0
+    open: int = 0
+    accepted: int = 0
+    via_v6: int = 0
+    via_retry: int = 0
+    failed: int = 0
+    # Outbound handshakes spent on the retry path, which is the honest measure of how
+    # hard the filter is dropping them: far above `via_retry` means it is dropping
+    # nearly all of them.
+    attempts: int = 0
+    # Flows for a destination already known not to be answering, given one handshake
+    # instead of a burst. Rising steadily means clients are hammering something that
+    # is blocked outright rather than being sampled, and the address is worth
+    # looking at.
+    cooled: int = 0
+    rx_bytes: int = 0
+    tx_bytes: int = 0
+    last_error: str | None = None
+
+
+class BypassList(BaseModel):
+    mode: str = "auto"
+    # The groups of destinations the node image ships a table for, e.g. `telegram`.
+    groups: list[str] = []
+    entries: list[BypassEntry]
+    # True while the redirect is installed. In `auto` this is false whenever an exit
+    # node is carrying client traffic.
+    active: bool = False
+    relay: BypassRelay | None = None
+    # False when the node container is not publishing bypass state: it is down, or
     # older than this feature.
     live: bool = False
     # False when the panel cannot edit the list.

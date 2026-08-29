@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     # Destinations that bypass the cascade, in the same bind-mounted directory. The
     # node container reads it from its own side of the mount.
     routes_registry_file: str = "/etc/saucewg/host/direct-routes.json"
+    # Destinations the entry node reopens for itself because the handshake to their
+    # IPv4 is what is being dropped, which no route can fix. Same directory again.
+    bypass_registry_file: str = "/etc/saucewg/host/bypass.json"
     # Set to false to make the panel read-only with respect to the cascade, e.g.
     # when the node list is managed by configuration management.
     node_provision_enabled: bool = True
@@ -71,6 +74,28 @@ class Settings(BaseSettings):
     node_ssh_key_enabled: bool = True
     # How long to wait for the node container to confirm it applied a new list.
     node_reload_timeout_seconds: int = 90
+
+    # --- exit node recovery ----------------------------------------------
+    # The cascade fails over on its own, so an unhealthy exit node costs nobody
+    # their connection — which is exactly why one can stay down for days without
+    # anybody noticing until the last node goes too. When the panel can reach a
+    # node over SSH it can also put it back, so it tries.
+    node_recovery_enabled: bool = True
+    # How often to look at the fleet. Cheap: it reads the state file the node
+    # container already publishes and only opens an SSH session for a node that
+    # has been down long enough to be worth acting on.
+    node_recovery_interval_seconds: int = 60
+    # How long an uplink must have been unhealthy before the first attempt. Long
+    # enough that a restart, a reboot or a reload is not chased by a repair.
+    node_recovery_grace_seconds: int = 300
+    # Attempts are spaced out geometrically from the interval above, so a server
+    # that is simply gone is probed a few times an hour rather than every minute.
+    node_recovery_backoff_factor: float = 3.0
+    node_recovery_max_backoff_seconds: int = 3600
+    # After this many consecutive failed attempts the node is left alone until it
+    # recovers by itself or an operator intervenes. Retrying for ever would hide
+    # the one thing worth escalating: a server that no longer exists.
+    node_recovery_max_attempts: int = 6
     # Uploaded to every exit node and executed there. Falls back to fetching the
     # script from GitHub when the image does not carry a copy.
     saucewg_installer_path: str = "/app/assets/saucewg.sh"

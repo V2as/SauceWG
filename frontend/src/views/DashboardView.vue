@@ -169,6 +169,21 @@ onUnmounted(() => window.clearInterval(timer))
         </dd>
         <dt>Uplink traffic</dt>
         <dd>↑ {{ bytes(stats.cascade.rx_bytes) }} · ↓ {{ bytes(stats.cascade.tx_bytes) }}</dd>
+        <dt>Past the cascade</dt>
+        <dd>
+          <RouterLink to="/routing">{{ stats.cascade.direct_routes }}</RouterLink>
+          <span style="color: var(--text-dim)"> destinations leaving through this server</span>
+        </dd>
+        <dt>Reopened here</dt>
+        <dd>
+          <template v-if="stats.cascade.bypass_active">
+            <RouterLink to="/routing">{{ stats.cascade.bypass_routes }}</RouterLink>
+            <span style="color: var(--text-dim)"> destinations being dialled from this server</span>
+          </template>
+          <span v-else style="color: var(--text-dim)">
+            not engaged — client traffic is leaving through an exit node
+          </span>
+        </dd>
       </dl>
     </div>
   </template>

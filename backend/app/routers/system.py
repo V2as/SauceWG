@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from .. import __version__
 from ..awg import device_for
 from ..awg import protocol as proto
+from ..awg import bypass as bypass_registry
 from ..awg import routes as route_registry
 from ..awg.node import load_cascade_params, load_server_params
 from ..awg.uapi import UAPIError
@@ -34,6 +35,7 @@ router = APIRouter(tags=["system"])
 async def build_cascade_status() -> CascadeStatus:
     """Summarises the uplink the client traffic is currently leaving through."""
     state = load_uplink_state()
+    bypass = bypass_registry.state()
     status = CascadeStatus(
         enabled=settings.cascade_enabled,
         connected=False,
@@ -44,6 +46,8 @@ async def build_cascade_status() -> CascadeStatus:
         fallback=state.fallback,
         fallback_active=state.fallback_active and not state.stale,
         direct_routes=len(route_registry.state()["applied"]),
+        bypass_active=bool(bypass["active"]),
+        bypass_routes=len(bypass["applied"]),
     )
     if not settings.cascade_enabled:
         return status

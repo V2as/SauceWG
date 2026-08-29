@@ -49,6 +49,39 @@ jobs:
           pip install httpx
           ./scripts/test-node-api.py
 
+      # `saucewg recover` runs this, because recovering an exit node needs the panel's
+      # SSH key and the panel is the only container that has it. With no state file
+      # there is nothing unhealthy to work on, which is the answer it has to give
+      # rather than a traceback.
+      - name: The panel CLI can be asked to recover exit nodes
+        working-directory: backend
+        env:
+          JWT_SECRET: ci
+          ADMIN_PASSWORD: ci-password
+          POSTGRES_PASSWORD: ci
+          AWG_ENDPOINT_HOST: 127.0.0.1
+        run: python -m app.cli recover | jq -e 'length == 0'
+
+  # The bypass relay decides whether a destination the network drops is reachable,
+  # and it decides it with concurrency: several handshakes outstanding, the first
+  # answer kept, the rest closed. None of that can be seen from the outside — a
+  # leak here is a socket per connection and a wrong answer is a service that
+  # silently stays blocked — so it is tested against a faked censor.
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: docker/awg/bypass/go.mod
+      - name: The relay is formatted, vetted and tested
+        working-directory: docker/awg/bypass
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -d .; echo "::error::gofmt"; exit 1; }
+          go vet ./...
+          go test -race -count=1 ./...
+
   shell:
     runs-on: ubuntu-latest
     steps:
@@ -245,6 +278,48 @@ jobs:
           sudo jq -e 'all(.[]; .cidr != "8.8.8.8/32")' /tmp/entry/config/direct-routes.json >/dev/null
           echo "add-route and remove-route keep the list routable"
 
+      # The third list, for destinations no route can reach because the handshake to
+      # them is what is being dropped. Unlike the other two an entry carries *how* to
+      # reach the destination, so re-adding one has to correct it rather than be
+      # skipped as a duplicate.
+      - name: The CLI maintains the bypass list
+        run: |
+          sudo bash saucewg.sh --dir /tmp/entry --yes bypass add 203.0.113.0/24 \
+            --note "some service" --no-reload
+          sudo jq -e '.[0].cidr == "203.0.113.0/24" and .[0].enabled == true' \
+            /tmp/entry/config/bypass.json >/dev/null
+          sudo bash saucewg.sh --dir /tmp/entry --yes bypass add 198.51.100.7 \
+            --v6 2001:db8::a --no-reload
+          sudo jq -e '.[1].cidr == "198.51.100.7/32" and .[1].v6 == "2001:db8::a"' \
+            /tmp/entry/config/bypass.json >/dev/null
+          sudo bash saucewg.sh --dir /tmp/entry --yes bypass add 198.51.100.7 \
+            --v6 2001:db8::ff --no-reload
+          sudo jq -e 'length == 2 and .[1].v6 == "2001:db8::ff"' \
+            /tmp/entry/config/bypass.json >/dev/null
+
+          # A built-in group is shipped in the node image, so switching one of its
+          # entries off can only be recorded here.
+          sudo bash saucewg.sh --dir /tmp/entry --yes bypass add 91.108.56.0/22 \
+            --disable --no-reload
+          sudo jq -e '.[2].enabled == false' /tmp/entry/config/bypass.json >/dev/null
+
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes bypass add 0.0.0.0/0 --no-reload
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes bypass add telegram.org --no-reload
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes bypass add 1.2.3.4 --v6 not-v6 --no-reload
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes bypass nonsense
+
+          sudo bash saucewg.sh --dir /tmp/entry --yes bypass remove 198.51.100.7 --no-reload
+          sudo jq -e 'all(.[]; .cidr != "198.51.100.7/32")' /tmp/entry/config/bypass.json >/dev/null
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes bypass remove 10.0.0.0/8 --no-reload
+
+          # The mode is read from the environment, so it has to reach the container.
+          sudo bash saucewg.sh --dir /tmp/entry --yes bypass always --no-restart
+          sudo docker compose --project-directory /tmp/entry \
+            -f /tmp/entry/docker-compose.yml --env-file /tmp/entry/.env config --format json \
+            | jq -e '.services.awg.environment.BYPASS_MODE == "always"' >/dev/null
+          sudo bash saucewg.sh --dir /tmp/entry --yes bypass auto --no-restart
+          echo "bypass keeps its list and its mode consistent"
+
       # An installation made before the fallback had two modes must come out of an
       # update with the new default written down rather than assumed. Only the .env
       # migration is under test, so docker is stubbed out: pulling three images to
@@ -269,3 +344,117 @@ jobs:
           sudo grep -qx 'CASCADE_FALLBACK=block' /tmp/legacy/.env \
             || { echo "::error::update overwrote a deliberate choice"; exit 1; }
           echo "the fallback survives an update in both directions"
+
+      # The bypass arrives the same way, and for the same reason: an installation
+      # updated from before it existed has to come out with it configured, or the
+      # destinations it exists to reopen stay unreachable with no sign of why.
+      - name: Updating an older installation picks up the bypass
+        run: |
+          sudo rm -rf /tmp/nobypass
+          sudo bash saucewg.sh --dir /tmp/nobypass --yes install \
+            --endpoint-host 127.0.0.1 --admin-password ci-password --no-start
+          sudo sed -i '/^BYPASS_/d' /tmp/nobypass/.env
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/nobypass --yes update \
+            --no-restart 2>&1 | tee /tmp/bypass-update.log
+          sudo grep -qx 'BYPASS_MODE=auto' /tmp/nobypass/.env \
+            || { echo "::error::update left the bypass unset"; exit 1; }
+          sudo grep -qx 'BYPASS_GROUPS=telegram' /tmp/nobypass/.env \
+            || { echo "::error::update left the built-in group unset"; exit 1; }
+          sudo grep -qx 'BYPASS_PARALLEL=6' /tmp/nobypass/.env \
+            || { echo "::error::update left the handshake burst unset"; exit 1; }
+          grep -q 'reopened while clients leave through this node' /tmp/bypass-update.log \
+            || { echo "::error::the change in behaviour was not announced"; exit 1; }
+
+          # Reaching the .env is not the same as reaching the container: the compose
+          # file is regenerated by the same update and has to carry it too.
+          sudo docker compose --project-directory /tmp/nobypass \
+            -f /tmp/nobypass/docker-compose.yml --env-file /tmp/nobypass/.env config --format json \
+            | jq -e '.services.awg.environment
+                     | .BYPASS_MODE == "auto" and .BYPASS_GROUPS == "telegram"
+                       and .BYPASS_PARALLEL == "6" and .BYPASS_ATTEMPTS == "96"' >/dev/null \
+            || { echo "::error::the regenerated compose file does not pass the bypass through"; exit 1; }
+
+          # An operator who turned it off keeps it off.
+          sudo bash saucewg.sh --dir /tmp/nobypass --yes bypass off --no-restart
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/nobypass --yes update --no-restart
+          sudo grep -qx 'BYPASS_MODE=off' /tmp/nobypass/.env \
+            || { echo "::error::update overwrote a deliberate choice"; exit 1; }
+          echo "the bypass arrives on update and survives being turned off"
+
+      # Node recovery arrives the same way. An installation updated from before it
+      # existed has to come out with the panel configured to use it, or a failed exit
+      # node stays failed with nothing saying why.
+      - name: Updating an older installation picks up node recovery
+        run: |
+          sudo sed -i '/^NODE_RECOVERY_/d' /tmp/nobypass/.env
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/nobypass --yes update \
+            --no-restart 2>&1 | tee /tmp/recovery-update.log
+          sudo grep -qx 'NODE_RECOVERY_ENABLED=true' /tmp/nobypass/.env \
+            || { echo "::error::update left recovery unset"; exit 1; }
+          grep -q 'instead of only routing around it' /tmp/recovery-update.log \
+            || { echo "::error::the change in behaviour was not announced"; exit 1; }
+          sudo docker compose --project-directory /tmp/nobypass \
+            -f /tmp/nobypass/docker-compose.yml --env-file /tmp/nobypass/.env config --format json \
+            | jq -e '.services.panel.environment.NODE_RECOVERY_ENABLED == "true"' >/dev/null \
+            || { echo "::error::the regenerated compose file does not pass recovery through"; exit 1; }
+
+          # An operator who turned it off keeps it off.
+          sudo sed -i 's/^NODE_RECOVERY_ENABLED=.*/NODE_RECOVERY_ENABLED=false/' /tmp/nobypass/.env
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/nobypass --yes update --no-restart
+          sudo grep -qx 'NODE_RECOVERY_ENABLED=false' /tmp/nobypass/.env \
+            || { echo "::error::update overwrote a deliberate choice"; exit 1; }
+          echo "node recovery arrives on update and survives being turned off"
+
+      # Recovering an exit node happens inside the panel container, so the CLI's own
+      # job is to reach it and to say so plainly when it cannot — a silent failure
+      # here reads as "every node is fine".
+      - name: recover says when it cannot reach the panel
+        run: |
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/entry --yes recover \
+            > /tmp/recover.log 2>&1 \
+            && { echo "::error::recover reported success without a panel"; exit 1; }
+          grep -q 'did not answer' /tmp/recover.log \
+            || { echo "::error::recover failed without saying why"; cat /tmp/recover.log; exit 1; }
+          echo "recover reports an unreachable panel"
+
+      # `saucewg update` run as the installed command reads the file it would have to
+      # overwrite, so it cannot deliver a newer CLI by copying — and the compose file and
+      # the .env keys a release adds are written by the CLI, not by the images. Left to
+      # itself that is a server running new containers configured by the old release, so
+      # update fetches the published script and hands the run over to it.
+      - name: Update replaces a stale CLI and finishes under the new one
+        run: |
+          mkdir -p /tmp/pub /tmp/bin
+          printf '#!/bin/sh\nexit 0\n' > /tmp/bin/docker && chmod +x /tmp/bin/docker
+          sudo cp saucewg.sh /tmp/bin/saucewg && sudo chmod +x /tmp/bin/saucewg
+          sudo bash saucewg.sh --dir /tmp/stale --yes install \
+            --endpoint-host 127.0.0.1 --admin-password ci-password --no-start
+          # The migration the newer script is supposed to perform, undone so its arrival
+          # is what puts it back.
+          sudo sed -i '/^CASCADE_FALLBACK=/d' /tmp/stale/.env
+
+          run() {
+            sudo env PATH=/tmp/bin:$PATH SAUCEWG_CLI_PATH=/tmp/bin/saucewg \
+              SAUCEWG_RAW_BASE="$1" /tmp/bin/saucewg --dir /tmp/stale --yes update --no-restart 2>&1
+          }
+          installed() { sed -n 's/^SAUCEWG_VERSION="\([^"]*\)".*/\1/p' /tmp/bin/saucewg | head -1; }
+
+          sed 's/^SAUCEWG_VERSION="[^"]*"/SAUCEWG_VERSION="99.0.0"/' saucewg.sh > /tmp/pub/saucewg.sh
+          run file:///tmp/pub | grep -q '99.0.0' \
+            || { echo "::error::a stale CLI updated silently"; exit 1; }
+          [ "$(installed)" = 99.0.0 ] || { echo "::error::the CLI was not replaced"; exit 1; }
+          sudo grep -qx 'CASCADE_FALLBACK=direct' /tmp/stale/.env \
+            || { echo "::error::the newer script did not finish the update"; exit 1; }
+
+          # An identical version is not swapped, and a mirror serving something that is
+          # not this script leaves the working copy in place.
+          sudo cp saucewg.sh /tmp/bin/saucewg
+          cp saucewg.sh /tmp/pub/saucewg.sh
+          run file:///tmp/pub | grep -q '→' \
+            && { echo "::error::replaced the CLI with its own version"; exit 1; }
+          printf '<html>404</html>\nfi done )\n' > /tmp/pub/saucewg.sh
+          run file:///tmp/pub | grep -q 'did not arrive intact' \
+            || { echo "::error::a broken download was not reported"; exit 1; }
+          [ "$(installed)" = "$(sed -n 's/^SAUCEWG_VERSION="\([^"]*\)".*/\1/p' saucewg.sh | head -1)" ] \
+            || { echo "::error::a broken download clobbered the CLI"; exit 1; }
+          echo "a stale CLI hands the update to the published one, and only to a sound one"

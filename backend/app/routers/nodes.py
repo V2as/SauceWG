@@ -28,6 +28,7 @@ from ..schemas import (
     NodeContainer,
     NodeCredentials,
     NodeLogs,
+    NodeRecovery,
     NodeServiceRequest,
     NodeStatus,
     NodeUpgradeRequest,
@@ -35,7 +36,7 @@ from ..schemas import (
     TaskLogLine,
     TaskOut,
 )
-from ..services import identity, provision
+from ..services import identity, provision, recovery
 from ..services.tasks import Task, detached, tasks
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,11 @@ def _metadata() -> dict[str, dict[str, Any]]:
         return {}
 
 
-def _serialise(node: ExitNodeState, meta: dict[str, Any] | None) -> ExitNode:
+def _serialise(
+    node: ExitNodeState,
+    meta: dict[str, Any] | None,
+    recovering: dict[str, Any] | None = None,
+) -> ExitNode:
     meta = meta or {}
     created = meta.get("created_at")
     created_at: datetime | None = None
@@ -98,6 +103,7 @@ def _serialise(node: ExitNodeState, meta: dict[str, Any] | None) -> ExitNode:
         ssh_key=bool(meta.get("ssh_key")) and settings.node_ssh_key_enabled,
         created_at=created_at,
         task_id=running.id if running else None,
+        recovery=NodeRecovery(**recovering) if recovering else None,
     )
 
 
@@ -109,6 +115,7 @@ def _snapshot(mode: str | None = None, pinned: str | None = None) -> ExitNodeLis
     """
     state = load_uplink_state()
     meta = _metadata()
+    recovering = recovery.state()
     return ExitNodeList(
         mode=mode if mode is not None else state.mode,
         active=state.active,
@@ -120,7 +127,10 @@ def _snapshot(mode: str | None = None, pinned: str | None = None) -> ExitNodeLis
         updated_at=state.updated_at,
         config_error=registry.config_error(),
         provisioning=registry.writable(),
-        nodes=[_serialise(node, meta.get(node.name)) for node in state.nodes],
+        nodes=[
+            _serialise(node, meta.get(node.name), recovering.get(node.name))
+            for node in state.nodes
+        ],
     )
 
 
@@ -674,6 +684,9 @@ async def update_node(name: str, payload: ExitNodeUpdate, admin: SudoAdminDep) -
     except registry.RegistryError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
+    # A new endpoint or SSH address is a different server as far as recovery is
+    # concerned, so whatever it had given up on no longer applies.
+    recovery.forget(name)
     logger.info("admin %s updated exit node %s: %s", admin.username, name, sorted(changes))
     return _snapshot()
 
@@ -728,6 +741,7 @@ async def delete_node(
                 task.emit(f"could not clean up {credentials.host}: {exc}")
                 task.emit("the node was still removed from the cascade")
 
+        recovery.forget(name)
         task.result = {"name": name, "removed": True, "uninstalled": credentials is not None}
 
     return _task_out(tasks.start("remove", name, work))
@@ -764,6 +778,52 @@ async def repair_node(name: str, payload: NodeCredentials, admin: SudoAdminDep) 
         task.result = {"name": name, "uplink_public_key": uplink_key, "healthy": healthy}
 
     return _task_out(tasks.start("repair", name, work))
+
+
+@router.post("/{name}/recover", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED)
+async def recover_node(name: str, admin: SudoAdminDep) -> TaskOut:
+    """Tries to put a failed exit node back, escalating until it handshakes.
+
+    The same thing the panel does on its own timer, run now: probe the server, then
+    restart its service, then re-install the uplink key. Takes no credentials — it
+    uses the panel's own key, which is what makes it usable unattended, and a node
+    the panel has no key on cannot be recovered from here at all.
+
+    Asking for it clears whatever the automatic attempts had given up on, since an
+    operator asking has usually just fixed the reason.
+    """
+    _require_provision_enabled()
+    _reject_if_busy(name)
+
+    node = _find_or_404(name)
+    if not node.get("ssh_host"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{name!r} was not installed by the panel, so it has no SSH address "
+            f"to reach. Recover it on that server with `saucewg restart`.",
+        )
+
+    logger.info("admin %s is recovering exit node %s", admin.username, name)
+
+    async def work(task: Task) -> None:
+        task.begin(f"Recovering {name}")
+        result = await recovery.recover_now(name)
+        task.result = result
+        if result["healthy"]:
+            task.emit(f"{name} is carrying traffic again")
+        elif not result["acted"]:
+            task.emit(f"{name} is already healthy; nothing was touched")
+        else:
+            # Not a task failure: the attempt ran and reported what it found, and
+            # what it found is the answer the operator asked for.
+            task.emit(result.get("last_error") or f"{name} did not come back")
+            if result.get("blocked") == recovery.UNREACHABLE:
+                task.emit(
+                    "the server does not answer at all, so there is nothing left to "
+                    "try from here — check whether the VPS still exists"
+                )
+
+    return _task_out(tasks.start("recover", name, work))
 
 
 @router.post("/{name}/protocol", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED)
@@ -934,6 +994,9 @@ def _service_task(name: str, action: str, payload: NodeServiceRequest | None, ad
         task.begin(provision.SERVICE_ACTIONS[action])
         await provision.control_service(task, credentials, action)
         _remember_key(name, credentials)
+        # The operator has just done by hand what recovery would have escalated
+        # through, so its history is stale either way.
+        recovery.forget(name)
 
         healthy: bool | None = None
         if action == "stop":

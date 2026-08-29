@@ -32,6 +32,7 @@ from app.awg import registry  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.deps import get_current_admin, get_sudo_admin  # noqa: E402
 from app.main import app  # noqa: E402
+from app.services import recovery  # noqa: E402
 from app.services.tasks import tasks  # noqa: E402
 
 logging.disable(logging.INFO)
@@ -49,6 +50,7 @@ app.dependency_overrides[get_sudo_admin] = lambda: FakeAdmin()
 workdir = tempfile.mkdtemp(prefix="saucewg-nodes-")
 settings.node_registry_file = os.path.join(workdir, "exit-nodes.json")
 settings.routes_registry_file = os.path.join(workdir, "direct-routes.json")
+settings.bypass_registry_file = os.path.join(workdir, "bypass.json")
 settings.awg_socket_dir = workdir
 # Where the node container would persist the entry interface's profile.
 settings.awg_config_dir = workdir
@@ -78,11 +80,12 @@ def publish(
     fallback: str | None = "direct",
     fallback_active: bool = False,
     direct: dict | None = None,
+    bypass: dict | None = None,
 ) -> None:
     """Writes the state file the way the node container would.
 
-    ``fallback=None`` and ``direct=None`` leave those keys out entirely, which is what
-    a node container older than this panel publishes.
+    ``fallback=None``, ``direct=None`` and ``bypass=None`` leave those keys out
+    entirely, which is what a node container older than this panel publishes.
     """
     state = {
         "updated_at": time.time() - age,
@@ -100,6 +103,8 @@ def publish(
         state["fallback_active"] = fallback_active
     if direct is not None:
         state["direct"] = direct
+    if bypass is not None:
+        state["bypass"] = bypass
     with open(settings.uplink_state_file, "w", encoding="utf-8") as handle:
         json.dump(state, handle)
 
@@ -483,6 +488,240 @@ async def main() -> None:
         check("the panel says which one is in charge", "CASCADE_DIRECT_ROUTES" in (body["config_error"] or ""), body)
         response = await client.post("/api/routes", json={"cidr": ["9.9.9.9"]})
         check("and refuses writes that would not take effect", response.status_code == 409, response.text)
+
+        print("destinations the entry node reopens for itself")
+
+        def running(routes, *, mode="auto", active=True, groups=("telegram",)):
+            """The bypass state a node container publishes while the relay is up."""
+            return {
+                "mode": mode,
+                "groups": list(groups),
+                "source": "file",
+                "routes": list(routes),
+                "applied": len(routes),
+                "active": active,
+                "relay": {
+                    "listen": "10.8.0.1:8646",
+                    "prefixes": len(routes),
+                    "open": 1,
+                    "accepted": 40,
+                    "via_v6": 31,
+                    "via_retry": 8,
+                    "failed": 1,
+                    "attempts": 96,
+                    "cooled": 4,
+                    "rx_bytes": 4096,
+                    "tx_bytes": 2048,
+                },
+                "error": None,
+            }
+
+        publish()
+        response = await client.get("/api/bypass")
+        body = response.json()
+        check("the list is readable", response.status_code == 200, response.text)
+        check("and starts empty", body["entries"] == [], body)
+        check("with the node not answering yet", body["live"] is False, body)
+
+        response = await client.post(
+            "/api/bypass", json={"cidr": ["203.0.113.0/24"], "note": "some service"}
+        )
+        body = response.json()
+        check("a destination is accepted", response.status_code == 201, response.text)
+        check("and listed", body["entries"][0]["cidr"] == "203.0.113.0/24", body)
+        check("with no counterpart, so its own IPv4 is retried", body["entries"][0]["v6"] is None, body)
+        check("nothing is active until the node says so", body["entries"][0]["active"] is False, body)
+
+        response = await client.post(
+            "/api/bypass", json={"cidr": ["198.51.100.7"], "v6": "2001:db8::a"}
+        )
+        body = response.json()
+        check("a counterpart is kept", body["entries"][1]["v6"] == "2001:db8::a", body)
+        check("and a bare address became a host route", body["entries"][1]["cidr"] == "198.51.100.7/32", body)
+
+        # Unlike a direct route, an entry carries *how* to reach the destination, so
+        # adding one twice has to correct it rather than be skipped as a duplicate.
+        response = await client.post(
+            "/api/bypass", json={"cidr": ["198.51.100.7"], "v6": "2001:db8::ff"}
+        )
+        body = response.json()
+        check("re-adding one corrects its counterpart", body["entries"][1]["v6"] == "2001:db8::ff", body)
+        check("without duplicating it", len(body["entries"]) == 2, body)
+
+        for payload_, why in (
+            ({"cidr": ["telegram.org"]}, "a name is not a prefix"),
+            ({"cidr": ["0.0.0.0/0"]}, "every destination at once"),
+            ({"cidr": ["1.2.3.4"], "v6": "not-an-address"}, "an unparseable counterpart"),
+            ({"cidr": ["1.2.3.4"], "v6": "9.9.9.9"}, "an IPv4 counterpart"),
+            ({"cidr": ["1.2.3.4", "5.6.7.8"], "v6": "2001:db8::1"}, "one counterpart for two destinations"),
+        ):
+            response = await client.post("/api/bypass", json=payload_)
+            check(f"{why} is refused", response.status_code == 400, response.text)
+
+        # What the node container reports is what decides whether an entry is in force,
+        # and it also knows counterparts the file does not.
+        publish(bypass=running([
+            {"cidr": "203.0.113.0/24", "v6": None, "note": "some service"},
+            {"cidr": "198.51.100.7/32", "v6": "2001:db8::ff", "note": None},
+            {"cidr": "149.154.167.51/32", "v6": "2001:67c:4e8:f002::a", "note": "telegram-dc2"},
+        ]))
+        body = (await client.get("/api/bypass")).json()
+        check("the panel knows the node is answering", body["live"] is True, body)
+        check("the mode is reported", body["mode"] == "auto", body)
+        check("so are the built-in groups", body["groups"] == ["telegram"], body)
+        check("and that the redirect is in force", body["active"] is True, body)
+        check("a listed entry is marked active", body["entries"][0]["active"] is True, body)
+        check("the relay's counters come through", body["relay"]["via_v6"] == 31, body)
+        check("including the destinations it has stopped bursting at",
+              body["relay"]["cooled"] == 4, body)
+
+        built_in = [entry for entry in body["entries"] if entry["built_in"]]
+        check("a group's destination is shown alongside the list", len(built_in) == 1, body)
+        check("with the counterpart the group gave it",
+              built_in[0]["v6"] == "2001:67c:4e8:f002::a", built_in)
+        response = await client.delete("/api/bypass/149.154.167.51/32")
+        check("and cannot be deleted, only turned off", response.status_code == 409, response.text)
+        response = await client.put("/api/bypass/149.154.167.51/32", json={"enabled": False})
+        body = response.json()
+        check("turning a group's destination off is recorded here", response.status_code == 200, response.text)
+        check("so it survives an update",
+              any(e["cidr"] == "149.154.167.51/32" and e["enabled"] is False for e in body["entries"]),
+              body)
+
+        # In `auto` the redirect is deliberately absent while an exit node is carrying
+        # client traffic. That is the normal state, so it must not read as an error.
+        publish(bypass=running([], active=False))
+        body = (await client.get("/api/bypass")).json()
+        check("an idle bypass is not an error", body["config_error"] is None, body)
+        check("and says so plainly", body["active"] is False, body)
+        check("while the entries stay listed", len(body["entries"]) == 3, body)
+
+        publish(bypass=running([{"cidr": "203.0.113.0/24", "v6": None, "note": None}]) | {
+            "error": "the bypass relay is not running, so the redirected destinations are unreachable"
+        })
+        body = (await client.get("/api/bypass")).json()
+        check("a dead relay is reported", "relay is not running" in (body["config_error"] or ""), body)
+
+        response = await client.delete("/api/bypass/203.0.113.0/24")
+        check("an entry can be removed", response.status_code == 200, response.text)
+        response = await client.delete("/api/bypass/192.0.2.0/24")
+        check("removing one that is not there is a 404", response.status_code == 404, response.text)
+
+        # A container older than this feature publishes no bypass key at all.
+        publish()
+        body = (await client.get("/api/bypass")).json()
+        check("an older container reads as not answering", body["live"] is False, body)
+        check("without pretending the redirect is up", body["active"] is False, body)
+
+        print("when the environment overrides the bypass list")
+        publish(bypass=running([{"cidr": "1.2.3.0/24", "v6": None, "note": None}]) | {"source": "env"})
+        body = (await client.get("/api/bypass")).json()
+        check("the panel says which one is in charge", "BYPASS_ROUTES" in (body["config_error"] or ""), body)
+        response = await client.post("/api/bypass", json={"cidr": ["9.9.9.9"]})
+        check("and refuses writes that would not take effect", response.status_code == 409, response.text)
+
+        print("putting a failed exit node back")
+
+        def uplink(name: str, *, healthy: bool = False) -> dict:
+            """One entry of the node container's view of the cascade."""
+            return {
+                "name": name, "iface": f"awg-{name}", "address": "10.77.0.2/32",
+                "priority": 10, "public_key": "KEY-D", "endpoint": "192.0.2.9:51820",
+                "peer_public_key": "PEER", "healthy": healthy, "active": healthy,
+            }
+
+        # A node the panel installed and holds a key for, whose SSH port is closed:
+        # every attempt below has to reach the point of dialling it and give up there.
+        registry.save_nodes([{
+            "name": "eu-down", "endpoint": "192.0.2.9:51820", "public_key": "KEY-D",
+            "address": "10.77.0.2/32", "priority": 10, "managed": True,
+            "ssh_host": "127.0.0.1", "ssh_port": 1, "ssh_user": "root", "ssh_key": True,
+        }])
+        publish(nodes=[uplink("eu-down")])
+        recovery.forget("eu-down")
+
+        settings.node_recovery_grace_seconds = 600
+        check("a node that has only just gone down is left alone", await recovery.sweep() == 0, recovery.state())
+
+        # Nothing else in this file waits, so attempts are due the moment they are
+        # considered; the backoff itself is checked below on its own.
+        settings.node_recovery_grace_seconds = 0
+        settings.node_recovery_interval_seconds = 0
+        check("once the grace period is up it is worked on", await recovery.sweep() == 1, recovery.state())
+        seen = recovery.state()["eu-down"]
+        check("the server is probed before anything is changed", seen["last_action"] == "probe", seen)
+        check("and why it could not be reached is kept", "127.0.0.1" in (seen["last_error"] or ""), seen)
+        check("one failure is not yet a verdict", seen["blocked"] is None, seen)
+
+        # Two silent probes is a server that is gone rather than restarting, and the
+        # useful answer is to stop and say so.
+        check("a second probe still runs", await recovery.sweep() == 1, recovery.state())
+        seen = recovery.state()["eu-down"]
+        check("after which it is left for a human", seen["blocked"] == "unreachable", seen)
+        check("saying the machine may no longer exist", seen["attempts"] == 2, seen)
+        check("and it is not dialled again", await recovery.sweep() == 0, recovery.state())
+
+        body = (await client.get("/api/nodes")).json()
+        reported = body["nodes"][0]["recovery"]
+        check("the panel publishes what recovery did", reported["blocked"] == "unreachable", body["nodes"][0])
+        check("with how long the node has been down", reported["down_for_seconds"] >= 0, reported)
+        check("and how many attempts it took to decide", reported["attempts"] == 2, reported)
+
+        print("recovering one on demand")
+        response = await client.post("/api/nodes/eu-down/recover")
+        check("an attempt can be asked for", response.status_code == 202, response.text)
+        task = await drain(client, response.json()["id"])
+        check("it reports rather than failing", task["status"] == "succeeded", task)
+        check("having got as far as the server", "127.0.0.1" in json.dumps(task["log"]), task["log"])
+        check("and says there is nothing left to try", "VPS" in json.dumps(task["log"]), task["log"])
+        check("the node was not touched", task["result"]["healthy"] is False, task)
+
+        response = await client.post("/api/nodes/ghost/recover")
+        check("recovering an unknown node is a 404", response.status_code == 404, response.text)
+
+        print("nodes recovery cannot help")
+        current = registry.load_nodes()
+        registry.find(current, "eu-down").pop("ssh_key")
+        registry.save_nodes(current)
+        recovery.forget("eu-down")
+        check("a node with no key on it is not dialled", await recovery.sweep() == 0, recovery.state())
+        seen = recovery.state()["eu-down"]
+        check("but the reason is recorded once", seen["blocked"] == "unreachable", seen)
+        check("without counting as an attempt", seen["attempts"] == 0, seen)
+        check("and it explains what an operator must do", "unattended" in (seen["last_error"] or ""), seen)
+
+        current = registry.load_nodes()
+        registry.find(current, "eu-down")["ssh_key"] = True
+        registry.save_nodes(current)
+
+        print("when the node container has gone quiet")
+        publish(age=3600, nodes=[uplink("eu-down")])
+        recovery.forget("eu-down")
+        check("an unhealthy reading nobody published is not acted on", await recovery.sweep() == 0, recovery.state())
+        check("and nothing is recorded against the node", recovery.state() == {}, recovery.state())
+
+        print("a node that comes back on its own")
+        publish(nodes=[uplink("eu-down")])
+        await recovery.sweep()
+        check("a failing node has a history", "eu-down" in recovery.state(), recovery.state())
+        publish(nodes=[uplink("eu-down", healthy=True)])
+        check("a healthy one is not worked on", await recovery.sweep() == 0, recovery.state())
+        check("and its history is dropped", recovery.state() == {}, recovery.state())
+        response = await client.post("/api/nodes/eu-down/recover")
+        task = await drain(client, response.json()["id"])
+        check("asking anyway does not restart a working node", task["result"]["acted"] is False, task)
+
+        print("an operator's own repair resets it")
+        publish(nodes=[uplink("eu-down")])
+        await recovery.sweep()
+        await recovery.sweep()
+        check("recovery had given up", recovery.state()["eu-down"]["blocked"] == "unreachable", recovery.state())
+        response = await client.put("/api/nodes/eu-down", json={"endpoint": "192.0.2.10:51820"})
+        check("moving the node to another server is accepted", response.status_code == 200, response.text)
+        check("and clears what recovery assumed", recovery.state() == {}, recovery.state())
+
+        registry.save_nodes([])
+        publish()
 
         print("when the panel is not in charge")
         publish(source="env")

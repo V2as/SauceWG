@@ -433,7 +433,9 @@ uplink_signature() {
 # its network — the kernel rejects 10.0.0.1/24 as a route, and the operator meant the
 # range. A /0 is refused: it would take every destination off the cascade, which is
 # what CASCADE_FALLBACK is for.
-readonly DIRECT_JQ='
+#
+# Shared with the bypass list, which reads prefixes written the same way.
+readonly CIDR_JQ='
 def entry:
     if type == "object" then with_entries(.key |= ascii_downcase)
     else {cidr: (. | tostring)} end;
@@ -457,6 +459,9 @@ def canonical:
             | {ok: "\(($net / 16777216) | floor).\((($net % 16777216) / 65536) | floor).\((($net % 65536) / 256) | floor).\($net % 256)/\($bits)"}
           end
       end;
+'
+
+readonly DIRECT_JQ="${CIDR_JQ}"'
 map(entry)
 | map(select(if has("enabled") then .enabled != false else true end))
 | map(text)
@@ -645,6 +650,415 @@ direct_error() {
 }
 
 # ---------------------------------------------------------------------------
+# Bypass
+# ---------------------------------------------------------------------------
+#
+# Destinations a censor blocks by refusing to let a TCP connection be established
+# to their IPv4, rather than by taking the route away. The entry node opens the
+# outbound half itself, over the destination's IPv6 where one is known and by
+# dialling its IPv4 until a handshake lands otherwise; awg-bypass does both, and
+# this side decides which destinations reach it and when.
+#
+# The when matters as much as the what. While an exit node is carrying client
+# traffic there is nothing to bypass — the flow already leaves the country — and
+# redirecting it here would move it back to the entry node's own address, which
+# is the exposure the cascade exists to avoid. So the default is to engage only
+# while the entry node is carrying the traffic anyway.
+
+BYPASS_MODE=${BYPASS_MODE:-auto}
+BYPASS_GROUPS=${BYPASS_GROUPS:-telegram}
+BYPASS_FILE=${BYPASS_FILE:-/etc/amnezia/host/bypass.json}
+BYPASS_PORT=${BYPASS_PORT:-8646}
+BYPASS_BIN=${BYPASS_BIN:-awg-bypass}
+BYPASS_CONFIG_FILE=${BYPASS_CONFIG_FILE:-/var/run/amneziawg/bypass.json}
+BYPASS_STATE_FILE=${BYPASS_STATE_FILE:-/var/run/amneziawg/bypass-state.json}
+# How hard to dial an IPv4 whose handshakes are being dropped, and how long to
+# wait for the IPv6 that should answer on the first try. The handshakes go out
+# several at a time because the client is waiting through all of them: against an
+# address losing nine SYNs in ten, six at a time is a connection in under a second
+# where one at a time is ten.
+BYPASS_ATTEMPTS=${BYPASS_ATTEMPTS:-96}
+BYPASS_PARALLEL=${BYPASS_PARALLEL:-6}
+BYPASS_ATTEMPT_TIMEOUT_MS=${BYPASS_ATTEMPT_TIMEOUT_MS:-400}
+BYPASS_RETRY_BUDGET_MS=${BYPASS_RETRY_BUDGET_MS:-20000}
+BYPASS_V6_TIMEOUT_MS=${BYPASS_V6_TIMEOUT_MS:-4000}
+# A destination that spends a whole budget without answering is worth one
+# handshake rather than a burst for a while: clients retry a failing address in
+# tight loops, and the entry node pays for every attempt in ephemeral ports and
+# conntrack entries.
+BYPASS_COOLDOWN_MS=${BYPASS_COOLDOWN_MS:-10000}
+BYPASS_COOL_AFTER=${BYPASS_COOL_AFTER:-3}
+
+# "prefix<TAB>ipv6 counterpart<TAB>note", most specific last is fine — the relay
+# sorts by prefix length itself.
+BYPASS_ROWS=()
+BYPASS_SOURCE=none
+BYPASS_ERROR=""
+# Whether the redirect is installed right now, and the port it points at.
+BYPASS_ACTIVE=false
+BYPASS_PID=0
+BYPASS_RULES=()
+# The signature of the table last handed to the relay, so an unchanged reload
+# costs nothing.
+BYPASS_APPLIED=""
+
+# Destinations the built-in groups cover.
+#
+# The IPv6 column is only filled in where the counterpart is known to be the same
+# server: an MTProto session's keys belong to one datacenter, so sending a flow to
+# the wrong one is worse than not translating it at all. Everything else is listed
+# without a counterpart and reached by dialling its own IPv4 persistently, which
+# needs no table to stay correct.
+#
+# Telegram's rows are the datacenter bootstrap addresses the official clients
+# ship (tdesktop's mtproto_dc_options.cpp, Telegram-iOS's seedAddressList) paired
+# with the IPv6 address of the same datacenter from the same tables, plus the
+# addresses t.me, api.telegram.org and the web app resolve to, each paired with
+# the IPv6 of the same name.
+#
+# The ranges at the end carry no counterpart on purpose. Two kinds of address live
+# in them: datacenter endpoints a client discovers at runtime, which cannot be
+# paired without knowing which datacenter each one is — sending an MTProto session
+# to the wrong one is worse than not translating it — and the media CDN, which
+# publishes no IPv6 at all (cdn1..5.telesco.pe are IPv4-only). Both are reached by
+# dialling their own IPv4 persistently, which is why that path carries photographs
+# and video rather than only being a fallback.
+#
+# "prefix|ipv6 counterpart|note", one per line. The separator is not a tab because
+# tab is an IFS whitespace character and `read` would collapse the two that
+# surround an empty counterpart into one, silently turning the note into it.
+bypass_group_rows() {
+    case "$1" in
+        telegram)
+            cat <<'ROWS'
+149.154.175.50/32|2001:b28:f23d:f001::a|telegram-dc1
+149.154.175.51/32|2001:b28:f23d:f001::a|telegram-dc1
+149.154.167.50/32|2001:67c:4e8:f002::a|telegram-dc2
+149.154.167.51/32|2001:67c:4e8:f002::a|telegram-dc2
+95.161.76.100/32|2001:67c:4e8:f002::a|telegram-dc2
+149.154.175.100/32|2001:b28:f23d:f003::a|telegram-dc3
+149.154.167.91/32|2001:67c:4e8:f004::a|telegram-dc4
+149.154.167.92/32|2001:67c:4e8:f004::a|telegram-dc4
+149.154.171.5/32|2001:b28:f23f:f005::a|telegram-dc5
+91.108.56.130/32|2001:b28:f23f:f005::a|telegram-dc5
+149.154.167.96/32|2001:67c:4e8:f002::b|telegram-dc2-media
+149.154.164.250/32|2001:67c:4e8:f004::b|telegram-dc4-media
+149.154.167.99/32|2001:67c:4e8:f004::9|telegram-web
+149.154.166.110/32|2001:67c:4e8:f004::9|telegram-web
+149.154.170.96/32|2001:b28:f23f:9::852:438|telegram-web-flora
+149.154.175.209/32|2001:b28:f23d:8005:7:0:109:338|telegram-web-pluto
+91.105.192.0/23||telegram
+91.108.4.0/22||telegram
+91.108.8.0/22||telegram
+91.108.12.0/22||telegram
+91.108.16.0/22||telegram
+91.108.20.0/22||telegram
+91.108.56.0/22||telegram
+95.161.64.0/20||telegram
+149.154.160.0/20||telegram
+185.76.151.0/24||telegram
+ROWS
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+bypass_groups_known() {
+    printf 'telegram'
+}
+
+# The operator's own list, in the shape the panel and direct-routes.json use, with
+# an optional IPv6 counterpart per entry.
+readonly BYPASS_JQ="${CIDR_JQ}"'
+map(entry)
+| map(. + {__cidr: (. | text), __enabled: (if has("enabled") then .enabled != false else true end)})
+| map(select(.__cidr | length > 0))
+| map(. + {__canon: (.__cidr | canonical)})[]
+| if (.__canon | has("ok"))
+  then "ok\u001f\(.__canon.ok)\u001f\((.v6 // .ipv6 // "") | tostring)\u001f\(.note // "")\u001f\(.__enabled)"
+  else "bad\u001f\(.__canon.bad)" end'
+
+bypass_config_source() {
+    if [ -n "${BYPASS_ROUTES:-}" ]; then
+        printf 'env'
+    elif [ -f "$BYPASS_FILE" ]; then
+        printf 'file'
+    else
+        printf 'none'
+    fi
+}
+
+bypass_source_json() {
+    case $(bypass_config_source) in
+        env) printf '%s' "$BYPASS_ROUTES" | jq -R -s 'split("[,;[:space:]]+"; "") | map(select(length > 0))' ;;
+        file) cat "$BYPASS_FILE" 2>/dev/null || printf '[]' ;;
+        *) printf '[]' ;;
+    esac
+}
+
+# Fills BYPASS_ROWS from the enabled groups and then from the operator's list,
+# which wins on any prefix it repeats and can switch a built-in row off with
+# `"enabled": false` rather than by having to restate the whole group.
+bypass_parse() {
+    local group rows prefix v6 note enabled kind bad=0 first=""
+    local -A row=() order=()
+    local -a sequence=()
+
+    BYPASS_SOURCE=$(bypass_config_source)
+    BYPASS_ERROR=""
+    BYPASS_ROWS=()
+
+    for group in $(printf '%s' "${BYPASS_GROUPS:-}" | tr ',;' '  '); do
+        if ! rows=$(bypass_group_rows "$group"); then
+            BYPASS_ERROR="no built-in bypass group named '${group}' (known: $(bypass_groups_known))"
+            log "bypass: $BYPASS_ERROR"
+            continue
+        fi
+        while IFS='|' read -r prefix v6 note; do
+            [ -n "$prefix" ] || continue
+            case $prefix in '#'*) continue ;; esac
+            if [ -z "${order[$prefix]:-}" ]; then
+                sequence+=("$prefix")
+                order[$prefix]=1
+            fi
+            row[$prefix]="${v6}"$'\t'"${note:-$group}"
+        done <<<"$rows"
+    done
+
+    while IFS=$'\x1f' read -r kind prefix v6 note enabled; do
+        case $kind in
+            ok)
+                if [ "$enabled" = "false" ]; then
+                    unset "row[$prefix]"
+                    continue
+                fi
+                if [ -z "${order[$prefix]:-}" ]; then
+                    sequence+=("$prefix")
+                    order[$prefix]=1
+                fi
+                row[$prefix]="${v6}"$'\t'"${note}"
+                ;;
+            bad)
+                bad=$((bad + 1))
+                [ -n "$first" ] || first=$prefix
+                ;;
+        esac
+    done < <(bypass_source_json | jq -r "$BYPASS_JQ" 2>/dev/null)
+
+    for prefix in ${sequence[@]+"${sequence[@]}"}; do
+        [ -n "${row[$prefix]:-}" ] || continue
+        BYPASS_ROWS+=("${prefix}"$'\t'"${row[$prefix]}")
+    done
+
+    if [ "$bad" -gt 0 ]; then
+        BYPASS_ERROR="skipped ${bad} bypass entr$([ "$bad" -eq 1 ] && printf 'y' || printf 'ies') that are not IPv4 prefixes, starting with '${first}'"
+        log "bypass: $BYPASS_ERROR"
+    fi
+    return 0
+}
+
+# True while the redirect should be in place. In `auto` that is exactly when
+# client traffic is leaving through the entry node itself and would otherwise meet
+# the filter this exists to get around.
+bypass_wanted() {
+    [ "${#BYPASS_ROWS[@]}" -gt 0 ] || return 1
+    case "$BYPASS_MODE" in
+        always|on|true) return 0 ;;
+        auto)
+            [ "$FALLBACK_ACTIVE" = "true" ] && [ "$FALLBACK_MODE" = "direct" ]
+            return $?
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# The address a redirect lands on: REDIRECT rewrites the destination to the
+# primary address of the interface the packet arrived on, which is the one the
+# server interface was brought up with. Binding there rather than to every address
+# is what keeps the port off the entry node's public interface.
+bypass_listen_ip() {
+    local addr
+    addr=$(first_host "$AWG_SUBNET")
+    printf '%s' "${addr%%/*}"
+}
+
+bypass_listen_address() {
+    printf '%s:%s' "$(bypass_listen_ip)" "$BYPASS_PORT"
+}
+
+# The relay's table. Only the client-facing address is bound, so the port is not
+# reachable from anywhere a client cannot already reach.
+bypass_write_config() {
+    local tmp="${BYPASS_CONFIG_FILE}.tmp" prefix v6 note
+    mkdir -p "$(dirname "$BYPASS_CONFIG_FILE")" 2>/dev/null || true
+
+    if for prefix in ${BYPASS_ROWS[@]+"${BYPASS_ROWS[@]}"}; do
+        printf '%s\n' "$prefix"
+    done | jq -R -s \
+        --arg listen "$(bypass_listen_address)" \
+        --argjson attempts "$BYPASS_ATTEMPTS" \
+        --argjson parallel "$BYPASS_PARALLEL" \
+        --argjson attempt_timeout "$BYPASS_ATTEMPT_TIMEOUT_MS" \
+        --argjson budget "$BYPASS_RETRY_BUDGET_MS" \
+        --argjson v6_timeout "$BYPASS_V6_TIMEOUT_MS" \
+        --argjson cooldown "$BYPASS_COOLDOWN_MS" \
+        --argjson cool_after "$BYPASS_COOL_AFTER" '
+        {
+            listen: $listen,
+            attempts: $attempts,
+            parallel: $parallel,
+            attempt_timeout_ms: $attempt_timeout,
+            retry_budget_ms: $budget,
+            v6_timeout_ms: $v6_timeout,
+            cooldown_ms: $cooldown,
+            cool_after: $cool_after,
+            map: (
+                split("\n") | map(select(length > 0)) | map(split("\t")) | map({
+                    prefix: .[0],
+                    v6: (.[1] // ""),
+                    note: (.[2] // "")
+                })
+            )
+        }' > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$BYPASS_CONFIG_FILE"
+        chmod 0644 "$BYPASS_CONFIG_FILE"
+        return 0
+    fi
+    rm -f "$tmp"
+    log "bypass: could not write ${BYPASS_CONFIG_FILE}"
+    return 1
+}
+
+bypass_running() {
+    [ "${BYPASS_PID:-0}" -gt 0 ] 2>/dev/null && kill -0 "$BYPASS_PID" 2>/dev/null
+}
+
+bypass_start() {
+    bypass_running && return 0
+    command -v "$BYPASS_BIN" >/dev/null 2>&1 || {
+        BYPASS_ERROR="the ${BYPASS_BIN} helper is missing from this node image"
+        log "bypass: $BYPASS_ERROR"
+        return 1
+    }
+    "$BYPASS_BIN" -config "$BYPASS_CONFIG_FILE" -state "$BYPASS_STATE_FILE" &
+    BYPASS_PID=$!
+    log "bypass: relay started on $(bypass_listen_address) (pid ${BYPASS_PID})"
+    return 0
+}
+
+bypass_stop() {
+    local pid=${BYPASS_PID:-0}
+    BYPASS_PID=0
+    [ "$pid" -gt 0 ] 2>/dev/null || return 0
+    kill "$pid" 2>/dev/null || true
+    # Reaped rather than left behind: the monitor is a long-lived parent, and a
+    # relay that is stopped and started as the cascade comes and goes would
+    # otherwise accumulate zombies for the life of the container.
+    wait "$pid" 2>/dev/null || true
+    rm -f "$BYPASS_STATE_FILE"
+    log "bypass: relay stopped"
+}
+
+bypass_rules_add() {
+    local row prefix listen_addr
+    listen_addr=$(bypass_listen_ip)
+
+    # Traffic redirected here is delivered locally rather than forwarded, so the
+    # FORWARD guard never sees it and the port needs its own way in.
+    iptables -C INPUT -i "$AWG_IFACE" -p tcp -d "$listen_addr" --dport "$BYPASS_PORT" -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT 1 -i "$AWG_IFACE" -p tcp -d "$listen_addr" --dport "$BYPASS_PORT" -j ACCEPT
+
+    BYPASS_RULES=()
+    for row in ${BYPASS_ROWS[@]+"${BYPASS_ROWS[@]}"}; do
+        prefix=${row%%$'\t'*}
+        iptables -t nat -C PREROUTING -i "$AWG_IFACE" -p tcp -d "$prefix" -j REDIRECT --to-ports "$BYPASS_PORT" 2>/dev/null \
+            || iptables -t nat -A PREROUTING -i "$AWG_IFACE" -p tcp -d "$prefix" -j REDIRECT --to-ports "$BYPASS_PORT" \
+            || continue
+        BYPASS_RULES+=("$prefix")
+    done
+}
+
+bypass_rules_del() {
+    local prefix listen_addr
+    listen_addr=$(bypass_listen_ip)
+    for prefix in ${BYPASS_RULES[@]+"${BYPASS_RULES[@]}"}; do
+        iptables -t nat -D PREROUTING -i "$AWG_IFACE" -p tcp -d "$prefix" -j REDIRECT --to-ports "$BYPASS_PORT" 2>/dev/null || true
+    done
+    BYPASS_RULES=()
+    iptables -D INPUT -i "$AWG_IFACE" -p tcp -d "$listen_addr" --dport "$BYPASS_PORT" -j ACCEPT 2>/dev/null || true
+}
+
+# Brings what is installed into line with what the configuration and the current
+# cascade state ask for. Cheap and idempotent, so it can be called from anywhere
+# that changes either.
+bypass_apply() {
+    local signature
+
+    if ! bypass_wanted; then
+        if [ "$BYPASS_ACTIVE" = "true" ]; then
+            bypass_rules_del
+            bypass_stop
+            BYPASS_ACTIVE=false
+            BYPASS_APPLIED=""
+            log "bypass: withdrawn; client traffic is on the cascade again"
+        fi
+        return 0
+    fi
+
+    signature=$(printf '%s\n' ${BYPASS_ROWS[@]+"${BYPASS_ROWS[@]}"})
+    if [ "$BYPASS_ACTIVE" = "true" ] && [ "$signature" = "$BYPASS_APPLIED" ] && bypass_running; then
+        return 0
+    fi
+
+    bypass_write_config || return 1
+    if bypass_running; then
+        # The relay re-reads its table on a signal, so the flows it is already
+        # carrying are not interrupted by a change to the list.
+        kill -HUP "$BYPASS_PID" 2>/dev/null || true
+    elif ! bypass_start; then
+        return 1
+    fi
+
+    if [ "$BYPASS_ACTIVE" = "true" ]; then
+        bypass_rules_del
+    fi
+    bypass_rules_add
+    BYPASS_ACTIVE=true
+    BYPASS_APPLIED=$signature
+    log "bypass: ${#BYPASS_RULES[@]} prefix(es) reopened through this entry node"
+    # Flows that were black-holed against the filter a moment ago have conntrack
+    # entries pointing straight out of eth0; without dropping them a client would
+    # wait out its own TCP timeouts before trying again.
+    conntrack -D -s "$AWG_SUBNET" -p tcp >/dev/null 2>&1 || true
+    return 0
+}
+
+bypass_reload() {
+    bypass_parse || true
+    bypass_apply
+}
+
+bypass_config_mtime() {
+    [ -f "$BYPASS_FILE" ] || { printf '0'; return; }
+    stat -c %Y "$BYPASS_FILE" 2>/dev/null || printf '0'
+}
+
+# What the relay itself reports, which is the only place the counters exist.
+bypass_runtime_json() {
+    [ "$BYPASS_ACTIVE" = "true" ] || { printf 'null'; return; }
+    jq -c '.' "$BYPASS_STATE_FILE" 2>/dev/null || printf 'null'
+}
+
+bypass_error() {
+    if [ "$BYPASS_MODE" != "off" ] && [ "${#BYPASS_ROWS[@]}" -gt 0 ] \
+        && [ "$BYPASS_ACTIVE" = "true" ] && ! bypass_running; then
+        printf 'the bypass relay is not running, so the redirected destinations are unreachable'
+        return 0
+    fi
+    printf '%s' "$BYPASS_ERROR"
+}
+
+# ---------------------------------------------------------------------------
 # Interfaces
 # ---------------------------------------------------------------------------
 
@@ -784,6 +1198,9 @@ uplinks_teardown() {
     ip route flush table "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
     [ -z "$DIRECT_RULES_IFACE" ] || path_rules_del "$DIRECT_RULES_IFACE"
     DIRECT_RULES_IFACE=""
+    bypass_rules_del
+    bypass_stop
+    BYPASS_ACTIVE=false
     for i in "${!UP_NAME[@]}"; do
         ip link del "${UP_IFACE[$i]}" 2>/dev/null || true
     done
@@ -830,6 +1247,10 @@ uplinks_routing_base() {
     # CASCADE_FALLBACK=direct has no exit node left to use.
     direct_routes_apply
 
+    # Destinations the entry node has to reach a different way than a client asked
+    # for, because a filter refuses the one it asked for.
+    bypass_apply
+
     # Client traffic may only leave through a path something above put there. The
     # rule is kept in both fallback modes: in `direct` the way out is an explicit
     # ACCEPT for the entry node's own interface, not the absence of a guard, so a
@@ -855,6 +1276,9 @@ uplink_activate() {
     # Traffic that was leaving through the entry node no longer needs its NAT, unless
     # a direct route still uses it.
     direct_path_rules
+    # Nor does it need the bypass: an exit node abroad is not being filtered, and
+    # the point of the cascade is that the flow does not appear from here.
+    bypass_apply
 
     if [ "$was_fallback" = "true" ]; then
         conntrack -D -s "$AWG_SUBNET" >/dev/null 2>&1 || true
@@ -897,6 +1321,11 @@ uplinks_fallback() {
             || ip route del default table "$CASCADE_TABLE" 2>/dev/null || true
         log "every exit node is down; blocking client traffic (CASCADE_FALLBACK=block)"
     fi
+
+    # In `direct` the traffic now leaves from this address, so whatever is filtered
+    # here is filtered for clients as well, which is what the bypass is for. In
+    # `block` nothing leaves at all and it is withdrawn.
+    bypass_apply
 
     if [ "$previous" -ge 0 ]; then
         conntrack -D -s "$AWG_SUBNET" >/dev/null 2>&1 || true
@@ -1033,6 +1462,15 @@ uplinks_write_state() {
     direct_json=$(printf '%s\n' ${DIRECT_PREFIXES[@]+"${DIRECT_PREFIXES[@]}"} \
         | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null) || direct_json='[]'
 
+    local bypass_json bypass_runtime
+    bypass_json=$(printf '%s\n' ${BYPASS_ROWS[@]+"${BYPASS_ROWS[@]}"} \
+        | jq -R -s 'split("\n") | map(select(length > 0)) | map(split("\t")) | map({
+              cidr: .[0],
+              v6: (if (.[1] // "") == "" then null else .[1] end),
+              note: (if (.[2] // "") == "" then null else .[2] end)
+          })' 2>/dev/null) || bypass_json='[]'
+    bypass_runtime=$(bypass_runtime_json)
+
     if for i in "${!UP_NAME[@]}"; do
         if [ "$i" -eq "$ACTIVE_INDEX" ]; then is_active=true; else is_active=false; fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -1054,6 +1492,14 @@ uplinks_write_state() {
         --arg direct_wan "$DIRECT_WAN" \
         --argjson direct_routes "$direct_json" \
         --argjson direct_applied "${DIRECT_APPLIED:-0}" \
+        --arg bypass_mode "$BYPASS_MODE" \
+        --arg bypass_groups "$BYPASS_GROUPS" \
+        --arg bypass_source "$BYPASS_SOURCE" \
+        --arg bypass_error "$(bypass_error)" \
+        --argjson bypass_routes "$bypass_json" \
+        --argjson bypass_applied "${#BYPASS_RULES[@]}" \
+        --argjson bypass_active "$([ "$BYPASS_ACTIVE" = "true" ] && echo true || echo false)" \
+        --argjson bypass_runtime "$bypass_runtime" \
         --argjson fallback_active "$([ "$FALLBACK_ACTIVE" = "true" ] && echo true || echo false)" \
         --argjson now "$(date -u +%s)" '
         {
@@ -1075,6 +1521,19 @@ uplinks_write_state() {
                 applied: $direct_applied,
                 via: (if $direct_wan == "" then null else $direct_wan end),
                 error: (if $direct_error == "" then null else $direct_error end)
+            },
+            bypass: {
+                mode: $bypass_mode,
+                groups: ($bypass_groups | split("[,;[:space:]]+"; "") | map(select(length > 0))),
+                source: $bypass_source,
+                routes: $bypass_routes,
+                applied: $bypass_applied,
+                # Whether the redirect is installed right now. In `auto` this is
+                # false whenever an exit node is carrying traffic, which is the
+                # normal state and not a fault.
+                active: $bypass_active,
+                relay: $bypass_runtime,
+                error: (if $bypass_error == "" then null else $bypass_error end)
             },
             nodes: (
                 split("\n") | map(select(length > 0)) | map(split("\t")) | map({
@@ -1214,8 +1673,9 @@ uplinks_reload() {
 
     # The catch-all REJECT rule must stay at the bottom of FORWARD even after rules
     # were added and removed around it, the ip rule may have been lost with a deleted
-    # interface, and the direct list may be what the reload was requested for.
+    # interface, and either destination list may be what the reload was requested for.
     direct_parse || true
+    bypass_parse || true
     uplinks_routing_base
 
     uplinks_refresh_health
@@ -1241,11 +1701,13 @@ uplinks_reload() {
 # what keeps a long-lived reload cycle from filling the container with zombies.
 uplinks_monitor() {
     local want now next_health=0
-    local seen_request seen_mtime seen_direct requested mtime direct_mtime
+    local seen_request seen_mtime seen_direct seen_bypass
+    local requested mtime direct_mtime bypass_mtime
 
     seen_request=$(uplinks_reload_request_id)
     seen_mtime=$(uplinks_config_mtime)
     seen_direct=$(direct_config_mtime)
+    seen_bypass=$(bypass_config_mtime)
     RELOAD_ID=$seen_request
 
     while :; do
@@ -1258,6 +1720,7 @@ uplinks_monitor() {
         requested=$(uplinks_reload_request_id)
         mtime=$(uplinks_config_mtime)
         direct_mtime=$(direct_config_mtime)
+        bypass_mtime=$(bypass_config_mtime)
 
         if [ "$requested" != "$seen_request" ] || [ "$mtime" != "$seen_mtime" ]; then
             if [ "$requested" != "$seen_request" ]; then
@@ -1267,17 +1730,24 @@ uplinks_monitor() {
             fi
             seen_request=$requested
             seen_mtime=$mtime
-            # The reload re-reads the direct list too, so this edit is already applied.
+            # The reload re-reads both destination lists too, so those edits are
+            # already applied.
             seen_direct=$direct_mtime
+            seen_bypass=$bypass_mtime
             uplinks_reload || true
             RELOAD_ID=$requested
             uplinks_write_state
             next_health=$((now + CASCADE_PROBE_INTERVAL))
         elif [ "$direct_mtime" != "$seen_direct" ]; then
-            # Only the bypass list changed: the cascade itself does not need touching.
+            # Only the direct list changed: the cascade itself does not need touching.
             log "the direct route list changed on disk"
             seen_direct=$direct_mtime
             direct_reload
+            uplinks_write_state
+        elif [ "$bypass_mtime" != "$seen_bypass" ]; then
+            log "the bypass list changed on disk"
+            seen_bypass=$bypass_mtime
+            bypass_reload
             uplinks_write_state
         fi
 
@@ -1297,6 +1767,11 @@ uplinks_monitor() {
             if [ "$(direct_nexthop)" != "$DIRECT_NEXTHOP" ]; then
                 direct_routes_apply
             fi
+
+            # Reconciled on every tick rather than only on a state change: the
+            # redirect sends traffic into a process, and a process that died would
+            # otherwise leave those destinations worse off than without the bypass.
+            bypass_apply
 
             uplinks_write_state
             next_health=$((now + CASCADE_PROBE_INTERVAL))

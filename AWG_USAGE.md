@@ -336,7 +336,8 @@ GET /api/nodes
       "ssh_user": "root",
       "ssh_key": true,
       "created_at": "2026-06-02T09:12:44Z",
-      "task_id": null
+      "task_id": null,
+      "recovery": null
     },
     { "name": "eu-backup", "priority": 20, "healthy": true, "active": false, "…": "…" }
   ]
@@ -362,6 +363,7 @@ GET /api/nodes
 | `ssh_host` / `ssh_port` / `ssh_user` | how it reaches it; `null` for a node added by hand |
 | `ssh_key` | the panel's own key is on that server, so calls about it need no credentials |
 | `task_id` | set while an install, removal or repair for this node is still running |
+| `recovery` | what the panel's own recovery has tried on this node, or `null` while it is healthy and has nothing to report |
 
 ### How failover decides
 
@@ -420,6 +422,92 @@ The mode is set on the entry node, not through the API — `saucewg fallback dir
 or `CASCADE_FALLBACK` in `.env` — because it is a property of that node's deployment
 rather than something to toggle per request.
 
+### Putting a failed node back
+
+Failover is not repair, and this distinction is the one most likely to be missed by a
+status page: a failed exit node stays failed. Users are fine, the cascade has one fewer
+node, and nothing says so unless something asks. The panel therefore tries to recover
+it — it is the only component that can, since it holds an SSH key on every node it
+installed — and reports what happened per node:
+
+```json
+"recovery": {
+  "attempts": 2,
+  "last_action": "restart",
+  "last_error": "the server is up and the uplink key was re-installed, but the tunnel still does not handshake",
+  "blocked": null,
+  "down_for_seconds": 512,
+  "since_last_attempt_seconds": 47,
+  "recovered": false
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `attempts` | how many recovery runs this outage has had. Reset when the node comes back |
+| `last_action` | how far the last one escalated: `probe` (opened an SSH session), `restart` (restarted the service), `repair` (re-installed the uplink key) |
+| `last_error` | why it did not work, as a sentence fit to show an operator |
+| `blocked` | **the field to alert on.** `unreachable` means the server does not answer SSH at all — a deleted or suspended VPS, and nothing further will be tried. `exhausted` means the attempt budget is spent. `null` means it is still working on it |
+| `down_for_seconds` | how long the uplink has been unhealthy |
+| `since_last_attempt_seconds` | age of the last attempt; `null` before the first |
+| `recovered` | `true` when an attempt brought it back — the object is dropped on the next sweep |
+
+Attempts start after `NODE_RECOVERY_GRACE_SECONDS` (5 min), so a reload or a reboot is
+not chased, and back off geometrically after that. One node is worked on at a time, and
+never one an operator is already acting on (`task_id` set).
+
+This history lives in the panel process, so restarting the panel — which `saucewg update`
+does — clears it: `attempts` and `down_for_seconds` return to zero, and a node that had
+been given up on as `unreachable` is tried again from the start. That is deliberate, since
+a restart is usually the operator having changed something. It does mean the whole
+`recovery` object describes the current panel's effort, not the outage: for how long a
+node has really been down, use `last_handshake_at`, which the node container reports and
+a panel restart does not touch.
+
+```http
+POST /api/nodes/{name}/recover
+```
+
+Runs the same escalation now, and returns `202` with a task to poll like every other
+node operation. It takes no body: it uses the panel's key, which is what makes it usable
+from a bot. The task **succeeds even when the node does not come back** — the attempt ran
+and reported what it found, which is the answer that was asked for — so read
+`task.result`:
+
+```json
+{ "name": "pl-129", "healthy": false, "acted": true,
+  "blocked": "unreachable", "attempts": 3, "last_action": "probe",
+  "last_error": "72.56.246.208 did not answer in time", "…": "…" }
+```
+
+| `result` field | Use |
+| --- | --- |
+| `healthy` | `true` when the uplink is carrying traffic again. This is the success condition |
+| `acted` | `false` when the node was already healthy and nothing was touched |
+| the rest | the same fields as `recovery` above |
+
+`422` if the node was added by hand and has no SSH address, or if the panel has no key
+on it: those are recoverable only on that server, with `saucewg restart`. `404` for an
+unknown name, `409` while another operation on it is running.
+
+Asking for it also clears a `blocked` verdict, because an operator asking has usually
+just fixed the reason for it. Worth knowing for a bot that offers a "try again" button
+after telling a user their node is unreachable.
+
+An alert worth having, alongside the fallback one above:
+
+```python
+for node in get("/api/nodes")["nodes"]:
+    r = node.get("recovery") or {}
+    if r.get("blocked") == "unreachable":
+        alert(f"{node['name']} does not answer SSH; check the VPS still exists")
+    elif r.get("blocked") == "exhausted":
+        alert(f"{node['name']} could not be restarted: {r['last_error']}")
+```
+
+Set `NODE_RECOVERY_ENABLED=false` on the entry node to switch the automatic part off
+while leaving the endpoint available.
+
 ### Steering it
 
 ```http
@@ -448,6 +536,7 @@ POST   /api/nodes                 # install one on a bare server over SSH
 POST   /api/nodes/adopt           # register one that was installed by hand
 DELETE /api/nodes/{name}          # detach it, optionally wiping the server
 POST   /api/nodes/{name}/repair   # reinstall the uplink key on an unpaired node
+POST   /api/nodes/{name}/recover  # restart a failed node, then re-pair it if needed
 GET    /api/nodes/{name}/status   # containers, version and host facts, live
 GET    /api/nodes/{name}/logs     # the tail of that server's container logs
 POST   /api/nodes/{name}/restart  # also /start, /stop and /upgrade
@@ -587,7 +676,140 @@ variable overriding the file. The equivalent on the entry node itself is
 
 ---
 
-## 8. Node information
+## 8. Destinations the entry node reopens
+
+§7 decides *which way out* a destination takes. This is for destinations where no way
+out works: the outbound TCP handshake to their IPv4 is dropped, so nothing connects,
+while DNS resolves correctly, ICMP is answered and any flow that did get established
+keeps running. A route cannot fix that — the packets leave by a different interface and
+are dropped identically — so the entry node opens the outbound half itself, over the
+destination's IPv6 where the same service answers there, and by re-dialling its IPv4
+until a handshake lands where it does not.
+
+Telegram is the case this exists for; its datacentres ship as a built-in group, so the
+common deployment needs no list at all.
+
+```http
+GET    /api/bypass            # the list, with what is actually engaged
+POST   /api/bypass            # add one or more destinations
+PUT    /api/bypass/{cidr}     # change its IPv6 counterpart, relabel it, or turn it off
+DELETE /api/bypass/{cidr}     # stop reopening it
+```
+
+```json
+{
+  "entries": [
+    { "cidr": "149.154.167.51/32", "v6": "2001:67c:4e8:f002::a", "note": "telegram-dc2",
+      "enabled": true, "active": true, "built_in": true },
+    { "cidr": "203.0.113.0/24", "v6": null, "note": "some service",
+      "enabled": true, "active": true, "built_in": false },
+    { "…": "…" }
+  ],
+  "mode": "auto",
+  "groups": ["telegram"],
+  "active": true,
+  "live": true,
+  "editable": true,
+  "config_error": null,
+  "relay": {
+    "listen": "10.8.0.1:8646",
+    "prefixes": 26,
+    "open": 3,
+    "accepted": 412,
+    "via_v6": 380,
+    "via_retry": 29,
+    "failed": 3,
+    "attempts": 1174,
+    "cooled": 6,
+    "rx_bytes": 8419203,
+    "tx_bytes": 1204884
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `cidr` | the destination, masked to its network as in §7 |
+| `v6` | where the same service answers over IPv6, or `null` — then its own IPv4 is retried |
+| `built_in` | `true` for an entry that comes from a `groups` table rather than the list. It can be turned off but not deleted |
+| `enabled` | `false` keeps it listed without reopening it |
+| `active` | the node container has a redirect installed for it right now |
+| `mode` | `auto`, `always` or `off` — see below |
+| `groups` | built-in tables in force, currently only `telegram` |
+| `active` (top level) | **the one that matters.** Whether the redirect is installed at all |
+| `live` | `false` when the node container is not publishing this, so every `active` is unknown rather than false |
+| `relay` | the relay process's own counters, absent when it is not running |
+| `config_error` | why the list on file is not what is in force, or `null`. An idle `auto` is **not** an error |
+
+`relay.via_v6` against `relay.via_retry` is the useful pair to graph: it says which of
+the two paths is actually carrying the traffic, and `attempts / via_retry` is a direct
+measurement of how hard the filter is dropping handshakes — around 12 on a live Moscow
+node, meaning about one handshake in twelve is being answered.
+
+`relay.cooled` counts flows for a destination that had already spent a whole budget
+without answering, and so were given a short burst instead of a long one. A high and
+rising `cooled` is not a fault: it means clients are hammering an address that answers
+nothing — a datacentre endpoint blocked outright rather than sampled — and that this is
+costing a twelfth of what it otherwise would. It is, though, the number to look at when
+`failed` is large: on a live node a single such address accounted for 98% of all failures,
+and no amount of retrying was ever going to open it.
+
+The two kinds of block are worth telling apart, because only one of them retrying can
+solve. A sampled destination answers a few handshakes in twenty from the blocked network
+— retrying finds one of them. An outright-blocked one answers none from there while
+answering normally from a network the filter is not on. The measured example was
+`91.105.192.100`, a Telegram MTProto endpoint: 0 handshakes in 20 from the entry node's
+hosting segment, 10 in 10 from a Russian consumer ISP. So the address is alive and the
+filtering sits on the datacentre's uplink, which is also why this is a hosting problem
+rather than a national one. Nothing the entry node does alone opens it: it needs a path
+the block is not on, which means either an IPv6 counterpart or an exit node. Clients reach
+Telegram anyway because every DC it must have is mapped to IPv6, and a client that cannot
+reach one endpoint of a DC uses another — which is why `cooled` can be most of `failed` on
+a node where Telegram is working perfectly well.
+
+**`mode` and why `active` can be `false` with nothing wrong:**
+
+| `mode` | The redirect is installed |
+| --- | --- |
+| `auto` (default) | only while client traffic is leaving through the entry node — a cascade outage, or no exit node configured |
+| `always` | whenever the node container is running |
+| `off` | never |
+
+In `auto` on a healthy cascade, entries read as listed and **not** active. That is
+correct: a flow already leaving from another country is not meeting this filter, and
+relaying it would add a hop for nothing. A monitoring rule that treats
+`active: false` as a fault will fire permanently on a working system — alert on
+`config_error`, or on `relay` being absent while `active` is `true`.
+
+Like `mode`, the value is a property of the deployment (`BYPASS_MODE`, or
+`saucewg bypass auto|always|off`) rather than something to set per request.
+
+Adding takes an array, as §7 does, but with one difference that matters:
+
+```http
+POST /api/bypass
+{ "cidr": ["203.0.113.0/24"], "v6": "2001:db8::a", "note": "some service" }
+```
+
+* An entry carries *how* to reach the destination, so **re-posting one corrects it**
+  rather than being skipped as a duplicate. A direct route is only a destination, so
+  §7 skips duplicates; here the second post is how you fix a wrong `v6`.
+* `v6` applies to one destination. Posting several `cidr` values with a `v6` is a
+  `400` — they would all be relayed to one address.
+* IPv4 prefixes only for `cidr` (an IPv6 destination is not being filtered this way),
+  a single IPv6 address for `v6`, and `0.0.0.0/0` is refused for the same reason as
+  in §7.
+* `DELETE` on a `built_in` entry is a `409`, with the reason: the table ships in the
+  node image, so the only durable way to switch one off is
+  `PUT {"enabled": false}`, which is recorded in the list and survives an update.
+
+Writes answer `409` when the list is not the panel's to edit — `NODE_PROVISION_ENABLED=false`,
+or a `BYPASS_ROUTES` environment variable overriding the file. The equivalent on the
+entry node is `saucewg bypass`, `saucewg bypass add` and `saucewg bypass remove`.
+
+---
+
+## 9. Node information
 
 ```http
 GET /api/system
@@ -616,15 +838,18 @@ Host metrics, client totals, live throughput, and the cascade summary:
     "node": "eu-primary", "mode": "auto",
     "nodes_total": 2, "nodes_healthy": 2,
     "fallback": "direct", "fallback_active": false,
-    "direct_routes": 3
+    "direct_routes": 3,
+    "bypass_active": false, "bypass_routes": 0
   }
 }
 ```
 
 `cascade.connected` describes the cascade only: it is `false` whenever no exit node is
 carrying traffic, including while `fallback_active` is `true` and users are online
-through the entry node. `direct_routes` counts the prefixes actually installed in the
-bypass table.
+through the entry node. `direct_routes` counts the prefixes of §7 the node container has
+actually installed as routes. `bypass_active` and `bypass_routes` are the same for §8 —
+both zero on a healthy cascade in the default mode, which is the intended state rather
+than a fault.
 
 `node_ready` is `false` while the node container is still starting; config rendering
 fails with `503` until it flips. `total_up`/`total_down` are lifetime sums across all
@@ -652,7 +877,7 @@ as a liveness probe.
 
 ---
 
-## 9. Errors
+## 10. Errors
 
 FastAPI's shape throughout:
 
@@ -679,7 +904,7 @@ Restrict `CORS_ORIGINS` too — it defaults to `*`.
 
 ---
 
-## 10. Integration recipes
+## 11. Integration recipes
 
 **Provision a user**
 
@@ -749,7 +974,7 @@ must not block operations on the others.
 
 ---
 
-## 11. Configuration reference
+## 12. Configuration reference
 
 Values the central system may need to know about, set in the entry node's `.env`.
 
@@ -769,13 +994,19 @@ Values the central system may need to know about, set in the entry node's `.env`
 | `CASCADE_FALLBACK` | `direct` | during a total uplink outage: `direct` carries users through the entry node, `block` cuts them off |
 | `CASCADE_KILLSWITCH` | — | the previous name for the same choice; read only when `CASCADE_FALLBACK` is unset, where `true` means `block` |
 | `CASCADE_DIRECT_ROUTES` | — | a JSON array of prefixes to route past the cascade, overriding the file and making §7 read-only |
+| `BYPASS_MODE` | `auto` | when the reopened destinations of §8 are actually reopened: `auto`, `always`, `off` |
+| `BYPASS_GROUPS` | `telegram` | built-in destination tables in force; empty ships none |
+| `BYPASS_ROUTES` | — | prefixes to reopen, overriding the file and making §8 read-only |
+| `BYPASS_ATTEMPTS` / `BYPASS_PARALLEL` | 96 / 6 | the retry path's handshake budget per connection, and how many of them are outstanding at once |
 | `NODE_PROVISION_ENABLED` | `true` | `false` makes the cascade read-only through the API — see [`SAUCEWG_USAGE.md` §6](SAUCEWG_USAGE.md#6-files-on-the-server) |
+| `NODE_RECOVERY_ENABLED` | `true` | whether the panel tries to restart a failed exit node on its own, as in §6 |
+| `NODE_RECOVERY_GRACE_SECONDS` | `300` | how long a node must be unhealthy before the first attempt |
 | `CORS_ORIGINS` | `*` | tighten before exposing the panel |
 | `DOCS_ENABLED` | `true` | `/api/docs` serves live OpenAPI; `/api/openapi.json` is the machine-readable contract |
 
 ---
 
-## 12. Things that will surprise you
+## 13. Things that will surprise you
 
 * **`name` is the primary key in the API.** Renaming a client changes every URL. Use
   immutable IDs from your system as names.
@@ -793,6 +1024,19 @@ Values the central system may need to know about, set in the entry node's `.env`
   address until an exit node recovers. Read `fallback_active`, not just `active`.
 * **A direct route is a destination, not a client setting.** It applies to every client
   on the node, needs nothing on their side, and is invisible in their profile.
+* **A reopened destination reading `active: false` is usually correct.** In the default
+  `auto` mode the redirect exists only while clients are leaving through the entry node.
+  Alert on `config_error`, never on `active`.
+* **A large `relay.failed` is usually one address, not a broken relay.** Some destinations
+  are blocked outright rather than sampled, and no number of handshakes opens them. Read
+  `cooled` alongside it: that is the relay having recognised them and stopped paying for
+  them. What is worth alerting on is `via_v6` and `via_retry` both flat while `accepted`
+  climbs.
+* **Failover does not repair.** A failed exit node stays failed until the panel's
+  recovery gets it back or an operator does. `recovery.blocked == "unreachable"` is the
+  one that needs a human: that server is not answering at all.
+* **A recovery task that succeeds did not necessarily fix anything.** The task reports
+  what the attempt found; `result.healthy` is the success condition.
 * **The panel has no rate limiting.** Keep your poll loops to the cadences in §5.
 * **There is no pagination cursor**, only offset/limit against a live table; a client
   created mid-scan can shift rows. Sort by `created_at asc` when you need a stable scan.

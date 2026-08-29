@@ -179,6 +179,7 @@ release:
 | `SAUCEWG_DIR` | `/opt/saucewg` | Installation directory (also `--dir`) |
 | `SAUCEWG_CLI_PATH` | `/usr/local/bin/saucewg` | Where the CLI installs itself |
 | `SAUCEWG_REPO` / `SAUCEWG_REF` | `V2as/SauceWG` / `main` | Where the script fetches itself from |
+| `SAUCEWG_RAW_BASE` | derived from the two above | The same, for a mirror that is not GitHub |
 | `NO_COLOR` | — | Any value disables ANSI colour |
 
 ```bash
@@ -209,14 +210,25 @@ surface, available on both roles:
 | `saucewg info` | Machine-readable status — always JSON, whatever the flags |
 | `saucewg routes` | *(entry node)* Destinations that bypass the cascade — see §4.5 |
 | `saucewg fallback [direct\|block]` | *(entry node)* What happens while every exit node is down — see §4.6 |
+| `saucewg bypass` | *(entry node)* Destinations this node reopens for itself — see §4.7 |
+| `saucewg recover [NAME…]` | *(entry node)* Try to put failed exit nodes back — see §4.8 |
 | `saucewg protocol` | Which AmneziaWG generation this node serves, and what it is carrying |
 | `saucewg set-protocol V [--signature N]` | Move it to another generation and restart the node container |
 | `saucewg signatures` | The `I1` presets, with what each one imitates |
 | `saucewg version` | CLI version |
 
-`saucewg update` also replaces `/usr/local/bin/saucewg` with the current script and
-adds any settings a new release introduced to `.env`, so an old installation keeps
-working after an upgrade.
+`saucewg update` also adds any settings a new release introduced to `.env`, so an old
+installation keeps working after an upgrade. Those settings, and the compose file, are
+written by the script rather than by the images, so an update that pulled newer images
+with an older script would configure them the way the previous release did. To avoid
+that, `update` first replaces `/usr/local/bin/saucewg` with the copy published at
+`SAUCEWG_REF` and re-runs the same command with it — the version it moves to is printed
+before anything else happens.
+
+Whatever the mirror publishes is what gets installed, downgrade included: a fleet pinned
+with `SAUCEWG_REF` is asking for that ref. If the mirror cannot be reached, or serves
+something that is not this script, the update carries on with the CLI already installed
+rather than stopping.
 
 `saucewg info` is the health endpoint for a monitoring system:
 
@@ -253,8 +265,10 @@ account had issued.
 ## 4. The cascade: exit nodes and routing
 
 Exit nodes can be added and removed in three ways. They all end up writing the same
-file, so they can be mixed freely. Which destinations use the cascade at all (§4.5) and
-what happens when none of it is available (§4.6) are set on the entry node.
+file, so they can be mixed freely. Which destinations use the cascade at all (§4.5),
+what happens when none of it is available (§4.6), which destinations this node reopens
+for itself (§4.7) and what is done about a node that has failed (§4.8) are all set on
+the entry node.
 
 ### 4.1 From the panel (what an operator sees)
 
@@ -357,7 +371,7 @@ saucewg remove-route --note youtube                  # the whole group
 
 | Command | Purpose |
 | --- | --- |
-| `saucewg routes` | The bypass list, and whether each entry is actually installed (alias `list-routes`) |
+| `saucewg routes` | The direct route list, and whether each entry is actually installed (alias `list-routes`) |
 | `saucewg add-route CIDR…` | Route one or more destinations through this entry node |
 | `saucewg add-route --from-file PATH` | The same, reading one prefix per line; `#` comments and blank lines are ignored |
 | `saucewg remove-route CIDR…` | Put those destinations back on the cascade |
@@ -430,6 +444,142 @@ choose `block` where that is the thing being avoided.
 An installation from before this existed keeps its old behaviour until `saucewg update`,
 which writes `CASCADE_FALLBACK=direct` into `.env` and prints a note saying so. Setting
 it beforehand, by hand or with `saucewg fallback`, is respected and left alone.
+
+The migration is part of the script, not of the images. A CLI from before it existed
+does not perform it and leaves `CASCADE_FALLBACK` out of the compose file entirely, so
+the node reads the `CASCADE_KILLSWITCH=true` the old installer wrote and blocks — which
+looks exactly like an update that did nothing. `update` now replaces the CLI before it
+does anything else (§3), but a server updated by an older one needs it handed over
+directly:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/V2as/SauceWG/main/saucewg.sh) update
+```
+
+`saucewg fallback` reports what the node actually resolved, so it is the quickest way to
+tell which of the two happened.
+
+### 4.7 Destinations this node reopens for itself
+
+§4.5 chooses which way out a destination takes. Some destinations cannot be reached by
+any way out: the outbound TCP handshake to their IPv4 is dropped, so nothing connects,
+while DNS resolves, ICMP is answered and anything already established keeps running. A
+route does not help — the packets leave by another interface and are dropped the same
+way — so the entry node opens the outbound half itself.
+
+Telegram from a Russian hosting segment is the case this was built for. On a live entry
+node in Moscow: the datacentre addresses resolve correctly, ICMP to them is answered, and
+9 IPv4 SYNs in 10 to port 443 get no reply at all. The same datacentres over IPv6 answer
+immediately, every time.
+
+```bash
+saucewg bypass                                  # what is listed, and whether it is engaged
+saucewg bypass add 203.0.113.0/24 --v6 2001:db8::a --note "some service"
+saucewg bypass add 149.154.167.51 --v6 2001:67c:4e8:f002::a
+saucewg bypass add 91.108.56.0/22 --disable     # switch off one entry of a built-in group
+saucewg bypass remove 203.0.113.0/24
+saucewg bypass remove --note "some service"     # the whole group
+saucewg bypass always | auto | off              # when it engages
+```
+
+`iptables` redirects TCP for the listed prefixes to a relay inside the node container,
+which reads the original destination back off the socket and then either connects to the
+destination's IPv6 — the same server, a protocol the filter is not watching — or re-dials
+its IPv4, six handshakes at a time, within a bounded budget. The filter samples handshakes
+rather than dropping all of them, so each one is an independent throw: measured live, two
+thirds of these connections open within six handshakes, and going six at a time is what
+makes that under a second instead of ten. The retry path is also the only one Telegram's
+media CDN has, because `cdn1..5.telesco.pe` publish no IPv6 at all. The bytes are spliced
+verbatim: nothing terminates TLS or reads MTProto, and to both ends this is the transport.
+
+A destination that spends a whole budget answering nothing gets a short burst instead of a
+long one for a while, widening each time it fails again, and a single connection clears the
+record. That is not giving up; it is telling apart the two kinds of destination that arrive
+here. Persistence is right for one whose handshakes are being sampled and worthless for one
+blocked outright — and on the live node a single address of the second kind, retried by
+clients several times a second, accounted for 98% of all failed flows and 300 000
+handshakes a quarter of an hour. `saucewg bypass` reports it as a separate line when it is
+happening.
+
+| Mode | The redirect is installed |
+| --- | --- |
+| `auto` (default) | only while client traffic is leaving through this entry node — during a cascade outage, or with no exit node configured |
+| `always` | whenever the node container is running |
+| `off` | never |
+
+`auto` exists because a flow already leaving from another country is not meeting this
+filter, so relaying it would add a hop for nothing. The consequence to internalise:
+**on a healthy cascade the entries read as listed and not active, and that is correct.**
+`saucewg bypass` says which of the two it is on its first line.
+
+`BYPASS_GROUPS=telegram` ships the datacentre prefixes with their IPv6 counterparts, so
+the common case needs no list. `config/bypass.json` adds anything else, or corrects a
+group entry — an entry that comes from a group can be switched off there but not deleted,
+because the table itself lives in the node image:
+
+```json
+[
+  { "cidr": "203.0.113.0/24", "v6": "2001:db8::a", "note": "some service", "enabled": true },
+  { "cidr": "198.51.100.7/32", "note": "no v6 known — its own IPv4 is retried" },
+  { "cidr": "91.108.56.0/22", "enabled": false, "note": "a built-in, switched off here" }
+]
+```
+
+Changes reach the container within a second, like the other two lists. Re-adding an
+entry **corrects** it rather than being skipped as a duplicate — unlike a direct route,
+an entry carries how to reach the destination, so the second `add` is how a wrong `--v6`
+is fixed. `BYPASS_ROUTES` in `.env` puts the list in the environment instead, overriding
+the file and making the panel's section read-only. `BYPASS_MODE=off` disables the
+feature; `saucewg update` writes `BYPASS_MODE=auto` into an installation that predates
+it and prints a note, since it changes how those flows leave the server.
+
+### 4.8 Putting a failed exit node back
+
+Failover keeps clients online, and that is also the trap: nothing is broken from a
+client's point of view, so a dead exit node can stay dead until the last one goes with
+it. Recovering it needs a shell on that server, and the panel is the only part of the
+installation that has one — it installed most of the nodes and holds an SSH key on each.
+So it runs one escalating attempt at a time, on a timer:
+
+| Step | When | What it does |
+| --- | --- | --- |
+| wait | first `NODE_RECOVERY_GRACE_SECONDS` (5 min) | nothing — a container reload or a reboot fixes itself |
+| probe | the uplink is still unhealthy | opens an SSH session. Silent twice means the server is gone, not broken |
+| restart | the server answers | `saucewg restart` on it, then waits for the handshake |
+| repair | it is up and still silent | re-installs the entry node's uplink key: the two ends no longer agree |
+
+```bash
+saucewg recover              # every unhealthy node, now
+saucewg recover pl-129       # just this one
+# NAME    TRIED    RESULT                                  DETAIL
+# pl-129  probe    unreachable — check the server exists    203.0.113.9 did not answer in time
+```
+
+The exit status is `0` only when every node named came back, so it works in a cron or a
+health check. The command runs inside the panel container, because that is where the SSH
+key is — an exit node has no panel and cannot recover anything, including itself. The
+**Recover** button on the Exit nodes page and `POST /api/nodes/{name}/recover` are the
+same code.
+
+What it will not do is worth knowing:
+
+* **It stops at a server that does not answer SSH.** That is a deleted or suspended VPS,
+  not a broken service, and dialling it every minute would tell you nothing new. The
+  panel reports `unreachable` and leaves it; `saucewg recover` says so on the node's row.
+* **It never touches a healthy node**, or one an operator is already working on.
+* **It works on one node per pass.** Restarting two at once could take the last healthy
+  one with them, and an outage affecting several is one where this entry node's own
+  uplink is the likelier cause.
+* **It needs the panel's key.** A node adopted by hand has no SSH address recorded, so
+  it is recoverable only on that server, with `saucewg restart`.
+
+Attempts back off geometrically from `NODE_RECOVERY_INTERVAL_SECONDS` and stop after
+`NODE_RECOVERY_MAX_ATTEMPTS`; a node that comes back clears its own history. Asking by
+hand — the CLI, the button or the endpoint — clears a verdict it had given up on, since
+an operator asking has usually just fixed the reason. So does restarting the panel, which
+`saucewg update` does: the count is kept in memory, so an update gives even an
+`unreachable` node a fresh run of attempts. `NODE_RECOVERY_ENABLED=false` switches the
+automatic part off and leaves the manual one available.
 
 ---
 
@@ -630,7 +780,7 @@ Which destinations use the cascade is a separate list on the same panel:
 
 | Call | Body | Result |
 | --- | --- | --- |
-| `GET /api/routes` | — | The bypass list, with `active` saying which entries are really installed |
+| `GET /api/routes` | — | The direct route list, with `active` saying which entries are really installed |
 | `POST /api/routes` | `{"cidr": ["142.250.0.0/15", "8.8.8.8"], "note": "youtube"}` | `201`. Prefixes already listed are skipped, not rejected |
 | `PUT /api/routes/{cidr}` | `{"enabled": false}` or `{"note": "…"}` | Turns one off without losing it, or relabels it |
 | `DELETE /api/routes/{cidr}` | — | Puts that destination back on the cascade |
@@ -639,6 +789,20 @@ The prefix goes in the path with its slash intact: `DELETE /api/routes/142.250.0
 Full field semantics are in [`AWG_USAGE.md` §7](AWG_USAGE.md#7-routing-past-the-cascade);
 the fallback that applies when the whole cascade is down is set on the entry node itself
 (§4.6), not through the API.
+
+Destinations the entry node reopens for itself (§4.7) are a third list, with the same
+shape and one endpoint more:
+
+| Call | Body | Result |
+| --- | --- | --- |
+| `GET /api/bypass` | — | The list, the mode, and the relay's counters while it is running |
+| `POST /api/bypass` | `{"cidr": ["203.0.113.0/24"], "v6": "2001:db8::a", "note": "…"}` | `201`. Re-posting one **corrects** it rather than being skipped |
+| `PUT /api/bypass/{cidr}` | `{"enabled": false}`, `{"v6": "…"}` or `{"note": "…"}` | The only way to switch off an entry that comes from a built-in group |
+| `DELETE /api/bypass/{cidr}` | — | Stops reopening it; `409` on a built-in entry |
+
+Whether it is engaged at all is `BYPASS_MODE` on the entry node, not an API call, for
+the same reason as the fallback. Field semantics:
+[`AWG_USAGE.md` §8](AWG_USAGE.md#8-destinations-the-entry-node-reopens).
 
 ### 5.6 Managing the servers themselves
 
@@ -653,6 +817,7 @@ none of them need credentials once it carries the panel's key.
 | `POST /api/nodes/{name}/stop` | `{}` | `202` + task. The cascade fails over to the next healthy node |
 | `POST /api/nodes/{name}/start` | `{}` | `202` + task |
 | `POST /api/nodes/{name}/upgrade` | `{}` or `{"tag": "1.4.0"}` | `202` + task. Pulls newer images and recreates. Minutes, like an install |
+| `POST /api/nodes/{name}/recover` | — | `202` + task. Restart, then re-pair if that was not enough — the escalation of §4.8, run now |
 
 ```json
 {
@@ -676,6 +841,14 @@ decides whether to restart anything. An unreachable server is again a `200` with
 `tag` says otherwise, so a fleet moves together instead of drifting one server at a
 time.
 
+`recover` is the one to reach for when that distinction comes out the other way: the
+node is unhealthy and you do not yet know why. It probes, restarts and re-pairs in that
+order and reports where it stopped. Unlike the calls above its task **succeeds even when
+the node stays down** — the attempt ran and answered the question — so branch on
+`task.result.healthy`, and treat `task.result.blocked == "unreachable"` as "this server
+is not answering at all; check it still exists". The full field list is in
+[`AWG_USAGE.md` §6](AWG_USAGE.md#6-exit-nodes-and-failover).
+
 ### 5.7 What a node reports
 
 Each node in `GET /api/nodes` carries, on top of the health fields documented in
@@ -689,6 +862,7 @@ Each node in `GET /api/nodes` carries, on top of the health fields documented in
 | `protocol` | The AmneziaWG generation this uplink speaks |
 | `created_at` | When it joined the cascade |
 | `task_id` | Set while an operation on this node is still running |
+| `recovery` | What the panel's own recovery has tried on it, or `null` while it is healthy — `blocked: "unreachable"` is the one that needs a human (§4.8) |
 
 and at the top level `config_error`: a complete sentence, safe to show to a human,
 explaining why the cascade is not what the panel thinks it is. It is `null` when all is
@@ -805,6 +979,7 @@ images.
 | `/opt/saucewg/docker-compose.yml` | Generated; regenerated on every `saucewg update` |
 | `/opt/saucewg/config/exit-nodes.json` | The cascade. Written by the panel and the CLI |
 | `/opt/saucewg/config/direct-routes.json` | Destinations that bypass the cascade, written the same way |
+| `/opt/saucewg/config/bypass.json` | Destinations this node reopens for itself (§4.7), written the same way |
 | `/opt/saucewg/config/panel-ssh-key` | The panel's SSH identity, mode `0600`, with its `.pub` beside it |
 | `/opt/saucewg/.role` | `entry` or `exit` |
 | `/usr/local/bin/saucewg` | The CLI, which is a copy of the installer |
@@ -821,14 +996,25 @@ Settings that matter for node management specifically:
 | --- | --- | --- |
 | `NODE_PROVISION_ENABLED` | `true` | `false` makes the panel read-only with respect to the cascade and to routing — set it when both lists are owned by configuration management |
 | `NODE_REGISTRY_FILE` | `/etc/saucewg/host/exit-nodes.json` | Where the panel sees the node list *inside its container* |
-| `ROUTES_REGISTRY_FILE` | `/etc/saucewg/host/direct-routes.json` | The same for the bypass list |
+| `ROUTES_REGISTRY_FILE` | `/etc/saucewg/host/direct-routes.json` | The same for the direct route list |
+| `BYPASS_REGISTRY_FILE` | `/etc/saucewg/host/bypass.json` | The same for the reopened destinations of §4.7 |
 | `CASCADE_FALLBACK` | `direct` | What happens while every exit node is down — see §4.6 |
-| `CASCADE_DIRECT_FILE` | `/etc/amnezia/host/direct-routes.json` | Where the *node container* reads the bypass list |
+| `CASCADE_DIRECT_FILE` | `/etc/amnezia/host/direct-routes.json` | Where the *node container* reads the direct route list |
 | `CASCADE_DIRECT_ROUTES` | | The same list inline, overriding the file |
+| `BYPASS_MODE` | `auto` | When the destinations of §4.7 are reopened: `auto`, `always`, `off` |
+| `BYPASS_GROUPS` | `telegram` | Built-in destination tables in force; empty ships none |
+| `BYPASS_FILE` | `/etc/amnezia/host/bypass.json` | Where the *node container* reads the reopened destinations |
+| `BYPASS_ROUTES` | | The same list inline, overriding the file |
+| `BYPASS_PORT` | `8646` | Where the relay listens, on the client interface's address only |
+| `BYPASS_ATTEMPTS` / `BYPASS_PARALLEL` | `96` / `6` | Handshakes the retry path may spend on one connection, and how many go out at once |
 | `NODE_SSH_KEY_FILE` | `/etc/saucewg/host/panel-ssh-key` | The panel's own SSH key, generated on first use |
 | `NODE_SSH_KEY_ENABLED` | `true` | `false` stops the panel keeping a key, so every call carries credentials |
 | `NODE_SSH_TIMEOUT_SECONDS` | `900` | Ceiling for one remote command |
 | `NODE_SSH_QUERY_TIMEOUT_SECONDS` | `60` | Ceiling for the calls that answer inside one request: `check`, `status`, `logs` |
+| `NODE_RECOVERY_ENABLED` | `true` | Whether the panel tries to put a failed exit node back — see §4.8 |
+| `NODE_RECOVERY_GRACE_SECONDS` | `300` | How long a node must be unhealthy before the first attempt |
+| `NODE_RECOVERY_INTERVAL_SECONDS` | `60` | Sweep interval, and the base of the backoff between attempts |
+| `NODE_RECOVERY_MAX_ATTEMPTS` | `6` | After this many, the node is left for an operator |
 | `NODE_DEFAULT_PORT` | `51820` | Default offered in the UI |
 | `SAUCEWG_TAG`, `SAUCEWG_REPO`, `SAUCEWG_REF` | | Pin what the panel installs on, and upgrades, new nodes to |
 
@@ -888,5 +1074,27 @@ Settings that matter for node management specifically:
   on the node, needs nothing on their side, and does not appear in their profile. It is
   also only as good as the addresses in it: a service that answers from a range you did
   not list keeps going through the exit node.
+* **A reopened destination that is not active is usually correct.** In the default
+  `auto` mode the redirect exists only while clients are leaving through the entry node,
+  because a flow that already leaves from another country is not meeting the filter it
+  works around. `saucewg bypass` says which state it is in, on its first line.
+* **A big "unreachable" count in `saucewg bypass` is usually one address, and usually
+  harmless.** Some destinations are blocked outright rather than having their handshakes
+  sampled, and nothing this node does opens those — the measured one answered 0 handshakes
+  in 20 from this server and 10 in 10 from a home connection, so it is the hosting
+  network's filtering rather than a dead address. The line about destinations
+  that "cost one handshake each" is the relay having worked that out and stopped spending
+  on them: on the live node this took the handshake rate from 389 a second to 36 while
+  opening *more* connections than before. Telegram keeps working through it, because every
+  datacentre it needs is reachable over IPv6 and the app moves on from an endpoint that
+  will not answer. Judge it by the "over IPv6" and "by retrying" counts, not by this one.
+* **Failing over is not repairing.** The cascade moves clients off a dead exit node in
+  about 30 seconds and leaves it dead. The panel is what tries to bring it back (§4.8),
+  and a node it reports as `unreachable` is one no software on this side can fix — that
+  is a server that has stopped existing, and the honest fix is at the provider.
+* **`saucewg recover` needs the panel.** It runs inside that container because the SSH
+  key lives there, so it works on an entry node and nowhere else — and only for nodes
+  the panel installed. An adopted node is recovered with `saucewg restart` on its own
+  server.
 * **`saucewg` on an exit node has no panel commands** and will say so rather than
   guessing; `saucewg status` and `saucewg logs` work everywhere.

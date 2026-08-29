@@ -24,6 +24,13 @@ export CASCADE_UPLINK_SUBNET=10.77.0.0/24
 export UPLINK_STATE_FILE="$WORK/run/uplinks.json"
 export UPLINK_CONTROL_FILE="$WORK/run/uplink-control.json"
 export UPLINK_RELOAD_FILE="$WORK/run/reload.request"
+export BYPASS_FILE="$WORK/bypass.json"
+export BYPASS_CONFIG_FILE="$WORK/run/bypass.json"
+export BYPASS_STATE_FILE="$WORK/run/bypass-state.json"
+# Off until the tests that are about it, so everything before them exercises the
+# same code paths it did before the bypass existed.
+export BYPASS_MODE=off
+export BYPASS_GROUPS=telegram
 mkdir -p "$AWG_CONFIG_DIR" "$AWG_SOCKET_DIR"
 
 # shellcheck source=../docker/awg/lib.sh
@@ -150,6 +157,27 @@ awg() {
 amneziawg-go() { sleep 600 >/dev/null 2>&1; }
 wait_for_socket() { return 0; }
 iface_up() { return 0; }
+
+# The relay stands in for the real one, publishing the counters file it would so
+# that the path from its table to uplinks.json is exercised. What it does with a
+# connection is its own business and is not what these tests are about.
+awg-bypass() {
+    local config="" state=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -config) config=$2; shift 2 ;;
+            -state) state=$2; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    jq -n --argjson pid "$$" --argjson prefixes "$(jq '.map | length' "$config")" \
+        --arg listen "$(jq -r .listen "$config")" \
+        '{pid: $pid, listen: $listen, prefixes: $prefixes, open: 0, accepted: 0,
+          via_v6: 0, via_retry: 0, failed: 0, attempts: 0, cooled: 0,
+          rx_bytes: 0, tx_bytes: 0}' \
+        > "$state"
+    sleep 600 >/dev/null 2>&1
+}
 
 # shellcheck source=../docker/awg/uplinks.sh
 . "$ROOT/docker/awg/uplinks.sh"
@@ -278,6 +306,31 @@ has_nat() {
 }
 
 routes() { printf '%s\n' "$1" > "$CASCADE_DIRECT_FILE"; }
+
+bypass_list() { printf '%s\n' "$1" > "$BYPASS_FILE"; }
+
+# The destinations currently redirected into the relay, sorted.
+bypass_redirects() {
+    sed -n "s/^nat|PREROUTING|-i awg0 -p tcp -d \([^ ]*\) -j REDIRECT.*/\1/p" "$IPT" \
+        | sort | tr '\n' ' ' | sed 's/ $//'
+}
+
+# The relay publishes its counters from its own process, so there is a moment
+# after it starts in which the file it publishes them to does not exist yet.
+wait_for_relay_state() {
+    local i=0
+    while [ "$i" -lt 50 ] && [ ! -s "$BYPASS_STATE_FILE" ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+}
+
+# The IPv6 counterpart the relay was handed for one prefix, or "-" for none.
+bypass_target_of() {
+    jq -r --arg cidr "$1" \
+        '(.map[] | select(.prefix == $cidr) | (if .v6 == "" then "-" else .v6 end)) // "absent"' \
+        "$BYPASS_CONFIG_FILE"
+}
 
 # Every stub tunnel, including the ones a re-parse dropped from the arrays: `wait`
 # would otherwise block on a process nothing is left holding a pid for.
@@ -559,6 +612,114 @@ check "the direct routes are published" "198.51.100.7/32 203.0.113.0/24" \
     "$(jq -r '.direct.routes | sort | join(" ")' "$UPLINK_STATE_FILE")"
 check "with the count actually installed" "2" "$(jq -r .direct.applied "$UPLINK_STATE_FILE")"
 check "and where they leave through" "eth0" "$(jq -r .direct.via "$UPLINK_STATE_FILE")"
+
+echo "31. the built-in group knows which destinations to reopen, and how"
+BYPASS_MODE=auto
+bypass_reload
+# Counted from the group itself: the table gains rows as Telegram's addresses
+# change, and a test that restates its size only ever fails for that.
+GROUP_SIZE=$(bypass_group_rows telegram | wc -l | tr -d ' ')
+check "the relay is running" "true" "$(bypass_running && echo true || echo false)"
+check "a datacenter address is translated to the same datacenter" "2001:67c:4e8:f002::a" \
+    "$(bypass_target_of 149.154.167.51/32)"
+check "a range with no known counterpart is dialled as itself" "-" \
+    "$(bypass_target_of 91.108.4.0/22)"
+check "every prefix in the group is redirected" "$GROUP_SIZE" \
+    "$(bypass_redirects | wc -w | tr -d ' ')"
+check "the port only listens where a client can reach it" "10.8.0.1:8646" \
+    "$(jq -r .listen "$BYPASS_CONFIG_FILE")"
+
+echo "32. an unknown group is reported without losing the known ones"
+BYPASS_GROUPS="telegram,nonsense"
+bypass_reload
+check "the good group still applies" "true" \
+    "$([ "$(jq '.map | length' "$BYPASS_CONFIG_FILE")" -gt 20 ] && echo true || echo false)"
+check "the typo is named" "true" \
+    "$(case "$BYPASS_ERROR" in *"no built-in bypass group named 'nonsense'"*) echo true ;; *) echo "$BYPASS_ERROR" ;; esac)"
+BYPASS_GROUPS=telegram
+
+echo "33. the operator's list adds destinations and overrides built-in ones"
+bypass_list '[{"cidr": "203.0.113.0/24", "note": "some service"},
+              {"cidr": "149.154.167.51/32", "v6": "2001:db8::1", "note": "moved"},
+              {"cidr": "91.108.56.0/22", "enabled": false}]'
+bypass_reload
+check "the extra destination is redirected" "yes" \
+    "$(case " $(bypass_redirects) " in *" 203.0.113.0/24 "*) echo yes ;; *) echo no ;; esac)"
+check "a repeated prefix takes the operator's counterpart" "2001:db8::1" \
+    "$(bypass_target_of 149.154.167.51/32)"
+check "a built-in row can be switched off" "absent" "$(bypass_target_of 91.108.56.0/22)"
+check "and it stops being redirected" "no" \
+    "$(case " $(bypass_redirects) " in *" 91.108.56.0/22 "*) echo yes ;; *) echo no ;; esac)"
+
+echo "34. a bad entry is skipped, the rest still apply"
+bypass_list '["203.0.113.0/24", "not-an-address", "0.0.0.0/0"]'
+bypass_reload
+check "the good one is redirected" "yes" \
+    "$(case " $(bypass_redirects) " in *" 203.0.113.0/24 "*) echo yes ;; *) echo no ;; esac)"
+check "the others are reported" "true" \
+    "$(case "$BYPASS_ERROR" in *"skipped 2 bypass entries"*) echo true ;; *) echo "$BYPASS_ERROR" ;; esac)"
+bypass_list '[]'
+bypass_reload
+
+echo "35. in auto it is withdrawn the moment an exit node takes the traffic back"
+relay_pid=$BYPASS_PID
+UP_HEALTHY[0]=true
+uplink_activate 0 force
+check "the redirect is gone" "" "$(bypass_redirects)"
+check "the relay is stopped with it" "false" "$(bypass_running && echo true || echo false)"
+check "and its process was reaped" "gone" \
+    "$(kill -0 "$relay_pid" 2>/dev/null && echo alive || echo gone)"
+
+echo "36. and reinstated when the cascade drops again"
+UP_HEALTHY[0]=false
+FALLBACK_MODE=direct
+uplinks_fallback
+check "the destinations are redirected again" "true" \
+    "$([ "$(bypass_redirects | wc -w | tr -d ' ')" -gt 20 ] && echo true || echo false)"
+check "with the relay back up" "true" "$(bypass_running && echo true || echo false)"
+
+echo "37. always engages it even while the cascade is carrying traffic"
+BYPASS_MODE=always
+UP_HEALTHY[0]=true
+uplink_activate 0 force
+check "the redirect stays in place" "true" \
+    "$([ "$(bypass_redirects | wc -w | tr -d ' ')" -gt 20 ] && echo true || echo false)"
+BYPASS_MODE=off
+bypass_apply
+check "off takes it down whatever the cascade is doing" "" "$(bypass_redirects)"
+
+echo "38. all of it reaches the panel through the state file"
+BYPASS_MODE=auto
+# shellcheck disable=SC2034  # read by the code under test
+UP_HEALTHY[0]=false
+FALLBACK_MODE=direct
+uplinks_fallback
+wait_for_relay_state
+uplinks_write_state
+check "the mode is published" "auto" "$(jq -r .bypass.mode "$UPLINK_STATE_FILE")"
+check "so are the groups" "telegram" "$(jq -r '.bypass.groups | join(",")' "$UPLINK_STATE_FILE")"
+check "and whether it is in force right now" "true" "$(jq -r .bypass.active "$UPLINK_STATE_FILE")"
+check "with the count actually redirected" "$GROUP_SIZE" "$(jq -r .bypass.applied "$UPLINK_STATE_FILE")"
+check "one destination carries its counterpart" "2001:67c:4e8:f004::9" \
+    "$(jq -r '.bypass.routes[] | select(.cidr == "149.154.167.99/32") | .v6' "$UPLINK_STATE_FILE")"
+check "and one carries none" "null" \
+    "$(jq -r '.bypass.routes[] | select(.cidr == "91.108.4.0/22") | .v6' "$UPLINK_STATE_FILE")"
+check "the relay's own counters are passed through" "$GROUP_SIZE" \
+    "$(jq -r '.bypass.relay.prefixes' "$UPLINK_STATE_FILE")"
+check "there is nothing to warn about" "null" "$(jq -r .bypass.error "$UPLINK_STATE_FILE")"
+
+echo "39. a relay that dies is restarted rather than left silently down"
+kill "$BYPASS_PID" 2>/dev/null || true
+wait "$BYPASS_PID" 2>/dev/null || true
+check "it is noticed as gone" "false" "$(bypass_running && echo true || echo false)"
+bypass_apply
+check "and brought back" "true" "$(bypass_running && echo true || echo false)"
+check "with the redirect still complete" "$GROUP_SIZE" "$(bypass_redirects | wc -w | tr -d ' ')"
+
+echo "40. tearing the node down leaves no redirect behind"
+uplinks_teardown
+check "the redirect is removed" "" "$(bypass_redirects)"
+check "and the relay is stopped" "false" "$(bypass_running && echo true || echo false)"
 
 echo
 printf '%s passed, %s failed\n' "$PASSED" "$FAILED"

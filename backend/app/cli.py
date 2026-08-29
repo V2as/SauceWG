@@ -16,9 +16,11 @@ import sys
 
 from sqlalchemy import select
 
+from .awg.uplinks import load_uplink_state
 from .db import SessionLocal, init_db
 from .models import Admin
 from .security import hash_password
+from .services import recovery
 
 
 async def _set_password(username: str, password: str, sudo: bool) -> dict[str, object]:
@@ -55,6 +57,24 @@ async def _list_admins() -> list[dict[str, object]]:
         ]
 
 
+async def _recover(names: list[str]) -> list[dict[str, object]]:
+    """One recovery attempt per named node, or per unhealthy node when none are named.
+
+    No database and no HTTP: this is the same code the panel's own timer runs, so it
+    reaches the exit servers with the panel's SSH key. That is why it has to run in
+    this container rather than from the shell CLI.
+    """
+    if not names:
+        names = [node.name for node in load_uplink_state().nodes if not node.healthy]
+    out: list[dict[str, object]] = []
+    for name in names:
+        try:
+            out.append(await recovery.recover_now(name))
+        except Exception as exc:  # noqa: BLE001 - one bad node must not stop the rest
+            out.append({"name": name, "healthy": False, "acted": False, "last_error": str(exc)})
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="app.cli", description="SauceWG panel administration")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -71,6 +91,9 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("list-admins", help="list the configured admins")
 
+    recover = sub.add_parser("recover", help="try to bring unhealthy exit nodes back")
+    recover.add_argument("names", nargs="*", help="node names; defaults to every unhealthy node")
+
     args = parser.parse_args(argv)
 
     if args.command == "set-password":
@@ -86,6 +109,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list-admins":
         print(json.dumps(asyncio.run(_list_admins()), indent=2))
         return 0
+
+    if args.command == "recover":
+        results = asyncio.run(_recover(args.names))
+        print(json.dumps(results, indent=2))
+        # Non-zero when a node is still down, so a cron or a bot can tell without
+        # parsing. An empty fleet of unhealthy nodes is a success.
+        return 0 if all(row.get("healthy") for row in results) else 1
 
     parser.error(f"unknown command {args.command}")
     return 2

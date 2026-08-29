@@ -186,6 +186,7 @@ do_run() {
     # be used to add the first exit node — before any exit node exists.
     uplinks_parse || die "CASCADE_ENABLED=true but the exit node list is unusable: ${CONFIG_ERROR}"
     direct_parse || true
+    bypass_parse || true
 
     uplinks_setup_all
     uplinks_routing_base

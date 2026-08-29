@@ -23,6 +23,7 @@ let taskTimer: number | undefined
 const adding = ref(false)
 const removing = ref<ExitNode | null>(null)
 const repairing = ref<ExitNode | null>(null)
+const recovering = ref<ExitNode | null>(null)
 const editing = ref<ExitNode | null>(null)
 const switching = ref<ExitNode | null>(null)
 const managing = ref<ExitNode | null>(null)
@@ -338,6 +339,29 @@ async function service(action: 'start' | 'stop' | 'restart') {
   }
 }
 
+/** Puts a failed node back: restart the server's service, then re-pair if that was
+ *  not enough. The panel does the same on a timer; this is it now, without waiting
+ *  out the grace period or the backoff. */
+async function recover(node: ExitNode) {
+  const name = node.name
+  busy.value = name
+  try {
+    const started = await api.recoverNode(name)
+    task.value = null
+    recovering.value = node
+    follow(started, (final) => {
+      const outcome = final.result as { healthy?: boolean } | null
+      if (outcome?.healthy) notify(`${name} is carrying traffic again`, 'success')
+      else if (final.status === 'failed') notify(final.error ?? `Recovering ${name} failed`, 'error')
+      else notify(`${name} did not come back; see the log`, 'error')
+    })
+  } catch (err) {
+    notify(err instanceof Error ? err.message : String(err), 'error')
+  } finally {
+    busy.value = ''
+  }
+}
+
 async function upgrade() {
   if (!managing.value) return
   const name = managing.value.name
@@ -362,6 +386,7 @@ function closeTaskModal() {
   adding.value = false
   removing.value = null
   repairing.value = null
+  recovering.value = null
   switching.value = null
   managing.value = null
   task.value = null
@@ -381,6 +406,26 @@ function statusLabel(node: ExitNode) {
   if (node.healthy) return { text: 'standby', klass: 'badge-disabled' }
   return { text: 'down', klass: 'badge-expired' }
 }
+
+/** One line under a failed node's status, saying what is being done about it. */
+function recoveryLabel(node: ExitNode) {
+  const r = node.recovery
+  if (!r || node.healthy) return ''
+  const down = `down ${duration(r.down_for_seconds)}`
+  if (r.blocked === 'unreachable') return `${down} · the server does not answer`
+  if (r.blocked === 'exhausted') return `${down} · recovery gave up after ${r.attempts} tries`
+  if (!r.attempts) return `${down} · waiting before touching it`
+  const tried = { probe: 'probed', restart: 'restarted', repair: 're-paired' }[r.last_action ?? ''] ?? 'tried'
+  return `${down} · ${tried}, attempt ${r.attempts}`
+}
+
+/** True while nothing further will happen on its own, so the operator is the next
+ *  step — either here or on the server itself. */
+function needsAttention(node: ExitNode) {
+  return !node.healthy && (node.recovery?.blocked ?? null) !== null
+}
+
+const stranded = computed(() => state.value?.nodes.filter(needsAttention) ?? [])
 
 onMounted(() => {
   refresh()
@@ -431,6 +476,20 @@ onUnmounted(() => {
       <template v-else>
         No exit node can carry traffic and the fallback is set to block, so clients are
         cut off until one recovers.
+      </template>
+    </div>
+
+    <div v-if="stranded.length" class="alert alert-warn" style="margin-bottom: 14px">
+      Automatic recovery has stopped trying
+      <span class="mono">{{ stranded.map((n) => n.name).join(', ') }}</span
+      >.
+      <template v-if="stranded.some((n) => n.recovery?.blocked === 'unreachable')">
+        A server that does not answer SSH at all cannot be repaired from here — check
+        whether the VPS still exists at its provider.
+      </template>
+      <template v-else>
+        Restarting and re-pairing both ran without the tunnel coming back, so the exit
+        server needs looking at directly.
       </template>
     </div>
 
@@ -522,6 +581,10 @@ onUnmounted(() => {
               </td>
               <td>
                 <span class="badge" :class="statusLabel(node).klass">{{ statusLabel(node).text }}</span>
+                <div v-if="recoveryLabel(node)" class="stat-sub" style="margin-top: 4px"
+                     :title="node.recovery?.last_error ?? ''">
+                  {{ recoveryLabel(node) }}
+                </div>
               </td>
               <td class="mono">{{ node.protocol ?? '1.0' }}</td>
               <td class="mono">{{ node.priority }}</td>
@@ -546,6 +609,15 @@ onUnmounted(() => {
                     @click="openEdit(node)"
                   >
                     ✎
+                  </button>
+                  <button
+                    v-if="node.managed && !node.healthy"
+                    class="btn btn-sm"
+                    title="Restart this server's service, and re-pair it if that is not enough"
+                    :disabled="busy !== '' || !state.provisioning || !!node.task_id || !node.ssh_key"
+                    @click="recover(node)"
+                  >
+                    Recover
                   </button>
                   <button
                     v-if="node.managed"
@@ -888,6 +960,31 @@ onUnmounted(() => {
         </button>
       </template>
       <button v-else class="btn btn-primary" :disabled="taskRunning" @click="closeTaskModal">
+        {{ taskRunning ? 'Working…' : 'Done' }}
+      </button>
+    </template>
+  </ModalShell>
+
+  <!-- Recover --------------------------------------------------------------->
+  <ModalShell v-if="recovering" wide :title="`Recovering ${recovering.name}`" @close="closeTaskModal">
+    <p style="margin: 0; color: var(--text-muted); font-size: 13px">
+      {{ recovering.ssh_host }} is probed, its service restarted, and the uplink key
+      re-installed if the tunnel still does not handshake. Clients are already on another
+      exit node, so nothing they are doing is interrupted.
+    </p>
+    <template v-if="task">
+      <div class="row-between" style="margin-top: 14px">
+        <strong>{{ task.step || 'Starting' }}</strong>
+        <span class="badge" :class="task.status === 'failed' ? 'badge-expired' : task.status === 'succeeded' ? 'badge-active' : 'badge-limited'">
+          {{ task.status }}
+        </span>
+      </div>
+      <pre class="config">{{ task.log.map((l) => l.text).join('\n') }}</pre>
+      <div v-if="task.error" class="alert alert-error">{{ task.error }}</div>
+    </template>
+
+    <template #footer>
+      <button class="btn btn-primary" :disabled="taskRunning" @click="closeTaskModal">
         {{ taskRunning ? 'Working…' : 'Done' }}
       </button>
     </template>

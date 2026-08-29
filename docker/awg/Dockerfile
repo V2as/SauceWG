@@ -23,6 +23,15 @@ RUN git clone --depth 1 --branch "${AWG_GO_REF}" https://github.com/amnezia-vpn/
        go build -trimpath -ldflags "-s -w" -o /out/usr/bin/amneziawg-go \
     && chmod 0755 /out/usr/bin/amneziawg-go
 
+# The bypass relay. Stdlib only, so it builds offline once the base image is
+# cached, and it is built here rather than in its own stage to reuse the
+# toolchain that is already present.
+WORKDIR /src/bypass
+COPY bypass/go.mod bypass/main.go ./
+RUN CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}" \
+       go build -trimpath -ldflags "-s -w" -o /out/usr/bin/awg-bypass . \
+    && chmod 0755 /out/usr/bin/awg-bypass
+
 FROM alpine:3.20 AS tools-build
 ARG AWG_TOOLS_REF
 RUN apk add --no-cache git make build-base linux-headers bash

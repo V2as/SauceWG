@@ -12,11 +12,18 @@ Any number of exit nodes can be configured. All of them stay connected; one carr
 traffic, and the node fails over to the next healthy one within about 30 seconds when it
 stops answering. If none of them is usable, the entry node carries the traffic itself
 rather than cutting clients off, and picks the cascade back up as soon as an exit node
-recovers.
+recovers. Failing over is not the same as fixing: the panel also tries to put a failed
+exit node back, over SSH, on its own timer.
 
 Chosen destinations can be sent past the cascade on purpose: a range listed in
 `config/direct-routes.json` leaves through the entry node's own address while everything
 else still goes abroad, which is how a service that has to see a local IP keeps working.
+
+Where the problem is the destination rather than the route — an address whose TCP
+handshake is dropped on the way out, no matter which interface it leaves by — the entry
+node can reopen it for itself: over the destination's IPv6, which the same filters
+usually do not touch, or by retrying its IPv4 until one handshake survives. Telegram's
+datacentres ship as a built-in group, because that is what this exists for today.
 
 ```
    client                 entry node (unblocked IP)                exit nodes
@@ -109,7 +116,7 @@ generation from drifting apart.
 
 | Service | Image | Role |
 | --- | --- | --- |
-| `awg` | `saucewg/awg` | amneziawg-go + amneziawg-tools, interfaces, routing, NAT |
+| `awg` | `saucewg/awg` | amneziawg-go + amneziawg-tools, interfaces, routing, NAT, the bypass relay |
 | `panel` | `saucewg/panel` | FastAPI: REST API, traffic collector, peer reconciliation |
 | `caddy` | `saucewg/web` | Vue 3 single-page UI + reverse proxy for `/api` and `/sub` |
 | `postgres` | `postgres:16-alpine` | clients, admins, usage history |
@@ -202,7 +209,9 @@ saucewg start | stop | restart
 saucewg logs -f awg            # awg, panel, postgres, caddy
 saucewg update                 # pull newer images and recreate
 saucewg nodes                  # the cascade, with health
+saucewg recover                # try to bring failed exit nodes back
 saucewg routes                 # destinations that bypass the cascade
+saucewg bypass                 # destinations this node reopens for itself
 saucewg fallback               # what happens while every exit node is down
 saucewg protocol               # which AmneziaWG generation this node serves
 saucewg set-protocol 2.0       # move it to another one
@@ -264,11 +273,14 @@ curl -H "Authorization: Bearer $TOKEN" http://<host>/api/clients
 | `GET` | `/api/nodes/{name}/logs` | the tail of that server's container logs |
 | `POST` | `/api/nodes/{name}/restart\|start\|stop` | control the exit node's containers |
 | `POST` | `/api/nodes/{name}/upgrade` | pull newer images on the exit server |
+| `POST` | `/api/nodes/{name}/recover` | try to put a failed node back: restart, then re-pair |
 | `GET` | `/api/nodes/tasks[/{id}]` | progress and logs of a provisioning operation |
 | `POST` | `/api/nodes/{name}/activate` | prefer one exit node |
 | `POST` | `/api/nodes/auto` | drop the preference, back to priority order |
 | `GET/POST` | `/api/routes` | destinations that bypass the cascade / add some |
 | `PUT/DELETE` | `/api/routes/{cidr}` | relabel or disable one / put it back on the cascade |
+| `GET/POST` | `/api/bypass` | destinations the entry node reopens for itself / add some |
+| `PUT/DELETE` | `/api/bypass/{cidr}` | change its IPv6 counterpart or disable it / remove it |
 | `GET` | `/api/system` | host stats, client counts, live speed, cascade state |
 | `GET` | `/api/system/usage?hours=` | node-wide traffic history |
 | `POST` | `/api/system/sync` | force peer reconciliation |
@@ -367,6 +379,46 @@ which writes `CASCADE_FALLBACK=direct` into `.env` and says so, since it changes
 outage looks like. Setting it beforehand — by hand or with `saucewg fallback block` —
 is respected and left alone.
 
+### Putting a failed node back
+
+Failover keeps clients online, and that is also its weakness: nothing is broken from a
+client's point of view, so a dead exit node can stay dead until the last one goes with
+it. Only the panel can do anything about it — it installed most of the nodes and keeps
+an SSH key on each — so it runs one escalating attempt at a time, cheapest step first:
+
+| Step | When | What it does |
+| --- | --- | --- |
+| wait | first `NODE_RECOVERY_GRACE_SECONDS` (5 min) | nothing: a reload or a reboot fixes itself |
+| probe | the uplink is still unhealthy | opens an SSH session. Twice silent means the server is gone, not broken |
+| restart | the server answers | `saucewg restart` on it, then waits for the handshake |
+| repair | it is up and still silent | re-installs the entry node's uplink key, since the two ends no longer agree |
+
+Attempts back off geometrically from `NODE_RECOVERY_INTERVAL_SECONDS`, stop after
+`NODE_RECOVERY_MAX_ATTEMPTS`, and never run against a node an operator is already
+working on. One node is worked on per pass: restarting two at once could take the last
+healthy one with them, and an outage affecting several is one where the entry node's own
+uplink is the likelier cause. A node that comes back clears its own history, so the next
+outage is judged from scratch.
+
+Two things it deliberately does not do. It never restarts a *healthy* node to prove a
+point, and it stops as soon as a server does not answer SSH at all — that is a deleted
+or suspended VPS, and saying so is more useful than dialling it every minute. Both the
+panel and `saucewg recover` report which of the two happened:
+
+```bash
+saucewg recover              # every unhealthy node, now
+saucewg recover eu-nl        # just this one
+# NAME    TRIED    RESULT                                 DETAIL
+# pl-129  probe    unreachable — check the server exists   203.0.113.9 did not answer in time
+```
+
+The command runs inside the panel container, because that is where the SSH key is; the
+**Recover** button on the Exit nodes page and `POST /api/nodes/{name}/recover` are the
+same code. Asking for it by hand also clears whatever the automatic attempts had given
+up on, since an operator asking has usually just fixed the reason — as does restarting the
+panel, the count being held in memory, so an update starts a node over. Set
+`NODE_RECOVERY_ENABLED=false` to leave failed nodes alone entirely.
+
 ## Routing past the cascade
 
 Some destinations are better off never reaching the exit node: a bank that refuses a
@@ -415,6 +467,105 @@ Three things to know:
 
 `CASCADE_DIRECT_ROUTES` puts the list in the environment instead, with the same
 precedence and the same read-only consequence for the panel as `CASCADE_NODES_JSON`.
+
+## Reopening destinations the network drops
+
+A route decides which way out a destination takes. Some destinations are blocked in a
+way no route can address: the outbound TCP handshake to their IPv4 is dropped, so
+nothing ever connects, while ICMP answers normally, DNS resolves correctly and any flow
+that did get established keeps running. That is what a modern DPI box does instead of a
+firewall rule, and it means a `direct-routes.json` entry cannot help — the packets leave
+by a different interface and are dropped just the same.
+
+Telegram, from a Moscow hosting segment, is the case this was built for. Measured on a
+live entry node: DNS returns the right datacentre addresses, ICMP to them is answered,
+and 9 IPv4 SYNs in 10 to port 443 get no reply at all — not a reset, silence. Ports 80 and
+5222 to the same addresses are dropped at the same rate, so the filter is matching the
+destination rather than the service, which is why the redirect is not limited to one port.
+The same datacentres over IPv6 answer on the first try, every time.
+
+So the entry node opens the outbound half itself. `iptables` redirects TCP for the
+listed prefixes to a small relay in the node container (`awg-bypass`), which recovers
+the original destination from the socket and then, per connection:
+
+1. **connects to the destination's IPv6** when the list names one — the same server, a
+   protocol the filter is not looking at;
+2. **retries its IPv4**, several handshakes at a time within a bounded budget, when
+   there is no IPv6 or IPv6 is unavailable. The filter samples handshakes rather than
+   blocking them all, so each attempt is an independent throw: measured live, two
+   thirds of these connections open within six handshakes and the rest trail out to
+   sixty. They go out six at a time because the client is waiting through all of them —
+   a burst opens in under a second where one attempt after another takes ten.
+
+The second path is not just a fallback. Telegram's media CDN (`cdn1..5.telesco.pe`)
+publishes no IPv6 at all, so photographs and video can only arrive that way.
+
+A destination that spends a whole budget without answering is remembered, and for a
+while afterwards costs a short burst rather than a long one, widening each time it goes
+on failing. Nothing is given up on — a single connection clears the record — but the two
+kinds of destination need opposite treatment, and telling them apart matters: on the live
+node one address that answers *nothing* was being retried by clients several times a
+second, and on its own accounted for 98% of all failed flows and 300 000 handshakes a
+quarter of an hour. That address took 0 handshakes in 20 from the hosting segment and 10
+in 10 from a Russian consumer ISP, so it is alive and the filtering is on the datacentre's
+uplink; no budget would have opened it — only a path the block is not on would, which is
+an IPv6 counterpart or an exit node.
+Failing it in a second suits the client better too, because a Telegram client walks a list
+of datacentre addresses and the sooner one is refused the sooner it tries the next.
+
+Nothing about the client changes: it dials the same address it always did, and the
+tunnel it is in is unchanged. Telegram's own MTProto is end-to-end from the app to the
+datacentre, so the relay is carrying bytes it cannot read.
+
+```bash
+saucewg bypass                       # what is listed, and whether it is engaged now
+saucewg bypass add 203.0.113.0/24 --v6 2001:db8::a --note "some service"
+saucewg bypass add 91.108.56.0/22 --disable    # switch off one entry of a group
+saucewg bypass off                             # stop reopening anything
+```
+
+`BYPASS_GROUPS=telegram` ships the datacentre prefixes and their IPv6 counterparts, so
+the common case needs no list at all; `config/bypass.json` adds anything else, or
+corrects a group entry:
+
+```json
+[
+  { "cidr": "203.0.113.0/24", "v6": "2001:db8::a", "note": "some service" },
+  { "cidr": "198.51.100.7/32", "note": "no v6 known — its own IPv4 is retried" },
+  { "cidr": "91.108.56.0/22", "enabled": false, "note": "a built-in, switched off" }
+]
+```
+
+`BYPASS_MODE` decides when it engages:
+
+| Value | Behaviour |
+| --- | --- |
+| `auto` (default) | only while client traffic is leaving through the entry node — during a cascade outage, or with no exit node configured |
+| `always` | whether or not an exit node is carrying traffic |
+| `off` | never |
+
+`auto` is the default because a flow that is already leaving from another country is
+not meeting this filter, and relaying it would add a hop for nothing. It does mean that
+on a healthy cascade the list reads as *listed, not active* — that is the intended
+state, not a fault, and the panel and `saucewg bypass` both say which it is.
+
+Four things to know:
+
+- **IPv4 destinations, IPv6 counterparts.** The redirect matches IPv4 TCP; `v6` is
+  where the same service answers. A prefix with no counterpart still works — it gets
+  the retry path.
+- **A counterpart is only ever named on evidence.** The built-in group pairs an address
+  with an IPv6 address only where the two are known to be the same server: the
+  datacentre tables the official clients ship, or an IPv6 record of the same hostname.
+  A datacentre address a client discovers at runtime is left unpaired, because sending
+  an MTProto session to the wrong datacentre is worse than not translating it at all.
+- **TCP only.** UDP cannot be relayed this way and does not need it: the drop being
+  worked around is in connection establishment.
+- **The relay binds to the client interface address only**, on `BYPASS_PORT`, so it is
+  reachable from inside the tunnel and not from the internet.
+
+`BYPASS_ROUTES` puts the list in the environment, with the same precedence and the same
+read-only consequence for the panel as the other two lists.
 
 ## Monitoring
 
@@ -469,10 +620,12 @@ A second workflow, `.github/workflows/ci.yml`, runs on pull requests. It builds 
 frontend, shellchecks the scripts, validates the compose files in the repository and
 the ones `saucewg.sh` generates, and exercises the paths that are easy to break without
 noticing: the node container's live reload (`scripts/test-uplinks.sh`), the exit node API
-(`scripts/test-node-api.py`), and the fact that the node container, the panel and the
-installer still agree on what each AmneziaWG generation contains
-(`scripts/test-protocol-parity.sh`) — all against stubs rather than real servers. It
-needs no secrets.
+(`scripts/test-node-api.py`), the bypass relay's behaviour under a censor that answers one
+handshake in twenty (`docker/awg/bypass/main_test.go`, against a faked dialler — a leaked
+socket or a wrong answer there is invisible from the outside), and the fact that the node
+container, the panel and the installer still agree on what each AmneziaWG generation
+contains (`scripts/test-protocol-parity.sh`) — all against stubs rather than real servers.
+It needs no secrets.
 
 ### From your machine
 
@@ -499,6 +652,15 @@ workflow does.
   `block` fills it with an unreachable route so clients are cut off instead. The old
   `CASCADE_KILLSWITCH=true` is still read on an installation that has no
   `CASCADE_FALLBACK`, and means `block`.
+- **Reopened destinations.** The bypass is `nat`/`PREROUTING` `REDIRECT` rules plus a
+  relay process, both owned by the node container and both installed and withdrawn as
+  the cascade's state changes. It touches no route and no table, so it composes with
+  everything above: a prefix can be a direct route and a reopened destination at once,
+  and neither is aware of the other.
+- **Recovery.** Restarting a failed exit node is the panel's job, not the node
+  container's, because the credentials for it are the panel's. The two do not
+  coordinate: failover moves clients within 30 seconds regardless of whether recovery
+  is running, or enabled, or getting anywhere.
 - **Performance.** Both hops run the userspace `amneziawg-go`, which is CPU-bound. On a
   2-core VPS expect tens of Mbit/s per node. Installing the AmneziaWG kernel module on the
   host and pointing `WG_QUICK_USERSPACE_IMPLEMENTATION` at it is the usual next step if you
@@ -514,9 +676,10 @@ saucewg.sh        installer and service CLI; also the /usr/local/bin/saucewg com
 backend/          FastAPI service (app/awg = UAPI client, app/services = workers)
 frontend/         Vue 3 + Vite single-page UI
 docker/awg/       AmneziaWG node image: entrypoint, generations, uplinks + failover monitor
+docker/awg/bypass/  awg-bypass, the transparent relay for reopened destinations (Go)
 docker/caddy/     frontend build + Caddy reverse proxy image
 scripts/          bootstrap helpers, the exit node list manager, CI test harnesses
-config/           exit-nodes.json and direct-routes.json, bind-mounted into the node
+config/           exit-nodes.json, direct-routes.json and bypass.json, bind-mounted into the node
 .github/workflows/  CI checks and the Docker Hub publish pipeline
 AWG_USAGE.md      integration reference for managing users from a central API
 SAUCEWG_USAGE.md  installing and managing servers, from a shell or a bot

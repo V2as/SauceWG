@@ -41,6 +41,26 @@ export interface CascadeStatus {
   fallback: 'direct' | 'block'
   fallback_active: boolean
   direct_routes: number
+  // Destinations the entry node is reopening for itself. Zero and inactive is the
+  // normal state of a healthy cascade: in `auto` the redirect only exists while
+  // client traffic is leaving through this server.
+  bypass_active: boolean
+  bypass_routes: number
+}
+
+// What the panel's own recovery has been doing about a node that is down. Null while
+// the node is healthy, or before the first attempt.
+export interface NodeRecovery {
+  attempts: number
+  // 'probe' | 'restart' | 'repair': how far the last attempt escalated.
+  last_action: string | null
+  last_error: string | null
+  // 'unreachable' when the server does not answer SSH at all, 'exhausted' when the
+  // attempt budget is spent. Either way nothing further will be tried unattended.
+  blocked: string | null
+  down_for_seconds: number
+  since_last_attempt_seconds: number | null
+  recovered: boolean
 }
 
 export interface ExitNode {
@@ -70,6 +90,7 @@ export interface ExitNode {
   ssh_key: boolean
   created_at: string | null
   task_id: string | null
+  recovery: NodeRecovery | null
 }
 
 export interface PanelSshKey {
@@ -149,6 +170,50 @@ export interface DirectRoute {
 export interface DirectRouteList {
   routes: DirectRoute[]
   via: string | null
+  live: boolean
+  editable: boolean
+  config_error: string | null
+}
+
+// Destinations blocked at connection establishment rather than by route: the SYN to
+// their IPv4 is dropped, so no route reaches them. The entry node opens the outbound
+// half itself, over the destination's IPv6 or by retrying its IPv4.
+export interface BypassEntry {
+  cidr: string
+  // The IPv6 address of the same server, tried first when known. Null means the
+  // destination's own IPv4 is dialled until a handshake lands.
+  v6: string | null
+  note: string | null
+  enabled: boolean
+  // True while the node container is redirecting it. In `auto` every entry reads
+  // false whenever an exit node is carrying client traffic.
+  active: boolean
+  // From a group the node image ships rather than from the list the panel edits, so
+  // it can be turned off but not deleted.
+  built_in: boolean
+}
+
+export interface BypassRelay {
+  listen: string | null
+  prefixes: number
+  open: number
+  accepted: number
+  via_v6: number
+  via_retry: number
+  failed: number
+  attempts: number
+  cooled: number
+  rx_bytes: number
+  tx_bytes: number
+  last_error: string | null
+}
+
+export interface BypassList {
+  mode: 'auto' | 'always' | 'off'
+  groups: string[]
+  entries: BypassEntry[]
+  active: boolean
+  relay: BypassRelay | null
   live: boolean
   editable: boolean
   config_error: string | null
@@ -324,6 +389,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  // Restart the server's service and re-pair it if that is not enough. Takes no
+  // credentials: it uses the panel's own key, which is what lets the same escalation
+  // run unattended on a timer.
+  recoverNode: (name: string) =>
+    request<NodeTask>(`/nodes/${encodeURIComponent(name)}/recover`, { method: 'POST' }),
   // Both ends have to move together, so this reconfigures the exit node over SSH and
   // rebuilds the uplink with the profile it reports back.
   setNodeProtocol: (name: string, payload: Record<string, unknown>) =>
@@ -366,6 +436,17 @@ export const api = {
   updateRoute: (cidr: string, payload: { note?: string | null; enabled?: boolean }) =>
     request<DirectRouteList>(`/routes/${cidr}`, { method: 'PUT', body: JSON.stringify(payload) }),
   deleteRoute: (cidr: string) => request<DirectRouteList>(`/routes/${cidr}`, { method: 'DELETE' }),
+
+  // Destinations the entry node reopens for itself. The mode is not settable from
+  // here: it lives in the node container's environment, so it is `saucewg bypass`.
+  bypass: () => request<BypassList>('/bypass'),
+  addBypass: (payload: { cidr: string[]; v6?: string | null; note?: string | null }) =>
+    request<BypassList>('/bypass', { method: 'POST', body: JSON.stringify(payload) }),
+  updateBypass: (
+    cidr: string,
+    payload: { v6?: string | null; note?: string | null; enabled?: boolean },
+  ) => request<BypassList>(`/bypass/${cidr}`, { method: 'PUT', body: JSON.stringify(payload) }),
+  deleteBypass: (cidr: string) => request<BypassList>(`/bypass/${cidr}`, { method: 'DELETE' }),
 
   clients: (params: Record<string, string | number | undefined>) => {
     const query = new URLSearchParams()

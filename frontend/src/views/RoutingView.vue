@@ -1,10 +1,18 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { api, type CascadeStatus, type DirectRoute, type DirectRouteList } from '../api'
+import {
+  api,
+  type BypassEntry,
+  type BypassList,
+  type CascadeStatus,
+  type DirectRoute,
+  type DirectRouteList,
+} from '../api'
 import ModalShell from '../components/ModalShell.vue'
 import { notify } from '../store'
 
 const state = ref<DirectRouteList | null>(null)
+const bypass = ref<BypassList | null>(null)
 const cascade = ref<CascadeStatus | null>(null)
 const error = ref('')
 const busy = ref('')
@@ -14,6 +22,11 @@ const adding = ref(false)
 const editing = ref<DirectRoute | null>(null)
 const form = ref({ cidr: '', note: '' })
 const editForm = ref({ note: '' })
+
+const addingBypass = ref(false)
+const editingBypass = ref<BypassEntry | null>(null)
+const bypassForm = ref({ cidr: '', v6: '', note: '' })
+const bypassEditForm = ref({ v6: '', note: '' })
 
 const groups = computed(() => {
   const seen = new Map<string, number>()
@@ -32,12 +45,36 @@ const parsed = computed(() =>
     .filter(Boolean),
 )
 
+/** Every prefix in the bypass box, on the same terms as the box above. */
+const parsedBypass = computed(() =>
+  bypassForm.value.cidr
+    .split(/[\n,;]+/)
+    .map((line) => line.replace(/#.*$/, '').trim())
+    .filter(Boolean),
+)
+
+const bypassSummary = computed(() => {
+  const list = bypass.value
+  if (!list) return ''
+  if (list.mode === 'off') return 'Turned off'
+  if (list.active) return 'In force now'
+  return list.mode === 'always' ? 'Waiting for the relay' : 'Idle: an exit node has the traffic'
+})
+
+const bypassCooled = computed(() => bypass.value?.relay?.cooled ?? 0)
+
 async function refresh() {
   try {
     state.value = await api.routes()
     error.value = ''
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
+  }
+  try {
+    bypass.value = await api.bypass()
+  } catch {
+    // The direct routes above are still worth showing without it.
+    bypass.value = null
   }
 }
 
@@ -122,6 +159,73 @@ async function removeGroup(note: string) {
   try {
     for (const route of members) state.value = await api.deleteRoute(route.cidr)
     notify(`Removed ${members.length} route(s)`, 'success')
+  } catch (err) {
+    notify(err instanceof Error ? err.message : String(err), 'error')
+  } finally {
+    busy.value = ''
+  }
+}
+
+function openAddBypass() {
+  bypassForm.value = { cidr: '', v6: '', note: '' }
+  addingBypass.value = true
+}
+
+async function submitBypass() {
+  busy.value = 'bypass-add'
+  try {
+    bypass.value = await api.addBypass({
+      cidr: parsedBypass.value,
+      v6: bypassForm.value.v6.trim() || null,
+      note: bypassForm.value.note.trim() || null,
+    })
+    notify(`${parsedBypass.value.length} destination(s) will be reopened`, 'success')
+    addingBypass.value = false
+  } catch (err) {
+    notify(err instanceof Error ? err.message : String(err), 'error')
+  } finally {
+    busy.value = ''
+  }
+}
+
+function openEditBypass(entry: BypassEntry) {
+  bypassEditForm.value = { v6: entry.v6 ?? '', note: entry.note ?? '' }
+  editingBypass.value = entry
+}
+
+async function saveBypassEdit() {
+  if (!editingBypass.value) return
+  busy.value = editingBypass.value.cidr
+  try {
+    bypass.value = await api.updateBypass(editingBypass.value.cidr, {
+      v6: bypassEditForm.value.v6.trim() || null,
+      note: bypassEditForm.value.note.trim() || null,
+    })
+    editingBypass.value = null
+  } catch (err) {
+    notify(err instanceof Error ? err.message : String(err), 'error')
+  } finally {
+    busy.value = ''
+  }
+}
+
+async function toggleBypass(entry: BypassEntry) {
+  busy.value = entry.cidr
+  try {
+    bypass.value = await api.updateBypass(entry.cidr, { enabled: !entry.enabled })
+  } catch (err) {
+    notify(err instanceof Error ? err.message : String(err), 'error')
+  } finally {
+    busy.value = ''
+  }
+}
+
+async function removeBypass(entry: BypassEntry) {
+  if (!confirm(`Stop reopening ${entry.cidr}?`)) return
+  busy.value = entry.cidr
+  try {
+    bypass.value = await api.deleteBypass(entry.cidr)
+    notify(`${entry.cidr} is no longer reopened`, 'success')
   } catch (err) {
     notify(err instanceof Error ? err.message : String(err), 'error')
   } finally {
@@ -296,6 +400,173 @@ onUnmounted(() => window.clearInterval(timer))
     </div>
   </template>
 
+  <template v-if="bypass">
+    <div class="page-head" style="margin-top: 28px">
+      <div>
+        <h1 style="font-size: 20px">Reopened destinations</h1>
+        <p>
+          Destinations that are blocked by dropping the connection to them, which this
+          entry node opens another way
+        </p>
+      </div>
+      <button
+        class="btn btn-primary"
+        :disabled="!bypass.editable || bypass.mode === 'off'"
+        @click="openAddBypass"
+      >
+        + Reopen a destination
+      </button>
+    </div>
+
+    <div v-if="bypass.config_error" class="alert alert-error" style="margin-bottom: 14px">
+      {{ bypass.config_error }}
+    </div>
+
+    <div v-else-if="bypass.mode === 'off'" class="alert alert-warn" style="margin-bottom: 14px">
+      This is turned off, so a destination whose IPv4 handshake is being dropped stays
+      unreachable. Turn it on with <span class="mono">saucewg bypass auto</span>.
+    </div>
+
+    <div class="grid grid-4" style="margin-bottom: 14px">
+      <div class="card">
+        <div class="stat-label">Reopened now</div>
+        <div class="stat-value">{{ bypass.relay?.prefixes ?? 0 }}</div>
+        <div class="stat-sub">{{ bypassSummary }}</div>
+      </div>
+
+      <div class="card">
+        <div class="stat-label">When it engages</div>
+        <div class="stat-value" style="font-size: 20px">
+          {{ bypass.mode === 'always' ? 'Always' : bypass.mode === 'off' ? 'Never' : 'Only via entry' }}
+        </div>
+        <div class="stat-sub">set with <span class="mono">saucewg bypass</span></div>
+      </div>
+
+      <div class="card">
+        <div class="stat-label">Opened over IPv6</div>
+        <div class="stat-value">{{ bypass.relay?.via_v6 ?? 0 }}</div>
+        <div class="stat-sub">connections that took the counterpart</div>
+      </div>
+
+      <div class="card">
+        <div class="stat-label">Opened by retrying</div>
+        <div class="stat-value">{{ bypass.relay?.via_retry ?? 0 }}</div>
+        <div class="stat-sub">
+          <template v-if="bypass.relay?.via_retry">
+            in {{ bypass.relay.attempts }} handshake(s){{
+              bypass.relay.failed ? `, ${bypass.relay.failed} unreachable` : ''
+            }}
+          </template>
+          <template v-else-if="bypass.relay?.failed">
+            {{ bypass.relay.failed }} connection(s) could not be opened either way
+          </template>
+          <template v-else>no IPv4 handshake needed retrying</template>
+        </div>
+      </div>
+    </div>
+
+    <p v-if="bypassCooled" class="stat-sub" style="margin: -6px 0 14px">
+      {{ bypassCooled }} connection(s) went to a destination that had already spent a
+      whole budget without answering, so each was given one handshake instead of a
+      burst. That is clients retrying something blocked outright rather than sampled:
+      it costs nothing, but the destination is worth a look.
+    </p>
+
+    <div v-if="!bypass.entries.length" class="empty">
+      Nothing is being reopened.
+      <template v-if="bypass.groups.length">
+        The built-in {{ bypass.groups.join(', ') }} table is configured, but the node
+        container is not redirecting anything right now — in
+        <span class="mono">auto</span> that is what an exit node carrying the traffic
+        looks like.
+      </template>
+      <template v-else>
+        Add a destination whose IPv4 connects nowhere while ping to it still answers.
+      </template>
+    </div>
+
+    <div v-else class="table-wrap">
+      <table style="min-width: 720px">
+        <thead>
+          <tr>
+            <th class="plain">Destination</th>
+            <th class="plain">Reached over</th>
+            <th class="plain">State</th>
+            <th class="plain">Label</th>
+            <th class="plain"></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="entry in bypass.entries" :key="entry.cidr">
+            <td class="mono" style="font-weight: 550">{{ entry.cidr }}</td>
+            <td class="mono" style="font-size: 12px">
+              {{ entry.v6 ?? 'its own IPv4, retried' }}
+            </td>
+            <td>
+              <span
+                class="badge"
+                :class="!entry.enabled ? 'badge-disabled' : entry.active ? 'badge-active' : 'badge-limited'"
+              >
+                {{ !entry.enabled ? 'off' : entry.active ? 'reopened' : 'idle' }}
+              </span>
+              <span v-if="entry.built_in" class="badge badge-limited" style="margin-left: 4px">
+                built in
+              </span>
+            </td>
+            <td>{{ entry.note ?? '—' }}</td>
+            <td>
+              <div class="row" style="gap: 4px; justify-content: flex-end">
+                <button
+                  class="btn btn-ghost btn-sm"
+                  :disabled="!bypass.editable || busy !== ''"
+                  title="Edit the IPv6 counterpart or the label"
+                  @click="openEditBypass(entry)"
+                >
+                  ✎
+                </button>
+                <button
+                  class="btn btn-ghost btn-sm"
+                  :disabled="!bypass.editable || busy !== ''"
+                  :title="entry.enabled ? 'Stop reopening it, keeping it listed' : 'Reopen it again'"
+                  @click="toggleBypass(entry)"
+                >
+                  {{ entry.enabled ? '⏸' : '▶' }}
+                </button>
+                <button
+                  class="btn btn-ghost btn-sm"
+                  style="color: var(--danger)"
+                  :disabled="!bypass.editable || busy !== '' || entry.built_in"
+                  :title="entry.built_in ? 'From a built-in table: turn it off instead' : 'Remove'"
+                  @click="removeBypass(entry)"
+                >
+                  ✕
+                </button>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card" style="margin-top: 14px">
+      <div class="stat-label" style="margin-bottom: 14px">When to use this instead</div>
+      <p style="color: var(--text-dim); font-size: 12.5px; margin-top: 0">
+        Some destinations are blocked at the moment a TCP connection is opened rather
+        than by route: the SYN to their IPv4 is dropped, so nothing ever connects, while
+        ping to the same address answers and existing connections keep working. No route
+        change reaches those, so adding one above does nothing. This entry node opens the
+        outbound half itself — over the destination's IPv6 when the same server answers
+        there, and otherwise by dialling its IPv4 until one handshake gets through, which
+        is enough when the filter drops most of them rather than all.
+      </p>
+      <p style="color: var(--text-dim); font-size: 12.5px">
+        In <span class="mono">auto</span> this engages only while client traffic is
+        leaving through this entry node, because a flow already going out through an exit
+        node is not meeting the filter.
+      </p>
+    </div>
+  </template>
+
   <ModalShell v-if="adding" title="Send destinations through the entry node" @close="adding = false">
     <div class="field">
       <label>Addresses and ranges</label>
@@ -333,6 +604,67 @@ onUnmounted(() => window.clearInterval(timer))
     <template #footer>
       <button class="btn" @click="editing = null">Cancel</button>
       <button class="btn btn-primary" :disabled="busy !== ''" @click="saveEdit">Save</button>
+    </template>
+  </ModalShell>
+
+  <ModalShell v-if="addingBypass" title="Reopen a blocked destination" @close="addingBypass = false">
+    <div class="field">
+      <label>Addresses and ranges</label>
+      <textarea
+        v-model="bypassForm.cidr"
+        rows="6"
+        spellcheck="false"
+        placeholder="203.0.113.0/24&#10;198.51.100.7"
+      ></textarea>
+      <span class="hint">
+        One per line or comma-separated; a bare address means a single host. Anything
+        after a # is ignored.
+      </span>
+    </div>
+    <div class="field">
+      <label>IPv6 counterpart <span style="color: var(--text-dim)">— optional</span></label>
+      <input v-model="bypassForm.v6" type="text" placeholder="2001:db8::a" />
+      <span class="hint">
+        The address of the same server over IPv6, tried first. Only for a single
+        destination: sending unrelated ones to one address would reach the wrong server.
+        Leave it empty and the destination's own IPv4 is dialled until a handshake lands.
+      </span>
+    </div>
+    <div class="field">
+      <label>Label</label>
+      <input v-model="bypassForm.note" type="text" placeholder="some service" />
+    </div>
+
+    <template #footer>
+      <button class="btn" @click="addingBypass = false">Cancel</button>
+      <button
+        class="btn btn-primary"
+        :disabled="!parsedBypass.length || busy !== ''"
+        @click="submitBypass"
+      >
+        Reopen {{ parsedBypass.length || '' }}
+      </button>
+    </template>
+  </ModalShell>
+
+  <ModalShell
+    v-if="editingBypass"
+    :title="`Edit ${editingBypass.cidr}`"
+    @close="editingBypass = null"
+  >
+    <div class="field">
+      <label>IPv6 counterpart</label>
+      <input v-model="bypassEditForm.v6" type="text" placeholder="2001:db8::a" />
+      <span class="hint">Empty means the destination's own IPv4 is retried instead.</span>
+    </div>
+    <div class="field">
+      <label>Label</label>
+      <input v-model="bypassEditForm.note" type="text" placeholder="some service" />
+    </div>
+
+    <template #footer>
+      <button class="btn" @click="editingBypass = null">Cancel</button>
+      <button class="btn btn-primary" :disabled="busy !== ''" @click="saveBypassEdit">Save</button>
     </template>
   </ModalShell>
 </template>

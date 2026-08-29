@@ -87,6 +87,19 @@ services:
       # read from the same bind-mounted ./config directory.
       CASCADE_DIRECT_ROUTES: ${CASCADE_DIRECT_ROUTES:-}
       CASCADE_DIRECT_FILE: ${CASCADE_DIRECT_FILE:-/etc/amnezia/host/direct-routes.json}
+      # Destinations a censor blocks by dropping the TCP handshake to their IPv4
+      # rather than by taking the route away, which no route can fix: this entry
+      # node opens the outbound half itself, over the destination's IPv6 where one
+      # is known and by dialling its IPv4 until a handshake lands otherwise.
+      # `auto` engages only while client traffic is leaving through this node, since
+      # a flow already going out through an exit node is not being filtered here.
+      BYPASS_MODE: ${BYPASS_MODE:-auto}
+      BYPASS_GROUPS: ${BYPASS_GROUPS:-telegram}
+      BYPASS_ROUTES: ${BYPASS_ROUTES:-}
+      BYPASS_FILE: ${BYPASS_FILE:-/etc/amnezia/host/bypass.json}
+      BYPASS_PORT: ${BYPASS_PORT:-8646}
+      BYPASS_ATTEMPTS: ${BYPASS_ATTEMPTS:-96}
+      BYPASS_PARALLEL: ${BYPASS_PARALLEL:-6}
       CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
       # Failover tuning.
       CASCADE_PROBE_ENABLED: ${CASCADE_PROBE_ENABLED:-true}
@@ -179,6 +192,7 @@ services:
       # The direct route list, edited by the panel and read by the node container from
       # the other side of the same bind mount.
       ROUTES_REGISTRY_FILE: ${ROUTES_REGISTRY_FILE:-/etc/saucewg/host/direct-routes.json}
+      BYPASS_REGISTRY_FILE: ${BYPASS_REGISTRY_FILE:-/etc/saucewg/host/bypass.json}
       NODE_PROVISION_ENABLED: ${NODE_PROVISION_ENABLED:-true}
       NODE_DEFAULT_PORT: ${NODE_DEFAULT_PORT:-51820}
       NODE_SSH_TIMEOUT_SECONDS: ${NODE_SSH_TIMEOUT_SECONDS:-900}
@@ -187,6 +201,12 @@ services:
       # calls — status, logs, restart, upgrade, repair — need no credentials.
       NODE_SSH_KEY_FILE: ${NODE_SSH_KEY_FILE:-/etc/saucewg/host/panel-ssh-key}
       NODE_SSH_KEY_ENABLED: ${NODE_SSH_KEY_ENABLED:-true}
+      # Failover routes around a dead exit node; this is what tries to put it back,
+      # with the key above. Off leaves a failed node for an operator.
+      NODE_RECOVERY_ENABLED: ${NODE_RECOVERY_ENABLED:-true}
+      NODE_RECOVERY_GRACE_SECONDS: ${NODE_RECOVERY_GRACE_SECONDS:-300}
+      NODE_RECOVERY_INTERVAL_SECONDS: ${NODE_RECOVERY_INTERVAL_SECONDS:-60}
+      NODE_RECOVERY_MAX_ATTEMPTS: ${NODE_RECOVERY_MAX_ATTEMPTS:-6}
       # Pins a node installed from the UI to the same release as this panel.
       SAUCEWG_REPO: ${SAUCEWG_REPO:-V2as/SauceWG}
       SAUCEWG_REF: ${SAUCEWG_REF:-main}

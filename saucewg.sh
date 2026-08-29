@@ -21,7 +21,9 @@ SAUCEWG_VERSION="1.3.0"
 
 SAUCEWG_REPO="${SAUCEWG_REPO:-V2as/SauceWG}"
 SAUCEWG_REF="${SAUCEWG_REF:-main}"
-RAW_BASE="https://raw.githubusercontent.com/${SAUCEWG_REPO}/${SAUCEWG_REF}"
+# Where this script publishes itself. Overridable as a whole for a mirror that is not
+# GitHub at all, the same way SAUCEWG_REGISTRY moves the images.
+RAW_BASE="${SAUCEWG_RAW_BASE:-https://raw.githubusercontent.com/${SAUCEWG_REPO}/${SAUCEWG_REF}}"
 
 APP_DIR="${SAUCEWG_DIR:-/opt/saucewg}"
 CLI_PATH="${SAUCEWG_CLI_PATH:-/usr/local/bin/saucewg}"
@@ -37,6 +39,10 @@ ROLE_FILE="${APP_DIR}/.role"
 CONFIG_DIR="${APP_DIR}/config"
 NODES_FILE="${CONFIG_DIR}/exit-nodes.json"
 ROUTES_FILE="${CONFIG_DIR}/direct-routes.json"
+# Deliberately not called BYPASS_FILE: that is the name the node container's own
+# setting has, and compose interpolates from this process's environment as well as
+# from the .env, so the two must not be able to collide.
+BYPASS_LIST_FILE="${CONFIG_DIR}/bypass.json"
 
 JSON_OUTPUT=false
 ASSUME_YES=false
@@ -407,6 +413,59 @@ SYSCTL
     fi
 }
 
+# True when this script *is* the installed command, so install_cli has nothing to copy
+# over it.
+cli_is_installed_copy() {
+    [ "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)" = "$(readlink -f "$CLI_PATH" 2>/dev/null)" ]
+}
+
+# `saucewg update` pulls new images, but install_cli cannot hand it a newer copy of
+# itself: it is reading the file it would have to overwrite. That matters because the
+# compose file and the settings a release adds to .env are written by *this* script, not
+# by the images — so an update run from an old CLI leaves a server running new containers
+# configured the way the previous release configured them, which is how a new default
+# silently does not arrive. So fetch the published script and let cmd_update hand the
+# rest of the run over to it. Prints the version it installed.
+#
+# Whatever the mirror publishes wins, downgrade included: a fleet pinned with SAUCEWG_REF
+# is asking for that ref, not for the newest thing in existence.
+#
+# All of this is best-effort. A mirror that cannot be reached, or a download that does
+# not survive its own syntax check, leaves the old script to finish the update; that is
+# the outcome worth warning about, but not one worth abandoning an update over.
+cli_self_update() {
+    local published tmp
+    [ "${SAUCEWG_SELF_UPDATED:-}" = 1 ] && return 1
+    cli_is_installed_copy || return 1
+
+    tmp="${CLI_PATH}.new.$$"
+    curl -fsSL --max-time 60 "${RAW_BASE}/saucewg.sh" -o "$tmp" 2>/dev/null || {
+        rm -f "$tmp"
+        return 1
+    }
+    published=$(sed -n 's/^SAUCEWG_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -n1)
+    # A truncated download and a mirror serving an error page both land here.
+    if [ -z "$published" ] || ! bash -n "$tmp" 2>/dev/null; then
+        warn "the copy of saucewg at ${RAW_BASE} did not arrive intact; keeping this one"
+        rm -f "$tmp"
+        return 1
+    fi
+    if [ "$published" = "$SAUCEWG_VERSION" ]; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # A rename rather than a copy: bash reads a script as it runs it, so writing over the
+    # file this process is reading rewrites the rest of the run out from under it.
+    chmod 0755 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$CLI_PATH" 2>/dev/null || {
+        warn "could not replace ${CLI_PATH} with ${published}; continuing with ${SAUCEWG_VERSION}"
+        rm -f "$tmp"
+        return 1
+    }
+    printf '%s' "$published"
+}
+
 # Puts a copy of this script on PATH so the server can be managed with `saucewg`.
 install_cli() {
     # A missing `saucewg` command is an inconvenience, not a broken install, so
@@ -521,6 +580,16 @@ services:
       CASCADE_NODES_FILE: ${CASCADE_NODES_FILE:-/etc/amnezia/host/exit-nodes.json}
       CASCADE_DIRECT_ROUTES: ${CASCADE_DIRECT_ROUTES:-}
       CASCADE_DIRECT_FILE: ${CASCADE_DIRECT_FILE:-/etc/amnezia/host/direct-routes.json}
+      # Destinations a censor blocks by refusing the TCP handshake to their IPv4
+      # rather than by taking the route away, which the entry node reopens itself.
+      # `auto` engages only while the entry node is carrying client traffic.
+      BYPASS_MODE: ${BYPASS_MODE:-auto}
+      BYPASS_GROUPS: ${BYPASS_GROUPS:-telegram}
+      BYPASS_ROUTES: ${BYPASS_ROUTES:-}
+      BYPASS_FILE: ${BYPASS_FILE:-/etc/amnezia/host/bypass.json}
+      BYPASS_PORT: ${BYPASS_PORT:-8646}
+      BYPASS_ATTEMPTS: ${BYPASS_ATTEMPTS:-96}
+      BYPASS_PARALLEL: ${BYPASS_PARALLEL:-6}
       CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
       CASCADE_PROBE_ENABLED: ${CASCADE_PROBE_ENABLED:-true}
       CASCADE_PROBE_TARGET: ${CASCADE_PROBE_TARGET:-1.1.1.1}
@@ -579,12 +648,17 @@ services:
       SUBSCRIPTION_URL_PREFIX: ${SUBSCRIPTION_URL_PREFIX:-}
       NODE_REGISTRY_FILE: ${NODE_REGISTRY_FILE:-/etc/saucewg/host/exit-nodes.json}
       ROUTES_REGISTRY_FILE: ${ROUTES_REGISTRY_FILE:-/etc/saucewg/host/direct-routes.json}
+      BYPASS_REGISTRY_FILE: ${BYPASS_REGISTRY_FILE:-/etc/saucewg/host/bypass.json}
       NODE_PROVISION_ENABLED: ${NODE_PROVISION_ENABLED:-true}
       NODE_DEFAULT_PORT: ${NODE_DEFAULT_PORT:-51820}
       NODE_SSH_TIMEOUT_SECONDS: ${NODE_SSH_TIMEOUT_SECONDS:-900}
       NODE_SSH_QUERY_TIMEOUT_SECONDS: ${NODE_SSH_QUERY_TIMEOUT_SECONDS:-60}
       NODE_SSH_KEY_FILE: ${NODE_SSH_KEY_FILE:-/etc/saucewg/host/panel-ssh-key}
       NODE_SSH_KEY_ENABLED: ${NODE_SSH_KEY_ENABLED:-true}
+      NODE_RECOVERY_ENABLED: ${NODE_RECOVERY_ENABLED:-true}
+      NODE_RECOVERY_GRACE_SECONDS: ${NODE_RECOVERY_GRACE_SECONDS:-300}
+      NODE_RECOVERY_INTERVAL_SECONDS: ${NODE_RECOVERY_INTERVAL_SECONDS:-60}
+      NODE_RECOVERY_MAX_ATTEMPTS: ${NODE_RECOVERY_MAX_ATTEMPTS:-6}
       SAUCEWG_REPO: ${SAUCEWG_REPO:-V2as/SauceWG}
       SAUCEWG_REF: ${SAUCEWG_REF:-main}
       SAUCEWG_NAMESPACE: ${SAUCEWG_NAMESPACE:-v2as}
@@ -817,6 +891,20 @@ CASCADE_NODES_FILE=/etc/amnezia/host/exit-nodes.json
 CASCADE_DIRECT_FILE=/etc/amnezia/host/direct-routes.json
 CASCADE_DIRECT_ROUTES=
 CASCADE_UPLINK_SUBNET=${uplink_subnet}
+
+# Destinations blocked by dropping the TCP handshake to their IPv4, which this
+# entry node reopens over IPv6 or by retrying. auto engages only while clients are
+# leaving through here. See: saucewg bypass
+BYPASS_MODE=auto
+BYPASS_GROUPS=telegram
+BYPASS_FILE=/etc/amnezia/host/bypass.json
+BYPASS_ROUTES=
+BYPASS_PORT=8646
+# The handshake budget for one connection, and how many go out at once. Several at
+# a time is what makes a connection to a destination whose handshakes are being
+# dropped take under a second rather than ten.
+BYPASS_ATTEMPTS=96
+BYPASS_PARALLEL=6
 CASCADE_PROBE_ENABLED=true
 CASCADE_PROBE_TARGET=1.1.1.1
 CASCADE_PROBE_INTERVAL=10
@@ -843,11 +931,16 @@ SUBSCRIPTION_URL_PREFIX=
 
 NODE_REGISTRY_FILE=/etc/saucewg/host/exit-nodes.json
 ROUTES_REGISTRY_FILE=/etc/saucewg/host/direct-routes.json
+BYPASS_REGISTRY_FILE=/etc/saucewg/host/bypass.json
 NODE_PROVISION_ENABLED=true
 NODE_DEFAULT_PORT=51820
 NODE_SSH_TIMEOUT_SECONDS=900
 NODE_SSH_KEY_FILE=/etc/saucewg/host/panel-ssh-key
 NODE_SSH_KEY_ENABLED=true
+NODE_RECOVERY_ENABLED=true
+NODE_RECOVERY_GRACE_SECONDS=300
+NODE_RECOVERY_INTERVAL_SECONDS=60
+NODE_RECOVERY_MAX_ATTEMPTS=6
 EOF
     chmod 600 "$ENV_FILE"
 
@@ -1811,6 +1904,225 @@ cmd_fallback() {
 }
 
 # ---------------------------------------------------------------------------
+# Bypass
+# ---------------------------------------------------------------------------
+#
+# Destinations that are blocked at the point where a TCP connection is
+# established: the SYN to their IPv4 is dropped, so nothing ever connects, while
+# ICMP and every already-established flow pass. A route cannot fix that, so
+# `add-route` cannot either — the entry node has to open the outbound half itself,
+# over the destination's IPv6 or by dialling its IPv4 until a handshake lands.
+#
+# The built-in `telegram` group is what most installations need and is on by
+# default; this list is for anything else, or for correcting a group.
+
+bypass_list_file() {
+    mkdir -p "$CONFIG_DIR"
+    [ -f "$BYPASS_LIST_FILE" ] || { printf '[]\n' > "$BYPASS_LIST_FILE"; chmod 600 "$BYPASS_LIST_FILE"; }
+    printf '%s' "$BYPASS_LIST_FILE"
+}
+
+bypass_list_json() {
+    [ -f "$BYPASS_LIST_FILE" ] && jq '.' "$BYPASS_LIST_FILE" 2>/dev/null || printf '[]'
+}
+
+# What the node container installed, which is the answer that matters: a
+# destination can be listed here and not be redirected, either because the mode
+# says not to or because an exit node is carrying the traffic.
+bypass_state() {
+    compose exec -T awg cat /var/run/amneziawg/uplinks.json 2>/dev/null || true
+}
+
+bypass_mode_configured() {
+    local mode
+    mode=$(env_get "$ENV_FILE" BYPASS_MODE || true)
+    printf '%s' "${mode:-auto}"
+}
+
+cmd_bypass() {
+    require_entry
+    local action="${1:-}"
+    case "$action" in
+        add|remove) shift; bypass_edit "$action" "$@"; return ;;
+        auto|always|off) shift; bypass_set_mode "$action" "$@"; return ;;
+        "") ;;
+        -*) die "unknown option for bypass: $action" ;;
+        *) die "bypass takes auto, always, off, add or remove" ;;
+    esac
+
+    local mode state list applied='[]' active=null relay=null error="" live=false
+    mode=$(bypass_mode_configured)
+    list=$(bypass_list_json)
+    state=$(bypass_state)
+    if printf '%s' "$state" | jq -e 'has("bypass")' >/dev/null 2>&1; then
+        live=true
+        applied=$(printf '%s' "$state" | jq -c '.bypass.routes // []')
+        active=$(printf '%s' "$state" | jq -c '.bypass.active')
+        relay=$(printf '%s' "$state" | jq -c '.bypass.relay')
+        error=$(printf '%s' "$state" | jq -r '.bypass.error // ""')
+    fi
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        printf '%s' "$list" | jq --arg mode "$mode" --argjson applied "$applied" \
+            --argjson active "$active" --argjson relay "$relay" --arg error "$error" \
+            --argjson live "$live" '{
+                mode: $mode, list: ., applied: $applied, active: $active,
+                relay: $relay, live: $live,
+                error: (if $error == "" then null else $error end)
+            }'
+        return
+    fi
+
+    note "bypass    ${mode}"
+    case "$mode" in
+        auto) note "          engages only while every exit node is down and clients leave through here" ;;
+        always) note "          engaged whether or not an exit node is carrying client traffic" ;;
+        off) note "          nothing is reopened; blocked destinations stay blocked" ;;
+    esac
+    if [ "$live" = false ]; then
+        warn "the node container did not answer, so nothing below is confirmed"
+    elif [ "$active" = true ]; then
+        local count
+        count=$(printf '%s' "$state" | jq -r '.bypass.applied')
+        note "          in force right now for ${count} destination(s)"
+        printf '%s' "$relay" | jq -e '. != null' >/dev/null 2>&1 && printf '%s' "$relay" | jq -r '
+            "          \(.accepted) connection(s): \(.via_v6) over IPv6, \(.via_retry) by retrying IPv4 in \(.attempts) handshake(s), \(.failed) unreachable"
+            + (if (.cooled // 0) > 0 then
+                "\n          \(.cooled) went to a destination already known not to answer, and cost one handshake each"
+              else "" end)' >&2
+    elif [ "$mode" != off ]; then
+        note "          not in force: an exit node is carrying client traffic"
+    fi
+
+    if [ "$(printf '%s' "$list" | jq 'length')" -gt 0 ]; then
+        printf '\n' >&2
+        printf '%s' "$list" | jq -r --argjson applied "$applied" '
+            "PREFIX\tVIA\tSTATUS\tNOTE",
+            (.[]
+             | (if type == "string" then {cidr: .} else . end) as $r
+             | (if ($r.cidr | test("/")) then $r.cidr else "\($r.cidr)/32" end) as $cidr
+             | ($applied | map(select(.cidr == $cidr)) | first) as $live
+             | "\($cidr)\t\((($live.v6 // $r.v6 // $r.ipv6) // "retry"))\t" +
+               (if $r.enabled == false then "off"
+                elif $live then "reopened"
+                else "pending" end) +
+               "\t\($r.note // "-")")' | column -t -s "$(printf '\t')" >&2
+    fi
+    [ -z "$error" ] || warn "$error"
+}
+
+bypass_set_mode() {
+    local mode=$1 restart=true
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-restart) restart=false; shift ;;
+            *) die "unknown option for bypass ${mode}: $1" ;;
+        esac
+    done
+    need_root "bypass ${mode}"
+
+    env_set "$ENV_FILE" BYPASS_MODE "$mode"
+    log "bypass set to ${mode}"
+
+    if [ "$restart" = true ]; then
+        step "Applying"
+        # The mode is read from the environment, which only a new container sees.
+        compose up -d awg >&2
+        note "connected clients reconnect on their own within a few seconds"
+    else
+        note "not applied yet; apply it with: saucewg restart"
+    fi
+
+    [ "$JSON_OUTPUT" = false ] || jq -n --arg mode "$mode" '{ok: true, bypass: $mode}'
+}
+
+bypass_edit() {
+    local action=$1 note_label="" v6="" reload=true disable=false args=()
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --note) note_label=$2; shift 2 ;;
+            --v6) v6=$2; shift 2 ;;
+            # A built-in group is a list this script ships, so switching one of its
+            # entries off has to be recorded here rather than by editing the group.
+            --disable) disable=true; shift ;;
+            --no-reload) reload=false; shift ;;
+            -*) die "unknown option for bypass ${action}: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+
+    need_root "bypass ${action}"
+    [ "${#args[@]}" -gt 0 ] || [ -n "$note_label" ] \
+        || die "bypass ${action} needs an address or range$([ "$action" = remove ] && printf ', or --note GROUP')"
+
+    if [ -n "$v6" ]; then
+        [ "$action" = add ] || die "--v6 only applies to: bypass add"
+        [ "${#args[@]}" -eq 1 ] || die "--v6 names one destination's counterpart, so pass one prefix"
+        printf '%s' "$v6" | grep -q ':' || die "not an IPv6 address: ${v6}"
+    fi
+
+    local prefix normalized wanted='[]'
+    for prefix in ${args[@]+"${args[@]}"}; do
+        case "$prefix" in
+            */0) die "${prefix} would send every destination through the relay" ;;
+        esac
+        normalized=$(normalize_prefix "$prefix")
+        [ -n "$normalized" ] || die "not an IPv4 address or range: ${prefix}"
+        wanted=$(printf '%s' "$wanted" | jq --arg c "$normalized" '. + [$c]')
+    done
+
+    local file before after
+    file=$(bypass_list_file)
+    before=$(jq 'length' "$file")
+
+    if [ "$action" = add ]; then
+        # Re-stated rather than skipped when it is already there: unlike a direct
+        # route, an entry here carries how to reach the destination, and correcting
+        # that is the main reason to add one twice.
+        jq --argjson wanted "$wanted" --arg note "$note_label" --arg v6 "$v6" \
+           --argjson enabled "$([ "$disable" = true ] && echo false || echo true)" '
+            reduce $wanted[] as $cidr (.;
+                map(select((.cidr // .) != $cidr))
+                + [{cidr: $cidr, enabled: $enabled}
+                   + (if $v6 == "" then {} else {v6: $v6} end)
+                   + (if $note == "" then {} else {note: $note} end)])' "$file" > "${file}.tmp"
+    else
+        jq --argjson wanted "$wanted" --arg note "$note_label" '
+            map(select(
+                ((.cidr // .) as $c | $wanted | index($c) | not)
+                and (if $note == "" then true else (.note // "") != $note end)))' "$file" > "${file}.tmp"
+    fi
+    mv "${file}.tmp" "$file"
+    chmod 600 "$file"
+    after=$(jq 'length' "$file")
+
+    if [ "$action" = add ]; then
+        if [ "$disable" = true ]; then
+            log "listed ${#args[@]} destination(s) as not to be reopened"
+        else
+            log "reopening ${#args[@]} destination(s) through this entry node"
+        fi
+    else
+        [ "$before" -ne "$after" ] || die "nothing matched; see: saucewg bypass"
+        log "removed $((before - after)) bypass entr$([ $((before - after)) -eq 1 ] && printf 'y' || printf 'ies')"
+    fi
+
+    # The node container watches this file, so an edit needs no restart — only the
+    # nudge that makes it look now rather than on its next tick.
+    if [ "$reload" = true ]; then
+        request_reload
+    else
+        note "not applied yet; apply it with: saucewg reload"
+    fi
+
+    [ "$JSON_OUTPUT" = false ] || jq -n --slurpfile list "$file" \
+        --argjson changed "$([ "$action" = add ] && printf '%s' "${#args[@]}" || printf '%s' "$((before - after))")" \
+        '{ok: true, changed: $changed, list: $list[0]}'
+}
+
+# ---------------------------------------------------------------------------
 # AmneziaWG generation
 # ---------------------------------------------------------------------------
 
@@ -2030,6 +2342,13 @@ cmd_update() {
     done
 
     step "Updating the saucewg command"
+    local newer
+    # Hand the update over to the newer script rather than pulling its images with this
+    # one's idea of what belongs in the compose file.
+    if newer=$(cli_self_update); then
+        log "saucewg ${SAUCEWG_VERSION} → ${newer}; running the rest of the update with it"
+        SAUCEWG_SELF_UPDATED=1 exec "$CLI_PATH" ${SAUCEWG_ARGV[@]+"${SAUCEWG_ARGV[@]}"}
+    fi
     install_cli
 
     step "Refreshing the compose file"
@@ -2051,8 +2370,44 @@ cmd_update() {
             || env_set "$ENV_FILE" NODE_SSH_KEY_ENABLED true
         grep -q '^ROUTES_REGISTRY_FILE=' "$ENV_FILE" \
             || env_set "$ENV_FILE" ROUTES_REGISTRY_FILE /etc/saucewg/host/direct-routes.json
+        grep -q '^BYPASS_REGISTRY_FILE=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" BYPASS_REGISTRY_FILE /etc/saucewg/host/bypass.json
         grep -q '^CASCADE_DIRECT_FILE=' "$ENV_FILE" \
             || env_set "$ENV_FILE" CASCADE_DIRECT_FILE /etc/amnezia/host/direct-routes.json
+        grep -q '^BYPASS_FILE=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" BYPASS_FILE /etc/amnezia/host/bypass.json
+        grep -q '^BYPASS_GROUPS=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" BYPASS_GROUPS telegram
+        # Written down rather than left to the container's own default, so the file
+        # says what the relay will actually do on a network that needs it tuned.
+        grep -q '^BYPASS_ATTEMPTS=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" BYPASS_ATTEMPTS 96
+        grep -q '^BYPASS_PARALLEL=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" BYPASS_PARALLEL 6
+
+        # Telegram is reachable from most Russian hosting segments only by not using
+        # the IPv4 a client asks for, and an entry node carrying traffic itself hits
+        # that. Reopening it is on by default because the alternative is that the
+        # app does not connect at all — but it is written down and announced, since
+        # it changes how those flows leave the server.
+        if ! grep -q '^BYPASS_MODE=' "$ENV_FILE"; then
+            env_set "$ENV_FILE" BYPASS_MODE auto
+            note "destinations whose IPv4 handshake is being dropped are now reopened while clients leave through this node"
+            note "  see what that covers with: saucewg bypass"
+        fi
+
+        # Failing over is not repairing: without this a dead exit node stays dead
+        # until an operator notices, which is exactly what nothing tells them about.
+        # It only ever acts on a node the panel holds a key for, and it stops rather
+        # than hammering a server that does not answer at all.
+        if ! grep -q '^NODE_RECOVERY_ENABLED=' "$ENV_FILE"; then
+            env_set "$ENV_FILE" NODE_RECOVERY_ENABLED true
+            env_set "$ENV_FILE" NODE_RECOVERY_GRACE_SECONDS 300
+            env_set "$ENV_FILE" NODE_RECOVERY_INTERVAL_SECONDS 60
+            env_set "$ENV_FILE" NODE_RECOVERY_MAX_ATTEMPTS 6
+            note "the panel now tries to restart an exit node that has failed, instead of only routing around it"
+            note "  run it yourself with: saucewg recover"
+        fi
 
         # Before this release the only choice was to block client traffic while every
         # exit node was down. Carrying it through the entry node instead keeps clients
@@ -2166,6 +2521,44 @@ cmd_admin_password() {
     fi
 }
 
+# Puts a failed exit node back, rather than only routing around it.
+#
+# The cascade's own failover moves clients off a dead uplink within about thirty
+# seconds and leaves it dead. Bringing the server back needs a shell on it, and the
+# panel is the only part of the installation that has one: it holds an SSH key for
+# every node it installed. So this runs there — probe, restart, and re-pair if the
+# two ends have stopped agreeing on keys.
+#
+# The same escalation runs on a timer inside the panel; this is it on demand, for an
+# operator who would rather not wait out the grace period.
+cmd_recover() {
+    need_root recover
+    require_entry
+
+    # A node that does not come back is an answer rather than a CLI failure, so the
+    # panel's exit status is passed through and its report is printed either way.
+    local json status=0
+    json=$(compose exec -T panel python -m app.cli recover "$@") || status=$?
+    printf '%s' "$json" | jq -e 'type == "array"' >/dev/null 2>&1 \
+        || die "the panel did not answer; is it running? (saucewg logs panel)"
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        printf '%s' "$json" | jq .
+    else
+        printf '%s' "$json" | jq -r '
+            if length == 0 then "every exit node is healthy"
+            else "NAME\tTRIED\tRESULT\tDETAIL",
+                 (.[] | "\(.name)\t\(.last_action // "-")\t" +
+                  (if .healthy then "recovered"
+                   elif .blocked == "unreachable" then "unreachable — check the server exists"
+                   elif .blocked == "exhausted" then "gave up"
+                   else "still down" end) +
+                  "\t\(.last_error // "-")")
+            end' | column -t -s "$(printf '\t')"
+    fi
+    return $status
+}
+
 # ---------------------------------------------------------------------------
 # info / help
 # ---------------------------------------------------------------------------
@@ -2245,6 +2638,8 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
                              (all three take --no-reload to batch several edits)
     uplink-key [NAME]        The entry node's public key for an uplink
     reload                   Re-read the exit node list without a restart
+    recover [NAME…]          Put failed exit nodes back: restart, then re-pair
+                             (defaults to every unhealthy node; needs the panel)
     admin-password           Reset the panel admin password
 
   Routing (entry node)
@@ -2253,6 +2648,13 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
                              (--note GROUP labels them, --from-file PATH reads a list)
     remove-route CIDR…       Put them back on the cascade (--note GROUP removes a group)
     fallback [direct|block]  What happens while every exit node is down
+
+  Blocked destinations (entry node)
+    bypass                   Destinations this node reopens, and whether it is doing so
+    bypass auto|always|off   auto reopens them only while clients leave through here
+    bypass add CIDR…         Reopen a destination whose IPv4 handshake is dropped
+                             (--v6 ADDR names its IPv6, --disable turns a built-in off)
+    bypass remove CIDR…      Stop reopening it (--note GROUP removes a group)
 
   Exit node
     node-info                Print this node's pairing object
@@ -2332,6 +2734,7 @@ main() {
     CONFIG_DIR="${APP_DIR}/config"
     NODES_FILE="${CONFIG_DIR}/exit-nodes.json"
     ROUTES_FILE="${CONFIG_DIR}/direct-routes.json"
+    BYPASS_LIST_FILE="${CONFIG_DIR}/bypass.json"
 
     set -- ${args[@]+"${args[@]}"}
 
@@ -2353,11 +2756,13 @@ main() {
         remove-node)      cmd_remove_node "$@" ;;
         uplink-key)       cmd_uplink_key "$@" ;;
         reload)           cmd_reload "$@" ;;
+        recover)          cmd_recover "$@" ;;
         admin-password)   cmd_admin_password "$@" ;;
         routes|list-routes) cmd_routes "$@" ;;
         add-route)        cmd_add_route "$@" ;;
         remove-route)     cmd_remove_route "$@" ;;
         fallback)         cmd_fallback "$@" ;;
+        bypass)           cmd_bypass "$@" ;;
         node-info)        cmd_node_info "$@" ;;
         node-pair)        cmd_node_pair "$@" ;;
         protocol)         cmd_protocol "$@" ;;
@@ -2370,4 +2775,6 @@ main() {
     esac
 }
 
+# Kept whole because `update` may replace this script and re-run the same command with it.
+SAUCEWG_ARGV=("$@")
 main "$@"

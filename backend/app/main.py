@@ -13,9 +13,10 @@ from . import __version__
 from .config import settings
 from .db import SessionLocal, init_db
 from .models import Admin
-from .routers import admins, auth, clients, nodes, routes, subscription, system
+from .routers import admins, auth, bypass, clients, nodes, routes, subscription, system
 from .security import hash_password
 from .services.collector import collect, purge_old_usage
+from .services.recovery import loop as recovery_loop
 from .services.sync import sync_peers
 from .services.tasks import tasks
 
@@ -97,6 +98,9 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(collector_loop()),
         asyncio.create_task(sync_loop()),
         asyncio.create_task(housekeeping_loop()),
+        # The cascade routes around a failed exit node by itself; nothing but the
+        # panel can put the server back, because nothing else can reach it.
+        asyncio.create_task(recovery_loop()),
     ]
     logger.info("%s %s is ready", settings.panel_title, __version__)
     try:
@@ -132,6 +136,7 @@ app.include_router(admins.router, prefix="/api")
 app.include_router(clients.router, prefix="/api")
 app.include_router(nodes.router, prefix="/api")
 app.include_router(routes.router, prefix="/api")
+app.include_router(bypass.router, prefix="/api")
 app.include_router(system.router, prefix="/api")
 app.include_router(subscription.router)
 

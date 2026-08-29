@@ -433,15 +433,20 @@ jobs:
           # is what puts it back.
           sudo sed -i '/^CASCADE_FALLBACK=/d' /tmp/stale/.env
 
+          # tee, not a pipe into grep: what is being asserted happens *after* the run
+          # announces the handover, and `grep -q` closing the pipe on that line kills
+          # the run right there — which is the failure this test would then report.
           run() {
             sudo env PATH=/tmp/bin:$PATH SAUCEWG_CLI_PATH=/tmp/bin/saucewg \
-              SAUCEWG_RAW_BASE="$1" /tmp/bin/saucewg --dir /tmp/stale --yes update --no-restart 2>&1
+              SAUCEWG_RAW_BASE="$1" /tmp/bin/saucewg --dir /tmp/stale --yes update \
+              --no-restart 2>&1 | tee /tmp/self-update.log
           }
+          said() { grep -q "$1" /tmp/self-update.log; }
           installed() { sed -n 's/^SAUCEWG_VERSION="\([^"]*\)".*/\1/p' /tmp/bin/saucewg | head -1; }
 
           sed 's/^SAUCEWG_VERSION="[^"]*"/SAUCEWG_VERSION="99.0.0"/' saucewg.sh > /tmp/pub/saucewg.sh
-          run file:///tmp/pub | grep -q '99.0.0' \
-            || { echo "::error::a stale CLI updated silently"; exit 1; }
+          run file:///tmp/pub
+          said '99.0.0' || { echo "::error::a stale CLI updated silently"; exit 1; }
           [ "$(installed)" = 99.0.0 ] || { echo "::error::the CLI was not replaced"; exit 1; }
           sudo grep -qx 'CASCADE_FALLBACK=direct' /tmp/stale/.env \
             || { echo "::error::the newer script did not finish the update"; exit 1; }
@@ -450,10 +455,11 @@ jobs:
           # not this script leaves the working copy in place.
           sudo cp saucewg.sh /tmp/bin/saucewg
           cp saucewg.sh /tmp/pub/saucewg.sh
-          run file:///tmp/pub | grep -q '→' \
-            && { echo "::error::replaced the CLI with its own version"; exit 1; }
+          run file:///tmp/pub
+          said '→' && { echo "::error::replaced the CLI with its own version"; exit 1; }
           printf '<html>404</html>\nfi done )\n' > /tmp/pub/saucewg.sh
-          run file:///tmp/pub | grep -q 'did not arrive intact' \
+          run file:///tmp/pub
+          said 'did not arrive intact' \
             || { echo "::error::a broken download was not reported"; exit 1; }
           [ "$(installed)" = "$(sed -n 's/^SAUCEWG_VERSION="\([^"]*\)".*/\1/p' saucewg.sh | head -1)" ] \
             || { echo "::error::a broken download clobbered the CLI"; exit 1; }

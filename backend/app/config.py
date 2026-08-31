@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # Destinations the entry node reopens for itself because the handshake to their
     # IPv4 is what is being dropped, which no route can fix. Same directory again.
     bypass_registry_file: str = "/etc/saucewg/host/bypass.json"
+    # Whether the node blocks BitTorrent in the traffic it forwards, and how hard.
+    # One client seeding is what gets an exit server suspended, so this is a switch
+    # rather than a list. Same directory again.
+    torrent_registry_file: str = "/etc/saucewg/host/torrent-block.json"
     # Set to false to make the panel read-only with respect to the cascade, e.g.
     # when the node list is managed by configuration management.
     node_provision_enabled: bool = True
@@ -165,6 +169,12 @@ class Settings(BaseSettings):
     @property
     def uplink_control_file(self) -> str:
         return f"{self.awg_socket_dir}/uplink-control.json"
+
+    @property
+    def torrent_state_file(self) -> str:
+        # Its own file rather than a key in uplinks.json: the same filter runs on
+        # an exit node, which has no cascade state to publish it alongside.
+        return f"{self.awg_socket_dir}/torrents.json"
 
     @property
     def uplink_reload_file(self) -> str:

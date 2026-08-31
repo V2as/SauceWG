@@ -219,6 +219,44 @@ export interface BypassList {
   config_error: string | null
 }
 
+// One client the torrent guard has caught. The list is a reporting window rather
+// than a penalty: nothing about a client is blocked for being on it.
+export interface TorrentOffender {
+  address: string
+  name: string | null
+  client_id: number | null
+  packets: number
+  expires_in: number
+}
+
+// Which of the kernel matches the filter is built on this host has. Without
+// `string` there is no signature layer and the guard degrades to a port filter.
+export interface TorrentCapabilities {
+  string: boolean
+  ipset: boolean
+  connbytes: boolean
+  comment: boolean
+}
+
+export interface TorrentStatus {
+  enabled: boolean
+  mode: 'on' | 'strict'
+  // What the node container says it is doing, which lags the two above by up to a
+  // second while a change is applied.
+  active: boolean
+  active_mode: string | null
+  rules: number
+  capabilities: TorrentCapabilities
+  // Packets dropped per layer, plus `total`.
+  blocked: Record<string, number>
+  // Addresses caught speaking BitTorrent and dropped on sight since.
+  peers: number
+  clients: TorrentOffender[]
+  live: boolean
+  editable: boolean
+  config_error: string | null
+}
+
 export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed'
 
 export interface NodeTask {
@@ -447,6 +485,12 @@ export const api = {
     payload: { v6?: string | null; note?: string | null; enabled?: boolean },
   ) => request<BypassList>(`/bypass/${cidr}`, { method: 'PUT', body: JSON.stringify(payload) }),
   deleteBypass: (cidr: string) => request<BypassList>(`/bypass/${cidr}`, { method: 'DELETE' }),
+
+  // BitTorrent in the traffic this node forwards. One switch and one dial, both
+  // optional, so the mode survives being turned off and on again.
+  torrents: () => request<TorrentStatus>('/torrents'),
+  setTorrents: (payload: { enabled?: boolean; mode?: 'on' | 'strict' }) =>
+    request<TorrentStatus>('/torrents', { method: 'PUT', body: JSON.stringify(payload) }),
 
   clients: (params: Record<string, string | number | undefined>) => {
     const query = new URLSearchParams()

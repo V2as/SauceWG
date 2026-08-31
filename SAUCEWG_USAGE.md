@@ -211,7 +211,8 @@ surface, available on both roles:
 | `saucewg routes` | *(entry node)* Destinations that bypass the cascade — see §4.5 |
 | `saucewg fallback [direct\|block]` | *(entry node)* What happens while every exit node is down — see §4.6 |
 | `saucewg bypass` | *(entry node)* Destinations this node reopens for itself — see §4.7 |
-| `saucewg recover [NAME…]` | *(entry node)* Try to put failed exit nodes back — see §4.8 |
+| `saucewg torrents [on\|strict\|off]` | Whether BitTorrent is blocked in what this node forwards — see §4.8 |
+| `saucewg recover [NAME…]` | *(entry node)* Try to put failed exit nodes back — see §4.9 |
 | `saucewg protocol` | Which AmneziaWG generation this node serves, and what it is carrying |
 | `saucewg set-protocol V [--signature N]` | Move it to another generation and restart the node container |
 | `saucewg signatures` | The `I1` presets, with what each one imitates |
@@ -267,8 +268,9 @@ account had issued.
 Exit nodes can be added and removed in three ways. They all end up writing the same
 file, so they can be mixed freely. Which destinations use the cascade at all (§4.5),
 what happens when none of it is available (§4.6), which destinations this node reopens
-for itself (§4.7) and what is done about a node that has failed (§4.8) are all set on
-the entry node.
+for itself (§4.7) and what is done about a node that has failed (§4.9) are all set on
+the entry node. Whether BitTorrent is carried at all (§4.8) is set on every node
+separately, because either end can be the address a swarm sees.
 
 ### 4.1 From the panel (what an operator sees)
 
@@ -533,7 +535,87 @@ the file and making the panel's section read-only. `BYPASS_MODE=off` disables th
 feature; `saucewg update` writes `BYPASS_MODE=auto` into an installation that predates
 it and prints a note, since it changes how those flows leave the server.
 
-### 4.8 Putting a failed exit node back
+### 4.8 Blocking BitTorrent
+
+The reason to care is not copyright, it is the server. A swarm sees the address of
+whichever node takes a client's traffic out, and a datacentre answers the notice that
+follows by suspending that server — no warning, no question about who was behind it.
+One client seeding for an evening is the node gone and every client on it with it. A
+European exit node is exactly the case, which is why this is on from the moment a node
+is installed.
+
+```bash
+saucewg torrents             # what is in force here, and what it has caught
+saucewg torrents on          # peer discovery, the peer wire, and caught peers
+saucewg torrents strict      # the same, plus a default-deny egress port policy
+saucewg torrents off         # forward it like anything else
+```
+
+```
+  torrents  on
+            peer discovery and the peer wire are blocked, and caught peers blacklisted
+            in force on awg0 with 61 rule(s)
+            1842 peer address(es) blacklisted
+            13630 packet(s) dropped
+
+CLIENT     PACKETS  EXPIRES IN
+10.8.0.14  12800    84000s
+10.8.0.9   40       3600s
+```
+
+It runs on **every** node, entry and exit alike, because either can be the address a
+swarm sees. On an entry node it inspects what clients send; on an exit node, what the
+entry node forwards. The rules sit in `mangle/FORWARD`, which is where a client's
+traffic exists as plain IP — after AmneziaWG has decrypted it, before anything
+re-encrypts it into an uplink.
+
+There is nothing to list and nothing to keep up to date. Peers are found at runtime and
+the connection to them is encrypted from its first byte, so a set of addresses or ports
+would be stale before it was written. What is matched instead is the protocol: the
+bencoded text of a DHT query, the fixed 64-bit constant a UDP tracker announce opens
+with, `info_hash=` in an HTTP announce, the `0x13 "BitTorrent protocol"` handshake, the
+20-byte uTP header whose first byte is fixed. None of that can be dropped by a client
+that still wants to work, and none of it is encrypted, because at that point the two
+ends have nothing to derive a key from.
+
+Every address caught speaking any of it goes into an ipset for an hour, so the *next*
+connection to that peer is dropped without being inspected. That is what carries the
+block across a reconnection nothing can read inside, and it is why the guard gets
+stronger the longer it runs.
+
+**`strict`** adds the one case signatures cannot see: an encrypted connection to an
+address the client already had, on a port nothing else uses. It refuses outbound TCP and
+UDP except to the ports in `TORRENT_TCP_PORTS` and `TORRENT_UDP_PORTS`, which is a
+general egress policy rather than a torrent signature — the only layer here that can
+inconvenience somebody who was not torrenting. It will break anything on a port nobody
+named, and deliberately includes a VPN a client runs inside the tunnel: that would carry
+torrents where nothing downstream could see them. The CLI warns before applying it.
+
+The two halves cover each other. The port policy catches what has no signature; the
+signatures catch what is on an allowed port. A client set to run uTP and DHT over
+UDP/443 to hide inside QUIC gets past the ports and straight into the shape and bencode
+rules, which never look at a port.
+
+The switch lives in `config/torrent-block.json` next to the other three lists, so the
+panel, the CLI and the node container all see the same thing and a change applies within
+a second without disturbing a tunnel. Turning it on also drops the conntrack entries for
+client traffic, so a torrent running at that moment stops rather than finishing.
+
+`TORRENT_BLOCK=off|on|strict` in `.env` pins it and takes the switch away from the panel
+and the CLI both; `saucewg torrents off` then refuses rather than writing a file that
+would be ignored. `saucewg update` turns the guard on for an installation that predates
+it and prints a note, since it changes what the server will carry.
+
+Two things to check on a host you did not build:
+
+* **`saucewg torrents` reports what the kernel could actually do.** The filter is built
+  on iptables match extensions, and a container host without `xt_string` gets a port
+  filter instead of a signature filter — enough to stop a default client and nothing
+  more. That is reported on the status line rather than left to be discovered.
+* **A rule the kernel refuses is skipped, not fatal.** A partial kernel installs
+  whatever it supports, and says how much of the ladder that was.
+
+### 4.9 Putting a failed exit node back
 
 Failover keeps clients online, and that is also the trap: nothing is broken from a
 client's point of view, so a dead exit node can stay dead until the last one goes with
@@ -817,7 +899,7 @@ none of them need credentials once it carries the panel's key.
 | `POST /api/nodes/{name}/stop` | `{}` | `202` + task. The cascade fails over to the next healthy node |
 | `POST /api/nodes/{name}/start` | `{}` | `202` + task |
 | `POST /api/nodes/{name}/upgrade` | `{}` or `{"tag": "1.4.0"}` | `202` + task. Pulls newer images and recreates. Minutes, like an install |
-| `POST /api/nodes/{name}/recover` | — | `202` + task. Restart, then re-pair if that was not enough — the escalation of §4.8, run now |
+| `POST /api/nodes/{name}/recover` | — | `202` + task. Restart, then re-pair if that was not enough — the escalation of §4.9, run now |
 
 ```json
 {
@@ -862,7 +944,7 @@ Each node in `GET /api/nodes` carries, on top of the health fields documented in
 | `protocol` | The AmneziaWG generation this uplink speaks |
 | `created_at` | When it joined the cascade |
 | `task_id` | Set while an operation on this node is still running |
-| `recovery` | What the panel's own recovery has tried on it, or `null` while it is healthy — `blocked: "unreachable"` is the one that needs a human (§4.8) |
+| `recovery` | What the panel's own recovery has tried on it, or `null` while it is healthy — `blocked: "unreachable"` is the one that needs a human (§4.9) |
 
 and at the top level `config_error`: a complete sentence, safe to show to a human,
 explaining why the cascade is not what the panel thinks it is. It is `null` when all is
@@ -980,6 +1062,7 @@ images.
 | `/opt/saucewg/config/exit-nodes.json` | The cascade. Written by the panel and the CLI |
 | `/opt/saucewg/config/direct-routes.json` | Destinations that bypass the cascade, written the same way |
 | `/opt/saucewg/config/bypass.json` | Destinations this node reopens for itself (§4.7), written the same way |
+| `/opt/saucewg/config/torrent-block.json` | Whether BitTorrent is blocked here (§4.8), and how hard |
 | `/opt/saucewg/config/panel-ssh-key` | The panel's SSH identity, mode `0600`, with its `.pub` beside it |
 | `/opt/saucewg/.role` | `entry` or `exit` |
 | `/usr/local/bin/saucewg` | The CLI, which is a copy of the installer |
@@ -1007,11 +1090,15 @@ Settings that matter for node management specifically:
 | `BYPASS_ROUTES` | | The same list inline, overriding the file |
 | `BYPASS_PORT` | `8646` | Where the relay listens, on the client interface's address only |
 | `BYPASS_ATTEMPTS` / `BYPASS_PARALLEL` | `96` / `6` | Handshakes the retry path may spend on one connection, and how many go out at once |
+| `TORRENT_REGISTRY_FILE` | `/etc/saucewg/host/torrent-block.json` | Where the panel sees the torrent switch of §4.8 *inside its container* |
+| `TORRENT_BLOCK` | | `off`, `on` or `strict` pins the switch and takes it away from the panel and the CLI; empty leaves it to the file |
+| `TORRENT_BLOCK_FILE` | `/etc/amnezia/host/torrent-block.json` | Where the *node container* reads the switch |
+| `TORRENT_TCP_PORTS` / `TORRENT_UDP_PORTS` | see §4.8 | The ports `strict` leaves open. Adding 500, 4500 or 51820 lets a client run its own VPN out of the tunnel and torrent inside it |
 | `NODE_SSH_KEY_FILE` | `/etc/saucewg/host/panel-ssh-key` | The panel's own SSH key, generated on first use |
 | `NODE_SSH_KEY_ENABLED` | `true` | `false` stops the panel keeping a key, so every call carries credentials |
 | `NODE_SSH_TIMEOUT_SECONDS` | `900` | Ceiling for one remote command |
 | `NODE_SSH_QUERY_TIMEOUT_SECONDS` | `60` | Ceiling for the calls that answer inside one request: `check`, `status`, `logs` |
-| `NODE_RECOVERY_ENABLED` | `true` | Whether the panel tries to put a failed exit node back — see §4.8 |
+| `NODE_RECOVERY_ENABLED` | `true` | Whether the panel tries to put a failed exit node back — see §4.9 |
 | `NODE_RECOVERY_GRACE_SECONDS` | `300` | How long a node must be unhealthy before the first attempt |
 | `NODE_RECOVERY_INTERVAL_SECONDS` | `60` | Sweep interval, and the base of the backoff between attempts |
 | `NODE_RECOVERY_MAX_ATTEMPTS` | `6` | After this many, the node is left for an operator |
@@ -1088,8 +1175,21 @@ Settings that matter for node management specifically:
   opening *more* connections than before. Telegram keeps working through it, because every
   datacentre it needs is reachable over IPv6 and the app moves on from an endpoint that
   will not answer. Judge it by the "over IPv6" and "by retrying" counts, not by this one.
+* **The torrent guard is on by default, on every node**, including one installed before
+  it existed once `saucewg update` has run. It is not an opt-in policy because what it
+  prevents is the loss of the server rather than a bill, and it is per node rather than
+  per client because a swarm sees a server's address and nothing finer.
+* **`strict` will break something eventually.** It is a default-deny egress port policy,
+  so any service on a port nobody listed stops working — including a VPN a client runs
+  inside the tunnel, which is the point. Reach for it on a node that has already had a
+  complaint, not as a starting position.
+* **The chosen mode survives being switched off.** `saucewg torrents off` after
+  `strict` keeps `strict` on file, so turning the guard back on returns to it rather
+  than to the standard mode.
+* **The counters reset with the node container.** They are read off the iptables rules
+  themselves, so a restart zeroes them. That is also why they cost nothing to keep.
 * **Failing over is not repairing.** The cascade moves clients off a dead exit node in
-  about 30 seconds and leaves it dead. The panel is what tries to bring it back (§4.8),
+  about 30 seconds and leaves it dead. The panel is what tries to bring it back (§4.9),
   and a node it reports as `unreachable` is one no software on this side can fix — that
   is a server that has stopped existing, and the honest fix is at the provider.
 * **`saucewg recover` needs the panel.** It runs inside that container because the SSH

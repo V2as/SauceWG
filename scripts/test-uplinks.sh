@@ -31,6 +31,8 @@ export BYPASS_STATE_FILE="$WORK/run/bypass-state.json"
 # same code paths it did before the bypass existed.
 export BYPASS_MODE=off
 export BYPASS_GROUPS=telegram
+export TORRENT_BLOCK_FILE="$WORK/torrent-block.json"
+export TORRENT_STATE_FILE="$WORK/run/torrents.json"
 mkdir -p "$AWG_CONFIG_DIR" "$AWG_SOCKET_DIR"
 
 # shellcheck source=../docker/awg/lib.sh
@@ -43,10 +45,14 @@ log() { [ "$VERBOSE" != true ] || printf '    [awg] %s\n' "$*" >&2; }
 # `ip` and `iptables` are modelled rather than swallowed: which table holds which
 # route, and where the REJECT rule sits in FORWARD, is exactly what decides whether
 # client traffic leaves through an exit node, through the entry node or nowhere.
-ROUTES="$WORK/routes"   # table <TAB> destination <TAB> as `ip route show` would print
-RULES="$WORK/rules"     # one policy rule per line
-IPT="$WORK/iptables"    # table|chain|rule, in chain order
-: > "$ROUTES"; : > "$RULES"; : > "$IPT"
+ROUTES="$WORK/routes"      # table <TAB> destination <TAB> as `ip route show` would print
+RULES="$WORK/rules"        # one policy rule per line
+IPT="$WORK/iptables"       # table|chain|rule, in chain order
+IPT_CHAINS="$WORK/chains"  # table|chain, for the ones created with -N
+IPT_COUNT="$WORK/counters" # rule key <US> packets, what the kernel would have counted
+SETS="$WORK/ipsets"        # one file per set: address <TAB> packets <TAB> timeout
+: > "$ROUTES"; : > "$RULES"; : > "$IPT"; : > "$IPT_CHAINS"; : > "$IPT_COUNT"
+mkdir -p "$SETS"
 
 # What the entry node's own default route looks like. Reassigned by the tests that
 # move it.
@@ -105,6 +111,41 @@ ip() {
     return 0
 }
 
+# Which match extensions and targets this fake kernel has. The torrent filter
+# probes for them and installs a different ladder depending on the answer, so the
+# tests have to be able to take one away and see what is left.
+FAKE_MATCHES="conntrack string comment connbytes set length multiport"
+
+fake_has() {
+    case " $FAKE_MATCHES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# A rule naming a match this kernel does not have is refused whole, which is what
+# makes a capability probe mean anything.
+fake_rule_loadable() {
+    local prev="" x
+    for x in "$@"; do
+        case $prev in
+            -m) fake_has "$x" || return 1 ;;
+            -j) [ "$x" != SET ] || fake_has set || return 1 ;;
+        esac
+        prev=$x
+    done
+    return 0
+}
+
+# Built-in chains are always there; the rest have to be created first.
+fake_chain_exists() {
+    case $2 in
+        FORWARD|INPUT|OUTPUT|PREROUTING|POSTROUTING) return 0 ;;
+    esac
+    grep -Fxq -- "$1|$2" "$IPT_CHAINS"
+}
+
+# Per-rule packet counters, keyed the same way the rules are. Only the tests ever
+# add to these — the kernel that would have is not here.
+declare -A IPT_PKTS=()
+
 iptables() {
     local table=filter args=() key rest
     while [ $# -gt 0 ]; do
@@ -115,10 +156,32 @@ iptables() {
     done
     local op=${args[0]:-} chain=${args[1]:-}
     case $op in
+        -N)
+            fake_chain_exists "$table" "$chain" && return 1
+            printf '%s|%s\n' "$table" "$chain" >> "$IPT_CHAINS"
+            return 0
+            ;;
+        -F)
+            fake_chain_exists "$table" "$chain" || return 1
+            grep -Fv -- "${table}|${chain}|" "$IPT" > "$IPT.tmp" 2>/dev/null || true
+            mv "$IPT.tmp" "$IPT"
+            return 0
+            ;;
+        -X)
+            fake_chain_exists "$table" "$chain" || return 1
+            # A chain something still jumps to cannot be deleted, which is the
+            # whole reason teardown flushes everything before it deletes anything.
+            ! grep -q -- "-j ${chain}\$" "$IPT" || return 1
+            grep -Fxv -- "${table}|${chain}" "$IPT_CHAINS" > "$IPT_CHAINS.tmp" 2>/dev/null || true
+            mv "$IPT_CHAINS.tmp" "$IPT_CHAINS"
+            return 0
+            ;;
         -I) rest="${args[*]:3}" ;;
         -C|-A|-D) rest="${args[*]:2}" ;;
         *) return 0 ;;
     esac
+    fake_chain_exists "$table" "$chain" || return 1
+    fake_rule_loadable ${args[@]+"${args[@]}"} || return 1
     key="${table}|${chain}|${rest}"
 
     case $op in
@@ -136,6 +199,61 @@ iptables() {
         -D)
             grep -Fxv -- "$key" "$IPT" > "$IPT.tmp" 2>/dev/null || true
             mv "$IPT.tmp" "$IPT"
+            ;;
+    esac
+    return 0
+}
+
+# The counters, in the format the torrent filter parses them out of.
+iptables-save() {
+    local table=filter line chain rest packets
+    while [ $# -gt 0 ]; do
+        case $1 in -t) table=$2; shift 2 ;; *) shift ;; esac
+    done
+    printf '*%s\n' "$table"
+    while IFS= read -r line; do
+        case $line in "${table}|"*) ;; *) continue ;; esac
+        rest=${line#*|}
+        chain=${rest%%|*}
+        rest=${rest#*|}
+        packets=${IPT_PKTS[$line]:-0}
+        printf '[%s:%s] -A %s %s\n' "$packets" "$((packets * 64))" "$chain" "$rest"
+    done < "$IPT"
+    printf 'COMMIT\n'
+}
+
+# One file per set, a line per member: address <TAB> packets <TAB> timeout.
+ipset() {
+    local name terse=false
+    case "${1:-}" in
+        create)
+            fake_has set || return 1
+            name=$2
+            [ -f "$SETS/$name" ] || : > "$SETS/$name"
+            ;;
+        destroy)
+            fake_has set || return 1
+            [ -n "${2:-}" ] || { rm -f "$SETS"/*; return 0; }
+            [ -f "$SETS/$2" ] || return 1
+            rm -f "$SETS/$2"
+            ;;
+        add)
+            fake_has set || return 1
+            [ -f "$SETS/$2" ] || return 1
+            printf '%s\t%s\t%s\n' "$3" "${4:-0}" "${5:-3600}" >> "$SETS/$2"
+            ;;
+        list)
+            fake_has set || return 1
+            shift
+            [ "${1:-}" != -t ] || { terse=true; shift; }
+            name=${1:-}
+            [ -f "$SETS/$name" ] || return 1
+            printf 'Name: %s\nType: hash:ip\nRevision: 5\nHeader: family inet hashsize 1024\n' "$name"
+            printf 'Number of entries: %s\n' "$(wc -l < "$SETS/$name" | tr -d ' ')"
+            [ "$terse" != true ] || return 0
+            printf 'Members:\n'
+            awk -F'\t' '{printf "%s timeout %s packets %s bytes %s\n", $1, $3, $2, $2 * 64}' \
+                "$SETS/$name"
             ;;
     esac
     return 0
@@ -179,6 +297,8 @@ awg-bypass() {
     sleep 600 >/dev/null 2>&1
 }
 
+# shellcheck source=../docker/awg/torrents.sh
+. "$ROOT/docker/awg/torrents.sh"
 # shellcheck source=../docker/awg/uplinks.sh
 . "$ROOT/docker/awg/uplinks.sh"
 
@@ -331,6 +451,60 @@ bypass_target_of() {
         '(.map[] | select(.prefix == $cidr) | (if .v6 == "" then "-" else .v6 end)) // "absent"' \
         "$BYPASS_CONFIG_FILE"
 }
+
+# --- torrent accessors -----------------------------------------------------
+
+torrent_switch() { printf '%s\n' "$1" > "$TORRENT_BLOCK_FILE"; }
+
+# The rules of one mangle chain, in the order the kernel would walk them.
+mangle_chain() {
+    sed -n "s/^mangle|$1|//p" "$IPT"
+}
+
+# The layers that actually got a rule installed, deduplicated and sorted, which
+# is what says which half of the ladder this kernel could take.
+torrent_layers() {
+    grep -o 'saucewg:torrent:[a-z-]*' "$IPT" | sed 's/.*://' \
+        | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+torrent_layer_rules() {
+    grep -c -- "saucewg:torrent:$1 " "$IPT" | tr -d ' '
+}
+
+# The order the port policy is walked in: every allow has to be above the deny it
+# is an exception to, or the allowlist means nothing.
+torrent_strict_order() {
+    mangle_chain "$TORRENT_CHAIN" | grep -o 'saucewg:torrent:[a-z-]*' | sed 's/.*://' \
+        | grep -Ex 'allow|strict-tcp|strict-udp' | uniq | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Where a chain is entered from, or "none".
+torrent_hook_of() {
+    sed -n "s/^mangle|FORWARD|\(.*\) -j $1\$/\1/p" "$IPT" | head -n1 | grep . || printf 'none'
+}
+
+torrent_chains() {
+    sed -n 's/^mangle|//p' "$IPT_CHAINS" | sort | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Charge packets to the one rule carrying a given fragment, the way the kernel
+# would have. Named by fragment rather than by layer so that two rules of the same
+# layer can be charged separately — whether those add up is the thing being tested.
+hit_rule() {
+    local packets=$1 fragment=$2 line
+    while IFS= read -r line; do
+        case $line in
+            *"$fragment"*)
+                IPT_PKTS[$line]=$(( ${IPT_PKTS[$line]:-0} + packets ))
+                return 0 ;;
+        esac
+    done < "$IPT"
+    return 1
+}
+
+# A client the guard caught, as the ipset would be holding it.
+caught() { ipset add "$TORRENT_CLIENT_SET" "$1" "$2" "${3:-86000}"; }
 
 # Every stub tunnel, including the ones a re-parse dropped from the arrays: `wait`
 # would otherwise block on a process nothing is left holding a pid for.
@@ -720,6 +894,167 @@ echo "40. tearing the node down leaves no redirect behind"
 uplinks_teardown
 check "the redirect is removed" "" "$(bypass_redirects)"
 check "and the relay is stopped" "false" "$(bypass_running && echo true || echo false)"
+
+echo "41. with nothing set anywhere, no torrent rule exists"
+torrent_reload
+check "nothing is blocked" "off" "$TORRENT_MODE"
+check "and it says nobody asked" "none" "$TORRENT_SOURCE"
+check "no chain was created" "" "$(torrent_chains)"
+check "and forwarding is untouched" "none" "$(torrent_hook_of "$TORRENT_CHAIN")"
+
+echo "42. the panel's file turns the guard on"
+torrent_switch '{"enabled": true, "mode": "on"}'
+torrent_reload
+check "the mode is read from the file" "on" "$TORRENT_MODE"
+check "every chain is in place" \
+    "SAUCEWG_TORRENT SAUCEWG_TORRENT_CUT SAUCEWG_TORRENT_HIT SAUCEWG_TORRENT_IN SAUCEWG_TORRENT_SCAN" \
+    "$(torrent_chains)"
+check "client traffic enters the ladder" "-i awg0" "$(torrent_hook_of "$TORRENT_CHAIN")"
+check "and what comes back is checked too" "-o awg0" "$(torrent_hook_of "$TORRENT_IN_CHAIN")"
+check "discovery, the wire and the replies are all covered" \
+    "dht dns handshake lsd metainfo peer pex port scan tracker utp" "$(torrent_layers)"
+check "the probe chain was cleaned up after itself" "gone" \
+    "$(case " $(torrent_chains) " in *PROBE*) echo kept ;; *) echo gone ;; esac)"
+
+echo "43. a hit blacklists the peer, notes the client and drops"
+check "the blacklist is consulted before anything else" \
+    "-m set --match-set saucewg-torrent-peers dst -m comment --comment saucewg:torrent:peer -j SAUCEWG_TORRENT_HIT" \
+    "$(mangle_chain "$TORRENT_CHAIN" | head -n1)"
+check "a hit remembers the peer" "yes" \
+    "$(mangle_chain "$TORRENT_HIT_CHAIN" | grep -Fxq -- '-j SET --add-set saucewg-torrent-peers dst --exist' && echo yes || echo no)"
+check "and who was talking to it" "yes" \
+    "$(mangle_chain "$TORRENT_HIT_CHAIN" | grep -Fxq -- '-j SET --add-set saucewg-torrent-clients src --exist' && echo yes || echo no)"
+check "before dropping the packet" "-j DROP" "$(mangle_chain "$TORRENT_HIT_CHAIN" | tail -n1)"
+# A DNS query for a tracker goes to a resolver: blacklisting it would take the
+# client off the internet entirely.
+check "a cut never blacklists the destination" "yes" \
+    "$(mangle_chain "$TORRENT_CUT_CHAIN" | grep -Fq -- 'add-set saucewg-torrent-peers' && echo no || echo yes)"
+check "though it still notes the client" "yes" \
+    "$(mangle_chain "$TORRENT_CUT_CHAIN" | grep -Fq -- 'add-set saucewg-torrent-clients src' && echo yes || echo no)"
+
+echo "44. standard leaves ordinary ports alone, strict closes them"
+check "nothing is refused for its port alone" "0" "$(torrent_layer_rules strict-tcp)"
+torrent_switch '{"enabled": true, "mode": "strict"}'
+torrent_reload
+check "strict is in force" "strict" "$TORRENT_MODE"
+check "outbound TCP is now default-deny" "1" "$(torrent_layer_rules strict-tcp)"
+check "and so is UDP" "1" "$(torrent_layer_rules strict-udp)"
+check "each deny sits below the ports it excepts" "allow strict-tcp allow strict-udp" \
+    "$(torrent_strict_order)"
+check "and the signature layers are still there" "true" \
+    "$([ "$(torrent_layer_rules dht)" -gt 0 ] && echo true || echo false)"
+
+echo "45. a long allowlist becomes several rules rather than being truncated"
+check "fifteen ports fit in one" "20,21,22,25,53,80,110,143,443,465,587,853,993,995,1935" \
+    "$(torrent_port_chunks "$TORRENT_TCP_PORTS" | head -n1)"
+check "a range costs two of them" "3128,3478,5222,5223,5228:5230,8080,8443" \
+    "$(torrent_port_chunks "$TORRENT_TCP_PORTS" | tail -n1)"
+check "and no port is lost in the split" "22" \
+    "$(torrent_port_chunks "$TORRENT_TCP_PORTS" | tr ',' '\n' | wc -l | tr -d ' ')"
+
+echo "46. a tick that changes nothing does not rebuild sixty rules"
+iptables -t mangle -D "$TORRENT_SCAN_CHAIN" -p udp --dport 6771 \
+    -m comment --comment saucewg:torrent:lsd -j "$TORRENT_CUT_CHAIN"
+torrent_apply
+check "the ladder is left exactly as it was" "1" "$(torrent_layer_rules lsd)"
+torrent_switch '{"enabled": true, "mode": "on"}'
+torrent_reload
+check "but a change to the mode rebuilds all of it" "2" "$(torrent_layer_rules lsd)"
+
+echo "47. a hook lost to somebody else's flush is put back"
+iptables -t mangle -D FORWARD -i awg0 -j "$TORRENT_CHAIN"
+check "it is noticed as gone" "none" "$(torrent_hook_of "$TORRENT_CHAIN")"
+check "and reported while it is" "true" \
+    "$(case "$(torrent_error)" in *"nothing is being sent through them"*) echo true ;; *) echo "$(torrent_error)" ;; esac)"
+torrent_apply
+check "the next tick reinstates it" "-i awg0" "$(torrent_hook_of "$TORRENT_CHAIN")"
+check "and there is nothing left to warn about" "" "$(torrent_error)"
+
+echo "48. what it caught reaches the panel"
+hit_rule 4 '9:get_peers'
+hit_rule 6 '13:announce_peer'
+hit_rule 7 '0000041727101980'
+hit_rule 900 'saucewg:torrent:scan '
+ipset add "$TORRENT_PEER_SET" 198.51.100.9 3 3600
+ipset add "$TORRENT_PEER_SET" 203.0.113.7 5 3600
+caught 10.8.0.5 40
+caught 10.8.0.9 12
+torrent_write_state
+check "the rules of one layer add up" "10" "$(jq -r .blocked.dht "$TORRENT_STATE_FILE")"
+check "each layer is reported on its own" "7" "$(jq -r .blocked.tracker "$TORRENT_STATE_FILE")"
+# `scan` is the rule traffic passes through on its way to being inspected, so
+# counting it would report the whole node as blocked torrents.
+check "the total counts what died, not what passed" "17" "$(jq -r .blocked.total "$TORRENT_STATE_FILE")"
+check "the size of the blacklist is published" "2" "$(jq -r .peers "$TORRENT_STATE_FILE")"
+check "the worst client is named first" "10.8.0.5" "$(jq -r '.clients[0].address' "$TORRENT_STATE_FILE")"
+check "with what it cost them" "40" "$(jq -r '.clients[0].packets' "$TORRENT_STATE_FILE")"
+check "the mode is published" "on" "$(jq -r .mode "$TORRENT_STATE_FILE")"
+check "and where it was decided" "file" "$(jq -r .source "$TORRENT_STATE_FILE")"
+check "so is what this kernel could actually do" "true" \
+    "$(jq -r .capabilities.string "$TORRENT_STATE_FILE")"
+check "with nothing to warn about" "null" "$(jq -r .error "$TORRENT_STATE_FILE")"
+
+echo "49. an unusable file keeps the guard that is already up"
+torrent_switch 'not json at all'
+torrent_reload
+check "the mode is unchanged" "on" "$TORRENT_MODE"
+check "and the rules are still in force" "-i awg0" "$(torrent_hook_of "$TORRENT_CHAIN")"
+check "the reason is recorded" "true" \
+    "$(case "$(torrent_error)" in *"not a JSON object"*) echo true ;; *) echo "$(torrent_error)" ;; esac)"
+
+echo "50. an unknown mode blocks the standard way rather than nothing"
+torrent_switch '{"enabled": true, "mode": "paranoid-extreme"}'
+torrent_reload
+check "the standard mode is in force" "on" "$TORRENT_MODE"
+check "and the typo is named" "true" \
+    "$(case "$(torrent_error)" in *"is not one of on or strict"*) echo true ;; *) echo "$(torrent_error)" ;; esac)"
+
+echo "51. switching it off takes every rule and both sets with it"
+torrent_switch '{"enabled": false, "mode": "strict"}'
+torrent_reload
+check "nothing is blocked" "off" "$TORRENT_MODE"
+check "no chain is left behind" "" "$(torrent_chains)"
+check "nothing is sent through them any more" "" \
+    "$(sed -n 's/^mangle|FORWARD|//p' "$IPT" | grep SAUCEWG || true)"
+check "and the blacklist is gone with them" "gone" \
+    "$(ipset list -t "$TORRENT_PEER_SET" >/dev/null 2>&1 && echo kept || echo gone)"
+# The mode the operator chose survives being switched off, so turning it back on
+# does not silently drop them to standard.
+check "the chosen mode is still on file" "strict" "$(jq -r .mode "$TORRENT_BLOCK_FILE")"
+
+echo "52. a kernel without the string match blocks what it can, and says which half"
+FAKE_MATCHES="comment connbytes set multiport"
+torrent_switch '{"enabled": true, "mode": "on"}'
+torrent_reload
+check "the signature layers are gone" "peer port" "$(torrent_layers)"
+check "the default ports are still refused" "2" "$(torrent_layer_rules port)"
+check "the operator is told what they got" "true" \
+    "$(case "$(torrent_error)" in *"no iptables string match"*) echo true ;; *) echo "$(torrent_error)" ;; esac)"
+check "and the panel sees it as a missing capability" "false" \
+    "$(torrent_write_state; jq -r .capabilities.string "$TORRENT_STATE_FILE")"
+torrent_switch '{"enabled": false}'
+torrent_reload
+FAKE_MATCHES="string comment connbytes set length multiport"
+
+echo "53. the environment overrides the panel, and says so"
+export TORRENT_BLOCK=strict
+torrent_reload
+check "the operator's setting wins over the file" "strict" "$TORRENT_MODE"
+check "and the panel is told the switch is not its own" "env" "$TORRENT_SOURCE"
+export TORRENT_BLOCK=nonsense
+torrent_reload
+check "a typo blocks nothing rather than everything" "off" "$TORRENT_MODE"
+check "and is reported" "true" \
+    "$(case "$(torrent_error)" in *"is not one of off, on or strict"*) echo true ;; *) echo "$(torrent_error)" ;; esac)"
+unset TORRENT_BLOCK
+
+echo "54. tearing the node down leaves no torrent rule behind"
+torrent_switch '{"enabled": true, "mode": "strict"}'
+torrent_reload
+check "the guard is up" "-i awg0" "$(torrent_hook_of "$TORRENT_CHAIN")"
+uplinks_teardown
+check "the chains are gone" "" "$(torrent_chains)"
+check "and so is every rule they held" "" "$(grep -c 'saucewg:torrent' "$IPT" | grep -v '^0$' || true)"
 
 echo
 printf '%s passed, %s failed\n' "$PASSED" "$FAILED"

@@ -100,6 +100,16 @@ services:
       BYPASS_PORT: ${BYPASS_PORT:-8646}
       BYPASS_ATTEMPTS: ${BYPASS_ATTEMPTS:-96}
       BYPASS_PARALLEL: ${BYPASS_PARALLEL:-6}
+      # BitTorrent, blocked in the traffic this node forwards, because one client
+      # seeding is an abuse notice and a suspended exit server. Empty leaves the
+      # decision to the file the panel writes; off, on or strict here overrides it
+      # and takes the switch out of the UI.
+      TORRENT_BLOCK: ${TORRENT_BLOCK:-}
+      TORRENT_BLOCK_FILE: ${TORRENT_BLOCK_FILE:-/etc/amnezia/host/torrent-block.json}
+      # What `strict` still lets a client reach. Everything else is refused, which
+      # is what closes encrypted peer traffic on a port nothing else uses.
+      TORRENT_TCP_PORTS: ${TORRENT_TCP_PORTS:-}
+      TORRENT_UDP_PORTS: ${TORRENT_UDP_PORTS:-}
       CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
       # Failover tuning.
       CASCADE_PROBE_ENABLED: ${CASCADE_PROBE_ENABLED:-true}
@@ -193,6 +203,8 @@ services:
       # the other side of the same bind mount.
       ROUTES_REGISTRY_FILE: ${ROUTES_REGISTRY_FILE:-/etc/saucewg/host/direct-routes.json}
       BYPASS_REGISTRY_FILE: ${BYPASS_REGISTRY_FILE:-/etc/saucewg/host/bypass.json}
+      # The torrent switch, on the panel's side of the same bind mount.
+      TORRENT_REGISTRY_FILE: ${TORRENT_REGISTRY_FILE:-/etc/saucewg/host/torrent-block.json}
       NODE_PROVISION_ENABLED: ${NODE_PROVISION_ENABLED:-true}
       NODE_DEFAULT_PORT: ${NODE_DEFAULT_PORT:-51820}
       NODE_SSH_TIMEOUT_SECONDS: ${NODE_SSH_TIMEOUT_SECONDS:-900}

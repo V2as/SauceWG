@@ -320,6 +320,57 @@ jobs:
           sudo bash saucewg.sh --dir /tmp/entry --yes bypass auto --no-restart
           echo "bypass keeps its list and its mode consistent"
 
+      # One client seeding gets an exit server suspended, so the switch has to be on
+      # from the moment a node is installed and has to stay where it was put. The
+      # container reads the file, so what is asserted is the file — not a container.
+      - name: The CLI maintains the torrent guard
+        run: |
+          sudo jq -e '.enabled == true and .mode == "on"' \
+            /tmp/entry/config/torrent-block.json >/dev/null \
+            || { echo "::error::a fresh install forwards torrents"; exit 1; }
+          sudo jq -e '.enabled == true' /tmp/exit/config/torrent-block.json >/dev/null \
+            || { echo "::error::a fresh exit node forwards torrents"; exit 1; }
+
+          sudo bash saucewg.sh --dir /tmp/entry --yes torrents strict
+          sudo jq -e '.mode == "strict"' /tmp/entry/config/torrent-block.json >/dev/null
+          # The dial keeps its position while the switch is off, so turning it back
+          # on does not silently drop the operator to the standard mode.
+          sudo bash saucewg.sh --dir /tmp/entry --yes torrents off
+          sudo jq -e '.enabled == false and .mode == "strict"' \
+            /tmp/entry/config/torrent-block.json >/dev/null \
+            || { echo "::error::switching off lost the chosen mode"; exit 1; }
+          sudo bash saucewg.sh --dir /tmp/entry --yes torrents on
+          sudo jq -e '.enabled == true and .mode == "on"' \
+            /tmp/entry/config/torrent-block.json >/dev/null
+
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes torrents nonsense
+
+          # Pinning it in the .env takes the switch away from the panel and the CLI
+          # alike, and saying so is the whole point of the check.
+          sudo sed -i 's/^TORRENT_BLOCK=.*/TORRENT_BLOCK=strict/' /tmp/entry/.env
+          sudo bash saucewg.sh --dir /tmp/entry --yes torrents off \
+            > /tmp/torrents.log 2>&1 \
+            && { echo "::error::the CLI wrote a switch the container would ignore"; exit 1; }
+          grep -q 'overrides this' /tmp/torrents.log \
+            || { echo "::error::the CLI did not say why"; cat /tmp/torrents.log; exit 1; }
+          sudo sed -i 's/^TORRENT_BLOCK=.*/TORRENT_BLOCK=/' /tmp/entry/.env
+
+          # Reaching the .env is not reaching the container: the mount is what lets
+          # the switch be changed without recreating it.
+          sudo docker compose --project-directory /tmp/entry \
+            -f /tmp/entry/docker-compose.yml --env-file /tmp/entry/.env config --format json \
+            > /tmp/entry-compose.json
+          jq -e '.services.awg.environment.TORRENT_BLOCK_FILE
+                 == "/etc/amnezia/host/torrent-block.json"' /tmp/entry-compose.json >/dev/null \
+            || { echo "::error::the container is not told where the switch is"; exit 1; }
+          jq -e '[.services.awg.volumes[] | select(.target == "/etc/amnezia/host")] | length == 1' \
+            /tmp/entry-compose.json >/dev/null \
+            || { echo "::error::the switch is not mounted into the node container"; exit 1; }
+          jq -e '.services.panel.environment.TORRENT_REGISTRY_FILE
+                 == "/etc/saucewg/host/torrent-block.json"' /tmp/entry-compose.json >/dev/null \
+            || { echo "::error::the panel cannot write the switch"; exit 1; }
+          echo "torrents keeps its switch and its mode consistent"
+
       # An installation made before the fallback had two modes must come out of an
       # update with the new default written down rather than assumed. Only the .env
       # migration is under test, so docker is stubbed out: pulling three images to

@@ -26,6 +26,8 @@ SERVER_PID=0
 
 # shellcheck source=uplinks.sh
 . /usr/local/lib/awg-uplinks.sh
+# shellcheck source=torrents.sh
+. /usr/local/lib/awg-torrents.sh
 
 # ---------------------------------------------------------------------------
 # Server interface (clients on the entry node, the entry node on the exit node)
@@ -152,6 +154,39 @@ setup_exit_routing() {
         || iptables -t mangle -A FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 }
 
+# A node that is not running a cascade has no monitor to hang anything off, so it
+# gets a small one: enough to notice that the interface died, and to follow the
+# torrent setting when the panel — or an operator with an editor — changes it.
+#
+# Shaped like the cascade's monitor: the setting is checked every second so an edit
+# applies in about that long, while the rules are reasserted and the counters
+# republished on the slower tick. Reading the counters means an `iptables-save` and
+# a handful of `jq` runs, which is not something to do every second for a page
+# nobody may be looking at.
+node_watch() {
+    local seen now next_tick=0
+    seen=$(torrent_config_mtime)
+    while :; do
+        kill -0 "$SERVER_PID" 2>/dev/null || return 0
+        now=$(date -u +%s)
+
+        if [ "$(torrent_config_mtime)" != "$seen" ]; then
+            seen=$(torrent_config_mtime)
+            log "the torrent setting changed on disk"
+            torrent_reload
+            torrent_write_state
+            next_tick=$((now + CASCADE_PROBE_INTERVAL))
+        elif [ "$now" -ge "$next_tick" ]; then
+            # Reasserted rather than assumed: a rule this container did not install
+            # can flush the table under it, and the guard has to survive that.
+            torrent_apply
+            torrent_write_state
+            next_tick=$((now + CASCADE_PROBE_INTERVAL))
+        fi
+        sleep 1
+    done
+}
+
 teardown() {
     local i
     log "shutting down"
@@ -161,6 +196,7 @@ teardown() {
         done
         uplinks_teardown
     fi
+    torrent_teardown
     ip link del "$AWG_IFACE" 2>/dev/null || true
     kill "${PIDS[@]}" 2>/dev/null || true
 }
@@ -176,8 +212,13 @@ do_run() {
 
     if [ "$AWG_ROLE" != "entry" ] || [ "$CASCADE_ENABLED" != "true" ]; then
         setup_exit_routing
+        # On an exit node the interface faces an entry node rather than a client,
+        # but the traffic on it is in the clear either way — and this is the last
+        # place it exists before it leaves under this server's own address, which
+        # is the address an abuse notice names.
+        torrent_tick
         log "node ready (role=${AWG_ROLE})"
-        wait -n "${PIDS[@]}"
+        node_watch
         log "an amneziawg-go process exited, stopping container"
         return
     fi
@@ -187,6 +228,7 @@ do_run() {
     uplinks_parse || die "CASCADE_ENABLED=true but the exit node list is unusable: ${CONFIG_ERROR}"
     direct_parse || true
     bypass_parse || true
+    torrent_parse || true
 
     uplinks_setup_all
     uplinks_routing_base
@@ -203,6 +245,7 @@ do_run() {
         uplinks_fallback
     fi
     uplinks_write_state
+    torrent_write_state
 
     log "node ready (role=entry, uplinks=$(uplink_count))"
     # The monitor stays in the foreground: it has to be the parent of every uplink

@@ -7,6 +7,7 @@ const routes = [
   { path: '/clients', name: 'clients', component: () => import('./views/ClientsView.vue') },
   { path: '/exit-nodes', name: 'exit-nodes', component: () => import('./views/ExitNodesView.vue') },
   { path: '/routing', name: 'routing', component: () => import('./views/RoutingView.vue') },
+  { path: '/torrents', name: 'torrents', component: () => import('./views/TorrentsView.vue') },
   { path: '/admins', name: 'admins', component: () => import('./views/AdminsView.vue') },
   { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },
   { path: '/:pathMatch(.*)*', redirect: '/' },

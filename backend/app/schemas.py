@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -483,6 +484,72 @@ class BypassList(BaseModel):
     editable: bool = True
     # Why the list on file is not the list in effect, if it is not.
     config_error: str | None = None
+
+
+class TorrentOffender(BaseModel):
+    """One client the guard has caught, and what it cost them.
+
+    The address comes from the node container, which knows nothing about clients;
+    the name is filled in here by matching it against the client table, which is
+    what turns "10.8.0.14 tried 4,000 times" into somebody to talk to.
+    """
+
+    address: str
+    name: str | None = None
+    client_id: int | None = None
+    # Packets dropped for this client since it was first caught.
+    packets: int = 0
+    # Seconds until it drops off this list if it stops. The list is a reporting
+    # window, not a penalty: nothing about a client is blocked for being on it.
+    expires_in: int = 0
+
+
+class TorrentCapabilities(BaseModel):
+    """Which of the kernel matches the filter is built on this host actually has.
+
+    Without ``string`` there is no signature layer at all and the guard degrades to
+    a port filter, which is worth knowing before trusting it.
+    """
+
+    string: bool = False
+    ipset: bool = False
+    connbytes: bool = False
+    comment: bool = False
+
+
+class TorrentStatus(BaseModel):
+    """Whether BitTorrent is being blocked in what this node forwards, and how well."""
+
+    enabled: bool = False
+    # 'on' blocks discovery, the peer wire and every address caught speaking it;
+    # 'strict' adds a default-deny egress port policy, which is what closes
+    # encrypted peer traffic on a port nothing else uses.
+    mode: str = "on"
+    # What the node container says it is doing, which can differ from the above
+    # while a change is being applied or when TORRENT_BLOCK overrides the file.
+    active: bool = False
+    active_mode: str | None = None
+    rules: int = 0
+    capabilities: TorrentCapabilities = TorrentCapabilities()
+    # Packets dropped per layer: dht, tracker, utp, handshake, pex, port, lsd, dns,
+    # metainfo, peer, strict-tcp, strict-udp — plus `total`.
+    blocked: dict[str, int] = {}
+    # Addresses caught speaking BitTorrent and blocked on sight since, which is what
+    # carries a block across a reconnection the filter can no longer read inside.
+    peers: int = 0
+    clients: list[TorrentOffender] = []
+    # False when the node container is not publishing this: it is down, or older
+    # than the feature.
+    live: bool = False
+    # False when the panel cannot change the switch.
+    editable: bool = True
+    # Why the setting on file is not the setting in force, if it is not.
+    config_error: str | None = None
+
+
+class TorrentUpdate(BaseModel):
+    enabled: bool | None = None
+    mode: Literal["on", "strict"] | None = None
 
 
 class PanelSshKey(BaseModel):

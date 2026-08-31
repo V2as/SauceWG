@@ -43,6 +43,8 @@ ROUTES_FILE="${CONFIG_DIR}/direct-routes.json"
 # setting has, and compose interpolates from this process's environment as well as
 # from the .env, so the two must not be able to collide.
 BYPASS_LIST_FILE="${CONFIG_DIR}/bypass.json"
+# Same reasoning as above: TORRENT_BLOCK_FILE is the container's own setting.
+TORRENT_SWITCH_FILE="${CONFIG_DIR}/torrent-block.json"
 
 JSON_OUTPUT=false
 ASSUME_YES=false
@@ -590,6 +592,14 @@ services:
       BYPASS_PORT: ${BYPASS_PORT:-8646}
       BYPASS_ATTEMPTS: ${BYPASS_ATTEMPTS:-96}
       BYPASS_PARALLEL: ${BYPASS_PARALLEL:-6}
+      # BitTorrent, blocked in what this node forwards, because a swarm sees the
+      # address of whichever server carries it out and a datacentre answers a
+      # copyright notice by suspending that server. Empty leaves the decision to
+      # the file the panel writes.
+      TORRENT_BLOCK: ${TORRENT_BLOCK:-}
+      TORRENT_BLOCK_FILE: ${TORRENT_BLOCK_FILE:-/etc/amnezia/host/torrent-block.json}
+      TORRENT_TCP_PORTS: ${TORRENT_TCP_PORTS:-}
+      TORRENT_UDP_PORTS: ${TORRENT_UDP_PORTS:-}
       CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
       CASCADE_PROBE_ENABLED: ${CASCADE_PROBE_ENABLED:-true}
       CASCADE_PROBE_TARGET: ${CASCADE_PROBE_TARGET:-1.1.1.1}
@@ -649,6 +659,7 @@ services:
       NODE_REGISTRY_FILE: ${NODE_REGISTRY_FILE:-/etc/saucewg/host/exit-nodes.json}
       ROUTES_REGISTRY_FILE: ${ROUTES_REGISTRY_FILE:-/etc/saucewg/host/direct-routes.json}
       BYPASS_REGISTRY_FILE: ${BYPASS_REGISTRY_FILE:-/etc/saucewg/host/bypass.json}
+      TORRENT_REGISTRY_FILE: ${TORRENT_REGISTRY_FILE:-/etc/saucewg/host/torrent-block.json}
       NODE_PROVISION_ENABLED: ${NODE_PROVISION_ENABLED:-true}
       NODE_DEFAULT_PORT: ${NODE_DEFAULT_PORT:-51820}
       NODE_SSH_TIMEOUT_SECONDS: ${NODE_SSH_TIMEOUT_SECONDS:-900}
@@ -739,9 +750,17 @@ services:
       AWG_PEER_PSK: ${AWG_PEER_PSK:-}
       AWG_PEER_ALLOWED_IPS: ${AWG_PEER_ALLOWED_IPS:-10.77.0.0/24}
       WAN_IFACE: ${WAN_IFACE:-}
+      TORRENT_BLOCK: ${TORRENT_BLOCK:-}
+      TORRENT_BLOCK_FILE: ${TORRENT_BLOCK_FILE:-/etc/amnezia/host/torrent-block.json}
+      TORRENT_TCP_PORTS: ${TORRENT_TCP_PORTS:-}
+      TORRENT_UDP_PORTS: ${TORRENT_UDP_PORTS:-}
     volumes:
       - awg-config:/etc/amnezia/amneziawg
       - awg-run:/var/run/amneziawg
+      # No panel on an exit node, so this only carries what saucewg.sh writes into
+      # it — which is what lets `saucewg torrents` change the setting here without
+      # recreating the container.
+      - ./config:/etc/amnezia/host:ro
 
 volumes:
   awg-config:
@@ -803,6 +822,9 @@ cmd_install() {
         printf '[]\n' > "$NODES_FILE"
         chmod 600 "$NODES_FILE"
     fi
+    # On from the start. A node that has never forwarded a torrent has nothing to
+    # lose by it, and the one that has is already the subject of a notice.
+    [ -f "$TORRENT_SWITCH_FILE" ] || torrent_switch_write true on
 
     step "Writing the configuration"
     if [ -z "$endpoint_host" ]; then
@@ -905,6 +927,19 @@ BYPASS_PORT=8646
 # dropped take under a second rather than ten.
 BYPASS_ATTEMPTS=96
 BYPASS_PARALLEL=6
+
+# BitTorrent, blocked in the traffic this node forwards. A swarm sees the address
+# of whichever server carries it out, and a datacentre answers a copyright notice
+# by suspending that server rather than by asking who was behind it. Leave this
+# empty and the switch lives in config/torrent-block.json, which is what the panel
+# and `saucewg torrents` write; off, on or strict here pins it and takes the switch
+# out of the UI.
+TORRENT_BLOCK=
+TORRENT_BLOCK_FILE=/etc/amnezia/host/torrent-block.json
+# What strict mode still allows out. Empty means the built-in lists.
+TORRENT_TCP_PORTS=
+TORRENT_UDP_PORTS=
+
 CASCADE_PROBE_ENABLED=true
 CASCADE_PROBE_TARGET=1.1.1.1
 CASCADE_PROBE_INTERVAL=10
@@ -932,6 +967,7 @@ SUBSCRIPTION_URL_PREFIX=
 NODE_REGISTRY_FILE=/etc/saucewg/host/exit-nodes.json
 ROUTES_REGISTRY_FILE=/etc/saucewg/host/direct-routes.json
 BYPASS_REGISTRY_FILE=/etc/saucewg/host/bypass.json
+TORRENT_REGISTRY_FILE=/etc/saucewg/host/torrent-block.json
 NODE_PROVISION_ENABLED=true
 NODE_DEFAULT_PORT=51820
 NODE_SSH_TIMEOUT_SECONDS=900
@@ -1141,8 +1177,21 @@ AWG_PEER_PUBLIC_KEY=${peer_key}
 AWG_PEER_PSK=${psk}
 AWG_PEER_ALLOWED_IPS=${peer_allowed}
 WAN_IFACE=
+
+# BitTorrent, blocked in the traffic this node forwards. This is the server a
+# swarm sees and the one a datacentre suspends over a copyright notice. Empty
+# takes the setting from config/torrent-block.json instead, which is what
+# \`saucewg torrents\` writes and what applies without recreating the container.
+TORRENT_BLOCK=
+TORRENT_BLOCK_FILE=/etc/amnezia/host/torrent-block.json
+TORRENT_TCP_PORTS=
+TORRENT_UDP_PORTS=
 EOF
         chmod 600 "$ENV_FILE"
+        mkdir -p "$CONFIG_DIR"
+        # This is the address a swarm sees and the one a datacentre suspends, so
+        # the guard is on before the node has carried anything.
+        [ -f "$TORRENT_SWITCH_FILE" ] || torrent_switch_write true on
         write_exit_compose
         install_cli
     fi
@@ -2123,6 +2172,145 @@ bypass_edit() {
 }
 
 # ---------------------------------------------------------------------------
+# Torrents
+# ---------------------------------------------------------------------------
+#
+# A swarm sees the address of whichever server carries a client's traffic out, and
+# a datacentre answers a copyright notice by suspending that server rather than by
+# asking who was behind it. One client seeding for an evening costs the node and
+# every other client on it — which is why this is a switch on the node rather than
+# a policy for an operator to enforce by asking.
+#
+# It applies on an exit node as well as an entry node: what arrives over an uplink
+# is still in the clear on the far side, and the exit node is the address that ends
+# up in the notice.
+
+torrent_switch_read() {
+    [ -f "$TORRENT_SWITCH_FILE" ] \
+        && jq -c '{enabled: (.enabled != false), mode: (.mode // "on")}' "$TORRENT_SWITCH_FILE" 2>/dev/null \
+        || printf '{"enabled":false,"mode":"on"}'
+}
+
+torrent_switch_write() {
+    local enabled=$1 mode=$2
+    mkdir -p "$CONFIG_DIR"
+    jq -n --argjson enabled "$enabled" --arg mode "$mode" \
+        '{enabled: $enabled, mode: $mode}' > "${TORRENT_SWITCH_FILE}.tmp"
+    mv "${TORRENT_SWITCH_FILE}.tmp" "$TORRENT_SWITCH_FILE"
+    chmod 600 "$TORRENT_SWITCH_FILE"
+}
+
+# What the node container installed, which is the answer that matters: the file
+# only records what was asked for.
+torrent_state() {
+    compose exec -T awg cat /var/run/amneziawg/torrents.json 2>/dev/null || true
+}
+
+cmd_torrents() {
+    require_installed
+    local action="${1:-}"
+    case "$action" in
+        on|strict|off) shift; torrent_set_mode "$action" "$@"; return ;;
+        "") ;;
+        -*) die "unknown option for torrents: $action" ;;
+        *) die "torrents takes on, strict or off" ;;
+    esac
+
+    local configured pinned state live=false
+    configured=$(torrent_switch_read)
+    pinned=$(env_get "$ENV_FILE" TORRENT_BLOCK || true)
+    state=$(torrent_state)
+    printf '%s' "$state" | jq -e 'has("mode")' >/dev/null 2>&1 && live=true
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        # A container that did not answer leaves `state` empty, and jq passes empty
+        # input through as no output at all rather than as a failure — so the null
+        # has to be substituted here rather than fallen back to.
+        [ "$live" = true ] || state=null
+        printf '%s' "$configured" | jq --argjson live "$live" --arg pinned "$pinned" \
+            --argjson state "$(printf '%s' "$state" | jq -c '.')" '
+            . + {live: $live, node: $state,
+                 pinned: (if $pinned == "" then null else $pinned end)}'
+        return
+    fi
+
+    local want
+    want=$(printf '%s' "$configured" | jq -r 'if .enabled then .mode else "off" end')
+    [ -z "$pinned" ] || want=$pinned
+
+    note "torrents  ${want}"
+    case "$want" in
+        off)    note "          BitTorrent is forwarded like anything else" ;;
+        on)     note "          peer discovery and the peer wire are blocked, and caught peers blacklisted" ;;
+        strict) note "          the same, plus outbound TCP and UDP only to the ports a service answers on" ;;
+    esac
+    [ -z "$pinned" ] \
+        || warn "TORRENT_BLOCK=${pinned} is set in .env, so the panel's switch is ignored"
+
+    if [ "$live" = false ]; then
+        warn "the node container did not answer, so nothing below is confirmed"
+        return
+    fi
+
+    printf '%s' "$state" | jq -r '
+        "          " + (if .active then "in force on \(.iface) with \(.rules) rule(s)"
+                        else "not installed on the node right now" end)
+        + (if (.peers // 0) > 0 then "\n          \(.peers) peer address(es) blacklisted" else "" end)
+        + (if (.blocked.total // 0) > 0 then "\n          \(.blocked.total) packet(s) dropped" else "" end)
+        # `// true` would read a kernel that has no string match as one that does:
+        # in jq, false is empty and the alternative wins. The node reports the same
+        # thing in .error, so this only speaks when something worse has crowded it out.
+        + (if .capabilities.string == false and ((.error // "") | test("string") | not)
+           then "\n          this kernel has no string match, so only the port rules are in force"
+           else "" end)' >&2
+
+    local caught
+    caught=$(printf '%s' "$state" | jq -r '.clients | length')
+    if [ "${caught:-0}" -gt 0 ]; then
+        printf '\n' >&2
+        printf '%s' "$state" | jq -r '
+            "CLIENT\tPACKETS\tEXPIRES IN",
+            (.clients[] | "\(.address)\t\(.packets)\t\(.expires_in)s")' \
+            | column -t -s "$(printf '\t')" >&2
+    fi
+
+    printf '%s' "$state" | jq -r '.error // ""' | grep . | while read -r line; do
+        warn "$line"
+    done
+}
+
+torrent_set_mode() {
+    local mode=$1
+    shift
+    [ $# -eq 0 ] || die "unknown option for torrents ${mode}: $1"
+    need_root "torrents ${mode}"
+
+    local pinned
+    pinned=$(env_get "$ENV_FILE" TORRENT_BLOCK || true)
+    [ -z "$pinned" ] \
+        || die "TORRENT_BLOCK=${pinned} is set in .env and overrides this. Clear it first."
+
+    # The mode is kept even while the guard is off, so turning it back on returns to
+    # the mode that was chosen rather than to the default.
+    local keep
+    keep=$(torrent_switch_read | jq -r .mode)
+    case "$mode" in
+        off) torrent_switch_write false "$keep" ;;
+        *)   torrent_switch_write true "$mode" ;;
+    esac
+    log "torrent blocking set to ${mode}"
+    [ "$mode" != strict ] \
+        || note "strict refuses outbound ports nothing answers on, which also breaks a VPN run inside the tunnel"
+
+    # No reload to request and nothing to batch: this is one switch rather than a
+    # list, and the node container watches the file on every role. It picks the
+    # change up on its next second and applies it without touching a tunnel.
+    note "the node applies it within a second"
+
+    [ "$JSON_OUTPUT" = false ] || jq -n --arg mode "$mode" '{ok: true, torrents: $mode}'
+}
+
+# ---------------------------------------------------------------------------
 # AmneziaWG generation
 # ---------------------------------------------------------------------------
 
@@ -2419,10 +2607,32 @@ cmd_update() {
             note "while every exit node is down, clients now leave through this entry node instead of being cut off"
             note "  keep the old behaviour with: saucewg fallback block"
         fi
+
+        grep -q '^TORRENT_REGISTRY_FILE=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" TORRENT_REGISTRY_FILE /etc/saucewg/host/torrent-block.json
     else
         write_exit_compose
         env_set "$ENV_FILE" IMAGE_AWG "$(image_ref awg)"
         env_set "$ENV_FILE" SAUCEWG_TAG "$IMAGE_TAG"
+        # The exit compose file gained a bind mount for this directory, and docker
+        # would otherwise create it root-owned on first start.
+        mkdir -p "$CONFIG_DIR"
+    fi
+
+    grep -q '^TORRENT_BLOCK_FILE=' "$ENV_FILE" \
+        || env_set "$ENV_FILE" TORRENT_BLOCK_FILE /etc/amnezia/host/torrent-block.json
+    grep -q '^TORRENT_BLOCK=' "$ENV_FILE" || env_set "$ENV_FILE" TORRENT_BLOCK ""
+
+    # One client seeding is a copyright notice and a suspended server, and the
+    # server it names is whichever one carried the traffic out — so this arrives on
+    # by default rather than as something to discover after losing a node. It is the
+    # standard mode, which blocks BitTorrent and nothing else; `strict` is a wider
+    # trade and stays opt-in.
+    if [ ! -f "$TORRENT_SWITCH_FILE" ]; then
+        mkdir -p "$CONFIG_DIR"
+        torrent_switch_write true on
+        note "BitTorrent is now blocked in the traffic this node forwards"
+        note "  see what it catches, or turn it off, with: saucewg torrents"
     fi
 
     # An installation from before generations were named is serving 1.0 clients right
@@ -2656,6 +2866,12 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
                              (--v6 ADDR names its IPv6, --disable turns a built-in off)
     bypass remove CIDR…      Stop reopening it (--note GROUP removes a group)
 
+  Torrents (any node)
+    torrents                 Whether BitTorrent is blocked here, and what was caught
+    torrents on              Block peer discovery, the peer wire and caught peers
+    torrents strict          The same, plus outbound only to ports a service answers on
+    torrents off             Forward it like anything else
+
   Exit node
     node-info                Print this node's pairing object
     node-pair --peer-key K   Install the entry node's uplink key here
@@ -2735,6 +2951,7 @@ main() {
     NODES_FILE="${CONFIG_DIR}/exit-nodes.json"
     ROUTES_FILE="${CONFIG_DIR}/direct-routes.json"
     BYPASS_LIST_FILE="${CONFIG_DIR}/bypass.json"
+    TORRENT_SWITCH_FILE="${CONFIG_DIR}/torrent-block.json"
 
     set -- ${args[@]+"${args[@]}"}
 
@@ -2763,6 +2980,7 @@ main() {
         remove-route)     cmd_remove_route "$@" ;;
         fallback)         cmd_fallback "$@" ;;
         bypass)           cmd_bypass "$@" ;;
+        torrents|torrent) cmd_torrents "$@" ;;
         node-info)        cmd_node_info "$@" ;;
         node-pair)        cmd_node_pair "$@" ;;
         protocol)         cmd_protocol "$@" ;;

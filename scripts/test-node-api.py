@@ -30,6 +30,7 @@ import httpx  # noqa: E402
 
 from app.awg import registry  # noqa: E402
 from app.config import settings  # noqa: E402
+from app.db import get_session  # noqa: E402
 from app.deps import get_current_admin, get_sudo_admin  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services import recovery  # noqa: E402
@@ -44,13 +45,45 @@ class FakeAdmin:
     is_active = True
 
 
+class FakeClient:
+    """A row of the client table, for the endpoints that put a name to an address."""
+
+    def __init__(self, client_id: int, name: str, address: str) -> None:
+        self.id = client_id
+        self.name = name
+        self.address = address
+
+
+class FakeSession:
+    """Enough of an AsyncSession to answer `select(Client)` without a database."""
+
+    rows: list[FakeClient] = []
+
+    async def execute(self, *_args, **_kwargs):
+        rows = self.rows
+
+        class Result:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return rows
+
+        return Result()
+
+
+session_stub = FakeSession()
+
 app.dependency_overrides[get_current_admin] = lambda: FakeAdmin()
 app.dependency_overrides[get_sudo_admin] = lambda: FakeAdmin()
+app.dependency_overrides[get_session] = lambda: session_stub
 
 workdir = tempfile.mkdtemp(prefix="saucewg-nodes-")
 settings.node_registry_file = os.path.join(workdir, "exit-nodes.json")
 settings.routes_registry_file = os.path.join(workdir, "direct-routes.json")
 settings.bypass_registry_file = os.path.join(workdir, "bypass.json")
+settings.torrent_registry_file = os.path.join(workdir, "torrent-block.json")
+# torrent_state_file follows awg_socket_dir, the same way uplink_state_file does.
 settings.awg_socket_dir = workdir
 # Where the node container would persist the entry interface's profile.
 settings.awg_config_dir = workdir
@@ -619,6 +652,99 @@ async def main() -> None:
         check("the panel says which one is in charge", "BYPASS_ROUTES" in (body["config_error"] or ""), body)
         response = await client.post("/api/bypass", json={"cidr": ["9.9.9.9"]})
         check("and refuses writes that would not take effect", response.status_code == 409, response.text)
+
+        print("the torrent guard")
+
+        def caught(state: dict | None) -> None:
+            """Writes torrents.json the way the node container would, or removes it."""
+            if state is None:
+                if os.path.exists(settings.torrent_state_file):
+                    os.unlink(settings.torrent_state_file)
+                return
+            with open(settings.torrent_state_file, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "updated_at": time.time(), "mode": "on", "source": "file",
+                    "iface": "awg0", "active": True, "rules": 61,
+                    "capabilities": {"string": True, "ipset": True,
+                                     "connbytes": True, "comment": True},
+                    "blocked": {"total": 0}, "peers": 0, "clients": [], "error": None,
+                } | state, handle)
+
+        caught(None)
+        body = (await client.get("/api/torrents")).json()
+        check("a node that has never been asked forwards torrents", body["enabled"] is False, body)
+        check("with the standard mode ready to be chosen", body["mode"] == "on", body)
+        check("nothing is claimed about a container that is not answering", body["live"] is False, body)
+        check("and that is not an error in itself", body["config_error"] is None, body)
+
+        response = await client.put("/api/torrents", json={"enabled": True})
+        check("the guard can be switched on", response.status_code == 200, response.text)
+        check("and it comes back on", response.json()["enabled"] is True, response.text)
+        with open(settings.torrent_registry_file, encoding="utf-8") as handle:
+            written = json.load(handle)
+        check("the file is the shape the container parses", written == {"enabled": True, "mode": "on"}, written)
+
+        response = await client.put("/api/torrents", json={"mode": "strict"})
+        check("the dial moves on its own", response.json()["mode"] == "strict", response.text)
+        check("without turning the switch off", response.json()["enabled"] is True, response.text)
+
+        # The switch and the dial are separate controls precisely so that this does
+        # not silently drop an operator back to the standard mode.
+        response = await client.put("/api/torrents", json={"enabled": False})
+        check("switching off keeps the mode that was chosen", response.json()["mode"] == "strict", response.text)
+        check("while the guard is down", response.json()["enabled"] is False, response.text)
+        await client.put("/api/torrents", json={"enabled": True})
+
+        response = await client.put("/api/torrents", json={"mode": "paranoid"})
+        check("a mode the container has no rules for is refused", response.status_code == 422, response.text)
+
+        print("what the guard caught")
+        session_stub.rows = [
+            FakeClient(7, "andrey-laptop", "10.8.0.14/32"),
+            FakeClient(9, "spare-phone", "10.8.0.9/32"),
+        ]
+        caught({
+            "mode": "strict", "rules": 61, "peers": 1842,
+            "blocked": {"dht": 9100, "utp": 4400, "tracker": 130, "total": 13630},
+            "clients": [
+                {"address": "10.8.0.14", "packets": 12800, "expires_in": 84000},
+                {"address": "10.8.0.99", "packets": 40, "expires_in": 3600},
+            ],
+        })
+        body = (await client.get("/api/torrents")).json()
+        check("the container's own reading is published", body["live"] is True, body)
+        check("with the mode it is actually running", body["active_mode"] == "strict", body)
+        check("and how many rules that took", body["rules"] == 61, body)
+        check("the layers are reported one by one", body["blocked"]["dht"] == 9100, body)
+        check("the blacklist is a number an operator can read", body["peers"] == 1842, body)
+        check("a caught client is named, not just numbered", body["clients"][0]["name"] == "andrey-laptop", body)
+        check("with the client the panel can act on", body["clients"][0]["client_id"] == 7, body)
+        check("and what it cost them", body["clients"][0]["packets"] == 12800, body)
+        # An address with no client behind it is somebody's own device on the
+        # subnet, or a client deleted since. It is still worth showing.
+        check("an unknown address is still listed", body["clients"][1]["name"] is None, body)
+        check("nothing is wrong with any of it", body["config_error"] is None, body)
+
+        print("when the kernel cannot do what was asked")
+        caught({"capabilities": {"string": False, "ipset": True, "connbytes": True, "comment": True}})
+        body = (await client.get("/api/torrents")).json()
+        check("a missing string match is not left to be discovered", "xt_string" in (body["config_error"] or ""), body)
+        check("and the panel says what still works", "port rules" in (body["config_error"] or ""), body)
+
+        caught({"error": "the torrent rules are installed but nothing is being sent through them"})
+        body = (await client.get("/api/torrents")).json()
+        check("a ladder nothing walks through is reported", "nothing is being sent" in (body["config_error"] or ""), body)
+
+        print("when the environment overrides the switch")
+        caught({"source": "env", "mode": "strict"})
+        body = (await client.get("/api/torrents")).json()
+        check("the panel says which one is in charge", "TORRENT_BLOCK" in (body["config_error"] or ""), body)
+        response = await client.put("/api/torrents", json={"enabled": False})
+        check("and refuses a write that would not take effect", response.status_code == 409, response.text)
+
+        caught(None)
+        session_stub.rows = []
+        os.unlink(settings.torrent_registry_file)
 
         print("putting a failed exit node back")
 

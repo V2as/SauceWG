@@ -25,6 +25,12 @@ node can reopen it for itself: over the destination's IPv6, which the same filte
 usually do not touch, or by retrying its IPv4 until one handshake survives. Telegram's
 datacentres ship as a built-in group, because that is what this exists for today.
 
+What the nodes will not carry is BitTorrent. A swarm sees the address of whichever
+server takes a client's traffic out, and a datacentre answers the copyright notice that
+follows by suspending that server — so one client seeding costs every client on it. Peer
+discovery, the peer wire and every address caught speaking either are blocked on the
+forwarding path, on by default, with a switch in the panel.
+
 ```
    client                 entry node (unblocked IP)                exit nodes
  ┌────────┐  AmneziaWG   ┌───────────────────────┐  awg1  ┌──────────────┐
@@ -281,6 +287,7 @@ curl -H "Authorization: Bearer $TOKEN" http://<host>/api/clients
 | `PUT/DELETE` | `/api/routes/{cidr}` | relabel or disable one / put it back on the cascade |
 | `GET/POST` | `/api/bypass` | destinations the entry node reopens for itself / add some |
 | `PUT/DELETE` | `/api/bypass/{cidr}` | change its IPv6 counterpart or disable it / remove it |
+| `GET/PUT` | `/api/torrents` | whether BitTorrent is blocked here, what it caught / switch it |
 | `GET` | `/api/system` | host stats, client counts, live speed, cascade state |
 | `GET` | `/api/system/usage?hours=` | node-wide traffic history |
 | `POST` | `/api/system/sync` | force peer reconciliation |
@@ -567,6 +574,108 @@ Four things to know:
 `BYPASS_ROUTES` puts the list in the environment, with the same precedence and the same
 read-only consequence for the panel as the other two lists.
 
+## Blocking BitTorrent
+
+A swarm sees the address of whichever server carries a client's traffic out, and a
+datacentre answers a copyright notice by suspending that server rather than by asking
+who was behind it. One client seeding for an evening is the whole node gone and every
+other client on it with it — which is why this is on by default, and why it is a switch
+rather than a list.
+
+There is nothing to list. Peers are discovered at runtime and the connection to them is
+encrypted from its first byte by MSE, so any set of addresses or ports is out of date
+before it is saved. What cannot change is the protocol, and the block is built on the
+parts of it no client can drop and still work.
+
+It runs on the forwarding path of the node, in `mangle/FORWARD` — the one place a
+client's traffic exists as plain IP, after AmneziaWG has decrypted what the client sent
+and before anything is re-encrypted into an uplink. The same code runs on an exit node,
+where the interface faces an entry node instead of a client.
+
+```bash
+saucewg torrents                     # what is blocked here, and what has been caught
+saucewg torrents strict              # add the egress port policy
+saucewg torrents off                 # forward it like anything else
+```
+
+Or the **Torrents** page in the panel, which is the same switch and adds who has been
+tripping it.
+
+### The layers
+
+*Discovery* — finding the peers of a swarm — cannot be encrypted, because the two ends
+have nothing to derive a key from yet. Killing it means a client never learns an address
+to talk to and, just as importantly, the swarm never learns this node's: a monitoring
+peer cannot see an address that never announced.
+
+| Layer | Matched on |
+| --- | --- |
+| DHT | the bencoded KRPC preamble (`d1:ad2:id20:`) and the query names — BEP 5 |
+| Trackers | the UDP protocol's fixed connection id `0x41727101980`, and `info_hash=` / `peer_id=` in an HTTP announce — BEP 15 and BEP 3 |
+| Local discovery | `BT-SEARCH` sent somewhere routable — BEP 14 |
+| Tracker lookups | DNS queries for the bootstrap and tracker names clients fall back to |
+
+*The peer wire* is the hard half, and two things are done about it. uTP — what a modern
+client opens with before MSE starts — is a 20-byte header in a 48-byte datagram whose
+first byte is fixed, so it is matched by shape and never gets as far as being encrypted.
+And every address caught speaking any part of the protocol goes into an ipset for an
+hour, so the *next* connection to that peer is dropped without being inspected, encrypted
+or not. That is what carries a block across a reconnection nothing can read inside.
+
+| Layer | Matched on |
+| --- | --- |
+| uTP | a 48-byte datagram whose payload starts `41 00` or `41 01` — BEP 29 |
+| Peer handshakes | `0x13` + `"BitTorrent protocol"` — BEP 3 |
+| Peer exchange | `ut_pex`, `ut_metadata`, `ut_holepunch` in the extension handshake — BEP 10 |
+| Known peers | an address already caught, whatever it is speaking now |
+| Default ports | 6881–6889, 6969, 51413 |
+| `.torrent` files | `application/x-bittorrent` and `d8:announce` on the way back |
+
+What is left after that is one case: a TCP/MSE connection to an address the client
+already knew, on a port nothing else uses. `strict` closes it, by refusing outbound TCP
+and UDP except to the ports real services answer on. That is a general egress policy
+rather than a torrent signature, which is exactly why it is a separate mode — it is the
+only layer here that can inconvenience somebody who was not torrenting, and it will
+break a VPN a client runs inside the tunnel. That last part is deliberate: a tunnel
+inside the tunnel would carry torrents where nothing downstream could ever see them.
+
+The two halves are complementary rather than redundant. The port policy catches what
+has no signature; the signatures catch what is on an allowed port. A client configured
+to run uTP and DHT over UDP/443 to hide inside QUIC defeats the port policy and walks
+straight into the shape and bencode rules, which never look at a port.
+
+`TORRENT_TCP_PORTS` and `TORRENT_UDP_PORTS` are the allowlist `strict` enforces. 500,
+4500 and 51820 are absent on purpose, for the reason above.
+
+### What it costs, and what it reports
+
+Every rule is bounded: the string matches only run over the first 32 packets of a
+connection, because everything they can match is in the opening exchange and scanning
+further would pay for bytes that cannot match. On a userspace tunnel that bound is the
+difference between a filter and a bottleneck.
+
+Each rule carries a comment naming its layer, which is where the per-layer counters on
+the panel come from — read straight off `iptables-save -c` rather than kept in a file.
+The addresses caught are reported too, joined to client names, so the answer to "who is
+torrenting" is a person to talk to rather than an IP. Nothing about a client on that
+list is blocked for being on it; it is a reporting window, kept for a day.
+
+Turning the guard on drops the conntrack entries for client traffic, so a torrent
+running at that moment stops rather than finishing — the handshake it would have been
+identified by is already in the past.
+
+The node probes its own kernel for `xt_string`, `ipset`, `connbytes` and `comment`, and
+publishes what it found. Without `xt_string` there is no signature layer at all and the
+guard degrades to a port filter; the panel says so rather than letting it be discovered
+later. Everything the kernel does support is still installed — a rule it refuses is
+skipped and counted, never fatal.
+
+`TORRENT_BLOCK=off|on|strict` pins the setting in the environment and takes the switch
+away from the panel, the same way `CASCADE_NODES_JSON` does for the node list. Left
+empty — the default — the setting comes from `config/torrent-block.json`, which the
+panel and `saucewg torrents` write and the node container applies within a second
+without disturbing a tunnel.
+
 ## Monitoring
 
 The collector polls the device every `COLLECTOR_INTERVAL_SECONDS` and:
@@ -661,6 +770,13 @@ workflow does.
   container's, because the credentials for it are the panel's. The two do not
   coordinate: failover moves clients within 30 seconds regardless of whether recovery
   is running, or enabled, or getting anywhere.
+- **The torrent guard** lives in `mangle`, not `filter`. Client traffic in
+  `filter/FORWARD` is a set of ACCEPT rules that the failover monitor inserts at
+  position 1 whenever a path appears, so a rule placed there would be jumped over the
+  moment an exit node was added. `mangle/FORWARD` is traversed before `filter` in its
+  entirety, which makes the ordering a property of the kernel rather than of who wrote
+  a rule last. It is IPv4-only because only IPv4 is carried: the tunnel interfaces come
+  up with `ip -4 address` and have no IPv6 address to forward from.
 - **Performance.** Both hops run the userspace `amneziawg-go`, which is CPU-bound. On a
   2-core VPS expect tens of Mbit/s per node. Installing the AmneziaWG kernel module on the
   host and pointing `WG_QUICK_USERSPACE_IMPLEMENTATION` at it is the usual next step if you
@@ -676,10 +792,11 @@ saucewg.sh        installer and service CLI; also the /usr/local/bin/saucewg com
 backend/          FastAPI service (app/awg = UAPI client, app/services = workers)
 frontend/         Vue 3 + Vite single-page UI
 docker/awg/       AmneziaWG node image: entrypoint, generations, uplinks + failover monitor
+docker/awg/torrents.sh  the layered BitTorrent filter, and what it publishes about itself
 docker/awg/bypass/  awg-bypass, the transparent relay for reopened destinations (Go)
 docker/caddy/     frontend build + Caddy reverse proxy image
 scripts/          bootstrap helpers, the exit node list manager, CI test harnesses
-config/           exit-nodes.json, direct-routes.json and bypass.json, bind-mounted into the node
+config/           the four lists the panel and the node share, bind-mounted into the node
 .github/workflows/  CI checks and the Docker Hub publish pipeline
 AWG_USAGE.md      integration reference for managing users from a central API
 SAUCEWG_USAGE.md  installing and managing servers, from a shell or a bot

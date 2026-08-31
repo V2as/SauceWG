@@ -809,7 +809,114 @@ entry node is `saucewg bypass`, `saucewg bypass add` and `saucewg bypass remove`
 
 ---
 
-## 9. Node information
+## 9. Blocking BitTorrent
+
+Torrent traffic is the one thing that gets a server taken away rather than throttled: a
+swarm sees the address of whichever node carries a client out, and a datacentre answers
+the copyright notice by suspending that server rather than by asking who was behind it.
+One client seeding for an evening is every client on that node disconnected. So the node
+blocks it, on by default, and this is the switch and the report.
+
+```http
+GET /api/torrents            # what is blocked here, and what it caught
+PUT /api/torrents            # turn it on or off, or change the mode
+```
+
+```json
+{
+  "enabled": true,
+  "mode": "on",
+  "active": true,
+  "active_mode": "on",
+  "rules": 61,
+  "capabilities": { "string": true, "ipset": true, "connbytes": true, "comment": true },
+  "blocked": { "dht": 9100, "utp": 4400, "tracker": 130, "peer": 88, "total": 13630 },
+  "peers": 1842,
+  "clients": [
+    { "address": "10.8.0.14", "name": "andrey-laptop", "client_id": 7,
+      "packets": 12800, "expires_in": 84000 }
+  ],
+  "live": true,
+  "editable": true,
+  "config_error": null
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `enabled` | the switch, as configured here |
+| `mode` | `on` or `strict`, as configured here. **Kept while `enabled` is false**, so switching off and on again returns to the mode that was chosen |
+| `active` | the node container has the rules installed right now |
+| `active_mode` | the mode it is actually running, which differs from `mode` for the second or two after a change, and permanently when `TORRENT_BLOCK` overrides the file |
+| `rules` | how many iptables rules that took, a useful sanity check on a degraded kernel |
+| `capabilities` | which kernel matches this host has — see below |
+| `blocked` | packets dropped per layer since the node last started, plus `total`. Read off the rules themselves, so it resets when the container does |
+| `peers` | addresses currently blacklisted for having spoken the protocol |
+| `clients` | who tripped it, most persistent first, capped at 50 |
+| `live` | `false` when the node container is not publishing this — it is stopped, or older than this feature. Everything above it is then unconfirmed |
+| `editable` | `false` when the panel is not the one in charge |
+| `config_error` | why what is configured is not what is in force, or `null` |
+
+`clients[].name` and `client_id` are filled in by matching the address the container saw
+against the client table, so the answer to "who is torrenting" is somebody to talk to
+rather than an IP. They are `null` for an address with no current client behind it — a
+device on the subnet, or a client deleted since. **Nothing on this list is blocked for
+being on it**: it is a reporting window, kept for a day, and a large `packets` is a
+torrent client nobody has told to stop, retrying peers it will never reach.
+
+`blocked` is keyed by layer, and which keys appear depends on the mode and the kernel:
+`dht`, `tracker`, `lsd`, `dns` (peer discovery), `utp`, `handshake`, `pex`, `peer`,
+`port` (the peer wire), `metainfo` (a `.torrent` file on its way back), and
+`strict-tcp` / `strict-udp` in strict mode. `total` excludes the pass-through rules, so
+it counts what died rather than what was inspected. Treat unknown keys as additive.
+
+**The two modes:**
+
+| `mode` | What it does |
+| --- | --- |
+| `on` | blocks peer discovery on protocol signatures, matches peer connections by the shape of their opening packet before MSE encrypts anything, and blacklists every address caught speaking either for an hour |
+| `strict` | the same, plus outbound TCP and UDP refused except to the ports real services answer on |
+
+`strict` exists as a separate mode because it is the only layer that can inconvenience
+somebody who was not torrenting: it closes the one case signatures cannot see — an
+encrypted connection to an address the client already knew, on a port nothing else uses
+— and in doing so breaks anything on a port nobody named, including a VPN a client runs
+inside the tunnel. That last part is deliberate, since such a tunnel would carry
+torrents where nothing downstream could see them. Warn the user before offering it.
+
+```http
+PUT /api/torrents
+{ "enabled": true }        # both fields optional and independent
+{ "mode": "strict" }       # changes the dial without touching the switch
+```
+
+A `mode` outside `on|strict` is a `422`. Writes answer `409` when the switch is not the
+panel's to change: `NODE_PROVISION_ENABLED=false`, or a `TORRENT_BLOCK` environment
+variable pinning it. Both are reported in `config_error` on the `GET` as well, so a UI
+can disable the control rather than discover it on submit.
+
+**`capabilities` is worth checking once per node.** The filter is built on iptables
+match extensions, and a host without them silently gets less than was asked for. The
+node probes for each and publishes what it found:
+
+| Key | Missing means |
+| --- | --- |
+| `string` | **no signature layer at all** — the guard degrades to a port filter, which stops a default client and nothing more. `config_error` says so |
+| `ipset` | a caught address is not remembered, so an encrypted reconnection to a known peer is judged on its own and gets through |
+| `connbytes` | every packet of a connection is scanned rather than the first 32, which costs throughput but blocks the same |
+| `comment` | the per-layer `blocked` counters are unavailable; `total` still works |
+
+A rule the kernel refuses is skipped and counted rather than being fatal, so a partial
+kernel still gets whatever it can support.
+
+Changes apply within about a second and disturb no tunnel. Turning the guard on also
+drops the conntrack entries for client traffic, so a torrent already running stops
+rather than finishing — its handshake is in the past and there would be nothing left to
+match. The equivalent on the entry node itself is `saucewg torrents`.
+
+---
+
+## 10. Node information
 
 ```http
 GET /api/system
@@ -877,7 +984,7 @@ as a liveness probe.
 
 ---
 
-## 10. Errors
+## 11. Errors
 
 FastAPI's shape throughout:
 
@@ -904,7 +1011,7 @@ Restrict `CORS_ORIGINS` too — it defaults to `*`.
 
 ---
 
-## 11. Integration recipes
+## 12. Integration recipes
 
 **Provision a user**
 
@@ -974,7 +1081,7 @@ must not block operations on the others.
 
 ---
 
-## 12. Configuration reference
+## 13. Configuration reference
 
 Values the central system may need to know about, set in the entry node's `.env`.
 
@@ -998,6 +1105,8 @@ Values the central system may need to know about, set in the entry node's `.env`
 | `BYPASS_GROUPS` | `telegram` | built-in destination tables in force; empty ships none |
 | `BYPASS_ROUTES` | — | prefixes to reopen, overriding the file and making §8 read-only |
 | `BYPASS_ATTEMPTS` / `BYPASS_PARALLEL` | 96 / 6 | the retry path's handshake budget per connection, and how many of them are outstanding at once |
+| `TORRENT_BLOCK` | — | `off`, `on` or `strict` pins the torrent guard of §9 and makes it read-only through the API; empty leaves the switch to the panel |
+| `TORRENT_TCP_PORTS` / `TORRENT_UDP_PORTS` | see §9 | the ports `strict` leaves open. Adding 500, 4500 or 51820 lets a client run its own VPN out of the tunnel, and torrent inside that |
 | `NODE_PROVISION_ENABLED` | `true` | `false` makes the cascade read-only through the API — see [`SAUCEWG_USAGE.md` §6](SAUCEWG_USAGE.md#6-files-on-the-server) |
 | `NODE_RECOVERY_ENABLED` | `true` | whether the panel tries to restart a failed exit node on its own, as in §6 |
 | `NODE_RECOVERY_GRACE_SECONDS` | `300` | how long a node must be unhealthy before the first attempt |
@@ -1006,7 +1115,7 @@ Values the central system may need to know about, set in the entry node's `.env`
 
 ---
 
-## 13. Things that will surprise you
+## 14. Things that will surprise you
 
 * **`name` is the primary key in the API.** Renaming a client changes every URL. Use
   immutable IDs from your system as names.
@@ -1032,6 +1141,16 @@ Values the central system may need to know about, set in the entry node's `.env`
   `cooled` alongside it: that is the relay having recognised them and stopped paying for
   them. What is worth alerting on is `via_v6` and `via_retry` both flat while `accepted`
   climbs.
+* **The torrent guard is on by default,** on a new installation and on an updated one.
+  It is a switch rather than a policy you opt into because the failure it prevents is
+  the loss of the server, not a bill.
+* **Its counters reset when the node container restarts.** They are read off the
+  iptables rules, which are rebuilt at startup. Treat `blocked` as a gauge since boot,
+  not as a total, and take differences rather than absolutes.
+* **`mode` survives being switched off.** `{"enabled": false}` does not reset it to
+  `on`, so a UI that sends the mode alongside every toggle will fight the panel.
+* **Check `capabilities.string` once per node.** Without it the guard is a port filter
+  and nothing more, which is not what the switch being green implies.
 * **Failover does not repair.** A failed exit node stays failed until the panel's
   recovery gets it back or an operator does. `recovery.blocked == "unreachable"` is the
   one that needs a human: that server is not answering at all.

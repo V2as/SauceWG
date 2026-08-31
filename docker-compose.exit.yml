@@ -49,9 +49,21 @@ services:
       # accepting the whole range keeps one exit image usable for any slot.
       AWG_PEER_ALLOWED_IPS: ${AWG_PEER_ALLOWED_IPS:-10.77.0.0/24}
       WAN_IFACE: ${WAN_IFACE:-}
+      # BitTorrent, blocked in the traffic this node forwards. This is the server
+      # a swarm sees and the one a datacentre suspends over it, so the guard is
+      # worth having here even when the entry node already runs it: what arrives
+      # over an uplink is still in the clear on this side.
+      TORRENT_BLOCK: ${TORRENT_BLOCK:-}
+      TORRENT_BLOCK_FILE: ${TORRENT_BLOCK_FILE:-/etc/amnezia/host/torrent-block.json}
+      TORRENT_TCP_PORTS: ${TORRENT_TCP_PORTS:-}
+      TORRENT_UDP_PORTS: ${TORRENT_UDP_PORTS:-}
     volumes:
       - awg-config:/etc/amnezia/amneziawg
       - awg-run:/var/run/amneziawg
+      # No panel here, so this only carries what an operator put in it by hand —
+      # but it is what lets `saucewg torrents` change the setting on an exit node
+      # without recreating the container.
+      - ./config:/etc/amnezia/host:ro
 
 volumes:
   awg-config:

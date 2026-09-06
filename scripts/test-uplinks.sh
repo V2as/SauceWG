@@ -113,8 +113,11 @@ ip() {
 
 # Which match extensions and targets this fake kernel has. The torrent filter
 # probes for them and installs a different ladder depending on the answer, so the
-# tests have to be able to take one away and see what is left.
-FAKE_MATCHES="conntrack string comment connbytes set length multiport"
+# tests have to be able to take one away and see what is left — and put it back
+# through FAKE_MATCHES_ALL, because a match quietly missing afterwards fails the
+# rules of whatever runs next instead of the test that removed it.
+FAKE_MATCHES_ALL="conntrack string comment connbytes set length multiport"
+FAKE_MATCHES=$FAKE_MATCHES_ALL
 
 fake_has() {
     case " $FAKE_MATCHES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
@@ -260,14 +263,32 @@ ipset() {
 }
 
 conntrack() { :; }
-ping() { return 1; }
+
+# Whether the far end still reaches the internet, which is the second half of a
+# probe: a tunnel can be handshaking and still be carrying nothing.
+FAKE_PING=fail
+ping() {
+    [ "$FAKE_PING" = ok ] || return 1
+    printf 'rtt min/avg/max/mdev = 11.1/22.2/33.3/4.4 ms\n'
+}
+
+# When each interface last handshaked, as an epoch, keyed by interface name. An
+# interface with no entry has never handshaked — which is what every test before
+# the health ones relies on, health not being what they are about.
+declare -A FAKE_HS=()
+
 awg() {
     case "${1:-}" in
         genkey) head -c32 /dev/urandom | base64 ;;
         pubkey) sed 's/.*/PUB-&/' ;;
         setconf) return 0 ;;
-        # No handshake data, so every uplink probes as unhealthy. Health is not
-        # what these tests are about.
+        show)
+            case "${3:-}" in
+                latest-handshakes) printf 'PEER-%s\t%s\n' "${2:-}" "${FAKE_HS[${2:-}]:-0}" ;;
+                transfer) printf 'PEER-%s\t0\t0\n' "${2:-}" ;;
+                *) return 1 ;;
+            esac
+            ;;
         *) return 1 ;;
     esac
 }
@@ -356,6 +377,20 @@ protocol_of() {
         [ "${UP_NAME[$i]}" = "$1" ] && { printf '%s' "${UP_PROTOCOL[$i]}"; return; }
     done
     printf 'missing'
+}
+
+iface_of() {
+    local i
+    for i in "${!UP_NAME[@]}"; do
+        [ "${UP_NAME[$i]}" = "$1" ] && { printf '%s' "${UP_IFACE[$i]}"; return; }
+    done
+    printf 'missing'
+}
+
+# One field of one node as the panel reads it out of the published state.
+node_field() {
+    jq -r --arg n "$1" --arg f "$2" \
+        '.nodes[] | select(.name == $n) | .[$f]' "$UPLINK_STATE_FILE"
 }
 
 # The obfuscation parameters one uplink's generated .conf actually carries, in order.
@@ -1034,7 +1069,7 @@ check "and the panel sees it as a missing capability" "false" \
     "$(torrent_write_state; jq -r .capabilities.string "$TORRENT_STATE_FILE")"
 torrent_switch '{"enabled": false}'
 torrent_reload
-FAKE_MATCHES="string comment connbytes set length multiport"
+FAKE_MATCHES=$FAKE_MATCHES_ALL
 
 echo "53. the environment overrides the panel, and says so"
 export TORRENT_BLOCK=strict
@@ -1048,7 +1083,66 @@ check "and is reported" "true" \
     "$(case "$(torrent_error)" in *"is not one of off, on or strict"*) echo true ;; *) echo "$(torrent_error)" ;; esac)"
 unset TORRENT_BLOCK
 
-echo "54. tearing the node down leaves no torrent rule behind"
+echo "55. the route follows the handshake, not the other way round"
+nodes "[$(node hs-one 198.51.100.20:51820 2 10)]"
+uplinks_reload
+uplinks_routing_base
+hs_iface=$(iface_of hs-one)
+FAKE_PING=ok
+FAKE_HS[$hs_iface]=$(date +%s)
+# Two good probes: a node that has just been built has to earn its way back in.
+uplinks_refresh_health
+uplinks_refresh_health
+uplink_activate 0
+uplinks_write_state
+check "a handshaking uplink carries traffic" "$hs_iface" "$(cascade_default)"
+check "and is published as healthy" "true" "$(node_field hs-one healthy)"
+
+echo "56. a handshake that stops is a failover, not a slow one"
+FAKE_HS[$hs_iface]=$(( $(date +%s) - 21600 ))
+uplinks_refresh_health
+uplinks_refresh_health
+check "two missed probes do not move the route" "true" "${UP_HEALTHY[0]}"
+uplinks_refresh_health
+check "the third does" "false" "${UP_HEALTHY[0]}"
+uplinks_fallback
+check "with nothing else to fall back on, the entry node takes over" "none" "$(cascade_default)"
+
+echo "57. a verdict that outlived its handshake is not published as a verdict"
+# The monitor stops evaluating health — wedged, or killed while the container
+# stays up — and the last verdict it wrote stays in place. This is the state that
+# had the panel reporting an exit node as connected six hours after its last
+# handshake: the flag says healthy, the timestamp beside it says otherwise.
+UP_HEALTHY[0]=true
+UP_HS[0]=$(( $(date +%s) - 21600 ))
+uplinks_write_state
+check "an hours-old handshake is published as down" "false" "$(node_field hs-one healthy)"
+hs_age=$(( $(date +%s) - $(node_field hs-one last_handshake) ))
+check "beside the handshake it was judged against" "true" \
+    "$([ "$hs_age" -gt 21000 ] && echo true || echo false)"
+check "and the rule the panel should apply to it" "180" \
+    "$(jq -r .handshake_timeout "$UPLINK_STATE_FILE")"
+check "including how long failover itself may take" "30" \
+    "$(jq -r .failover_seconds "$UPLINK_STATE_FILE")"
+
+# The hysteresis keeps a node up through CASCADE_FAIL_THRESHOLD bad probes on
+# purpose, so within that window a healthy verdict and an overdue handshake agree.
+# Contradicting the container there would fail a node over one missed keepalive.
+UP_HS[0]=$(( $(date +%s) - CASCADE_HANDSHAKE_TIMEOUT - 5 ))
+uplinks_write_state
+check "a handshake inside the failover window is left alone" "true" "$(node_field hs-one healthy)"
+
+echo "58. a handshake that is not a timestamp is not a handshake"
+# `awg show` printing anything unexpected — a warning, a partial line while the
+# interface is rebuilt — must not read as "recent enough".
+FAKE_HS[$hs_iface]="(none)"
+uplinks_refresh_health
+check "it counts as never having handshaked" "0" "${UP_HS[0]}"
+uplinks_write_state
+check "and the node is published as down" "false" "$(node_field hs-one healthy)"
+FAKE_PING=fail
+
+echo "59. tearing the node down leaves no torrent rule behind"
 torrent_switch '{"enabled": true, "mode": "strict"}'
 torrent_reload
 check "the guard is up" "-i awg0" "$(torrent_hook_of "$TORRENT_CHAIN")"

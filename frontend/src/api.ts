@@ -34,6 +34,9 @@ export interface CascadeStatus {
   tx_bytes: number
   exit_ip: string | null
   node: string | null
+  // True when `node` is the exit node clients are routed through and it has stopped
+  // handshaking without failover moving them off it. `connected` is false alongside.
+  stalled: boolean
   mode: string
   nodes_total: number
   nodes_healthy: number
@@ -75,7 +78,13 @@ export interface ExitNode {
   paired: boolean
   healthy: boolean
   active: boolean
+  // True when the node container still calls this uplink usable but its last
+  // handshake is too old for that to be true, so the panel reports it as down.
+  // `active` can be true alongside it: client traffic is being pointed at an exit
+  // node that is not answering, which is the state this exists to make visible.
+  stalled: boolean
   last_handshake_at: string | null
+  handshake_age_seconds: number | null
   latency_ms: number | null
   rx_bytes: number
   tx_bytes: number

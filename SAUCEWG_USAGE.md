@@ -320,6 +320,25 @@ saucewg node-pair --peer-key '<the uplink key>'
 `add-node`, `update-node` and `remove-node` all take `--no-reload` when you want to make
 several changes and apply them once with `saucewg reload`.
 
+`saucewg nodes` prints what the node container is actually doing, next to the handshake
+each verdict rests on:
+
+```
+PRIO  NAME   IFACE  STATUS    HANDSHAKE  ENDPOINT
+10    eu-nl  awg1   stalled   6h ago     198.51.100.20:51820
+20    eu-de  awg2   active    4s ago     203.0.113.31:51820
+30    eu-fr  awg3   standby   19s ago    203.0.113.9:51820
+40    eu-pl  awg4   unpaired  never      192.0.2.5:51820
+```
+
+`active` is carrying client traffic, `standby` is a working failover target, `unpaired`
+is missing the entry node's key and can never become active, and `down` is failing its
+health checks. **`stalled` is the one to act on**: the cascade is still counting on that
+node — routing clients through it, or holding it as somewhere to fail over to — and its
+last handshake is too old for anything to be coming back. The status is worked out from
+the handshake rather than read off the container's own flag, so it stays right even when
+the container's monitor is the thing that stopped. `saucewg logs awg` says why it did.
+
 `add-node` allocates the uplink address and the failover priority itself: a new node is
 appended *below* every existing one, so adding a node never moves live traffic. Pass
 `--address` or `--priority` to override.

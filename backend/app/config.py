@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     # The node container republishes uplinks.json on every health tick; anything
     # older than this means its monitor stopped.
     uplink_state_max_age_seconds: int = 60
+    # The node container's own health rule, which the panel applies again to what it
+    # publishes: an uplink whose last handshake is older than the timeout plus the
+    # time the hysteresis may take to act on it is dead, however healthy the node
+    # container says it is. The container publishes both numbers in uplinks.json, so
+    # these are only read for one too old to — and must match the defaults in
+    # docker/awg/uplinks.sh.
+    cascade_handshake_timeout: int = 180
+    cascade_probe_interval: int = 10
+    cascade_fail_threshold: int = 3
 
     # --- exit node provisioning ------------------------------------------
     # The exit node list, bind-mounted read-write from the host so the panel can
@@ -161,6 +170,16 @@ class Settings(BaseSettings):
     @property
     def cascade_params_file(self) -> str:
         return f"{self.awg_config_dir}/{self.cascade_iface}.params"
+
+    @property
+    def cascade_failover_seconds(self) -> int:
+        """How long the node container's failover may take once a handshake stops.
+
+        Its hysteresis keeps an uplink healthy through ``CASCADE_FAIL_THRESHOLD`` bad
+        probes on purpose, so a handshake may legitimately be this much older than
+        ``CASCADE_HANDSHAKE_TIMEOUT`` while the verdict is still "healthy".
+        """
+        return self.cascade_probe_interval * self.cascade_fail_threshold
 
     @property
     def uplink_state_file(self) -> str:

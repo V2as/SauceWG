@@ -39,6 +39,16 @@ const appPaddingWarning = computed(() => {
   return ['S3', 'S4'].some((key) => Number(obf[key] ?? 0) > 0)
 })
 
+// `down` and `stalled` both mean no client traffic is leaving through the cascade;
+// the difference is that a stalled one has an exit node assigned and failing to carry
+// it, which is a fault rather than an absence.
+const cascadeState = computed(() => {
+  const state = cascade.value
+  if (!state || !state.enabled) return 'disabled'
+  if (state.connected) return 'connected'
+  return state.stalled ? 'stalled' : 'down'
+})
+
 async function load() {
   try {
     const [node, system] = await Promise.all([api.settings(), api.system()])
@@ -147,8 +157,12 @@ onMounted(load)
         <dt>State</dt>
         <dd>
           <span class="badge" :class="cascade.connected ? 'badge-active' : 'badge-expired'">
-            {{ cascade.enabled ? (cascade.connected ? 'connected' : 'down') : 'disabled' }}
+            {{ cascadeState }}
           </span>
+          <div v-if="cascade.stalled" class="stat-sub" style="margin-top: 4px">
+            {{ cascade.node ?? 'the active exit node' }} is still being routed to, and has
+            stopped handshaking
+          </div>
         </dd>
         <dt>Interface</dt>
         <dd class="mono">{{ cascade.iface }}</dd>

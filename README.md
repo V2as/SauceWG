@@ -331,6 +331,21 @@ rotation and traffic moves to the next healthy node; two successes bring it back
 Switching rewrites one route and flushes stale NAT conntrack entries. Clients keep their
 tunnel to the entry node the whole time — they see a new exit IP, not a disconnect.
 
+**A health verdict is never older than the handshake it was made on.** The check above
+is a loop, and a loop can stop — wedged, killed while the container keeps running, or
+not yet past its first tick. Its last verdict would otherwise stand indefinitely: an
+exit node reported as healthy and active with a last handshake hours old, carrying
+client traffic and delivering none of it. So `healthy` is only published, and only
+believed, while the handshake beside it is younger than
+`CASCADE_HANDSHAKE_TIMEOUT + CASCADE_PROBE_INTERVAL × CASCADE_FAIL_THRESHOLD` — the
+timeout plus the time the hysteresis is allowed to take to act on it. The node container
+applies the rule when it writes `uplinks.json` and publishes both numbers in it; the
+panel and `saucewg nodes` apply the same rule again when they read it, since the file
+itself can be the stale thing. A node the cascade still counts on while its handshake
+says otherwise is reported as **stalled**: `healthy` false, `active` possibly still
+true, and named as such on the Exit nodes page, in `saucewg nodes` and in
+`GET /api/nodes`.
+
 `POST /api/nodes/{name}/activate` and the **Exit nodes** page pin a preferred node. The
 pin is a preference, not a lock: a pinned node that goes down is still failed over, and
 is taken back once it recovers.

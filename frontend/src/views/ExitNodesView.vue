@@ -402,9 +402,21 @@ function copy(text: string, label: string) {
 function statusLabel(node: ExitNode) {
   if (node.task_id) return { text: 'working', klass: 'badge-limited' }
   if (!node.paired) return { text: 'unpaired', klass: 'badge-limited' }
+  // Before `active`, deliberately: a node whose handshake has stopped is still the
+  // one the route points at, and reading "active" off that is the whole problem.
+  if (node.stalled) return { text: 'stalled', klass: 'badge-expired' }
   if (node.active) return { text: 'active', klass: 'badge-active' }
   if (node.healthy) return { text: 'standby', klass: 'badge-disabled' }
   return { text: 'down', klass: 'badge-expired' }
+}
+
+/** What is at stake in a stalled node. The Handshake column already says how long ago,
+ *  which is the other half of why the badge says what it says. */
+function stalledLabel(node: ExitNode) {
+  if (!node.stalled) return ''
+  return node.active
+    ? 'client traffic is still routed to it'
+    : 'still counted on as somewhere to fail over to'
 }
 
 /** One line under a failed node's status, saying what is being done about it. */
@@ -426,6 +438,11 @@ function needsAttention(node: ExitNode) {
 }
 
 const stranded = computed(() => state.value?.nodes.filter(needsAttention) ?? [])
+
+/** The node the route still points at after it stopped handshaking. Clients' traffic
+ *  is going into a tunnel with nothing on the other end, and because the cascade's own
+ *  failover is what should have noticed, nothing else on this page says so. */
+const stalledActive = computed(() => state.value?.nodes.find((n) => n.stalled && n.active) ?? null)
 
 onMounted(() => {
   refresh()
@@ -465,6 +482,16 @@ onUnmounted(() => {
       The node container has not refreshed its uplink state since
       {{ dateTime(state.updated_at) }}. The health data below is stale and failover is
       probably not running.
+    </div>
+
+    <div v-else-if="stalledActive" class="alert alert-error" style="margin-bottom: 14px">
+      Client traffic is being routed to
+      <span class="mono">{{ stalledActive.name }}</span
+      >, whose last handshake was {{ relativeTime(stalledActive.last_handshake_at) }} — the
+      tunnel to it is down, so nothing is reaching the internet through it. Failover
+      should have moved traffic off it and has not, so switch to another node or recover
+      this one, and check <span class="mono">saucewg logs awg</span> for why the cascade
+      monitor is not acting.
     </div>
 
     <div v-else-if="state.fallback_active" class="alert alert-warn" style="margin-bottom: 14px">
@@ -514,7 +541,10 @@ onUnmounted(() => {
           <div class="stat-label">Active exit</div>
           <div class="stat-value">{{ state.active ?? '—' }}</div>
           <div class="stat-sub">
-            {{ state.mode === 'manual' ? `pinned to ${state.pinned}` : 'chosen automatically' }}
+            <template v-if="stalledActive">carrying nothing — it is not handshaking</template>
+            <template v-else>
+              {{ state.mode === 'manual' ? `pinned to ${state.pinned}` : 'chosen automatically' }}
+            </template>
           </div>
         </div>
 
@@ -581,6 +611,9 @@ onUnmounted(() => {
               </td>
               <td>
                 <span class="badge" :class="statusLabel(node).klass">{{ statusLabel(node).text }}</span>
+                <div v-if="stalledLabel(node)" class="stat-sub" style="margin-top: 4px">
+                  {{ stalledLabel(node) }}
+                </div>
                 <div v-if="recoveryLabel(node)" class="stat-sub" style="margin-top: 4px"
                      :title="node.recovery?.last_error ?? ''">
                   {{ recoveryLabel(node) }}
@@ -591,7 +624,10 @@ onUnmounted(() => {
               <td class="mono">{{ node.endpoint ?? '—' }}</td>
               <td class="mono">{{ node.iface }}</td>
               <td class="mono">{{ node.latency_ms != null ? `${node.latency_ms.toFixed(1)} ms` : '—' }}</td>
-              <td :title="dateTime(node.last_handshake_at)">{{ relativeTime(node.last_handshake_at) }}</td>
+              <td :title="dateTime(node.last_handshake_at)"
+                  :style="node.stalled ? 'color: var(--danger)' : ''">
+                {{ relativeTime(node.last_handshake_at) }}
+              </td>
               <td>↑ {{ bytes(node.rx_bytes) }} · ↓ {{ bytes(node.tx_bytes) }}</td>
               <td>
                 <div class="row" style="gap: 4px; justify-content: flex-end">

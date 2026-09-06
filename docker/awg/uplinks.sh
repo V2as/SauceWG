@@ -53,6 +53,22 @@ CASCADE_FAIL_THRESHOLD=${CASCADE_FAIL_THRESHOLD:-3}
 CASCADE_RECOVER_THRESHOLD=${CASCADE_RECOVER_THRESHOLD:-2}
 CASCADE_HANDSHAKE_TIMEOUT=${CASCADE_HANDSHAKE_TIMEOUT:-180}
 
+# Every one of those is compared with `test -gt` below, and two of them are handed
+# to jq as numbers. A value that is not an integer breaks both — the second loudly,
+# the first silently: `test` errors out, the caller reads that as "the handshake is
+# not too old", and a dead uplink goes on being reported as a healthy one.
+case $CASCADE_PROBE_INTERVAL in ''|*[!0-9]*) CASCADE_PROBE_INTERVAL=10 ;; esac
+case $CASCADE_PROBE_TIMEOUT in ''|*[!0-9]*) CASCADE_PROBE_TIMEOUT=3 ;; esac
+case $CASCADE_FAIL_THRESHOLD in ''|*[!0-9]*) CASCADE_FAIL_THRESHOLD=3 ;; esac
+case $CASCADE_RECOVER_THRESHOLD in ''|*[!0-9]*) CASCADE_RECOVER_THRESHOLD=2 ;; esac
+case $CASCADE_HANDSHAKE_TIMEOUT in ''|*[!0-9]*) CASCADE_HANDSHAKE_TIMEOUT=180 ;; esac
+
+# How long failover itself is allowed to take: the hysteresis deliberately keeps a
+# node healthy through CASCADE_FAIL_THRESHOLD bad probes, so a handshake may legally
+# be this much older than the timeout while the verdict is still "healthy". Past it,
+# a healthy verdict contradicts the handshake it was supposedly made on.
+CASCADE_FAILOVER_SECONDS=$((CASCADE_PROBE_INTERVAL * CASCADE_FAIL_THRESHOLD))
+
 # Interface numbers are handed out per node name and persisted here, so removing a
 # node in the middle of the list does not renumber — and silently reconfigure — the
 # ones that survive it.
@@ -1350,9 +1366,11 @@ uplink_probe() {
     local hs="" now age rx="" tx="" out rtt
 
     # `awg show` fails while an interface is being rebuilt; that is a probe failure,
-    # never a reason to take the monitor down.
+    # never a reason to take the monitor down. Anything that is not a plain epoch
+    # counts as no handshake at all, for the same reason as above: an uplink whose
+    # age cannot be established has not shown that it is carrying anything.
     read -r _ hs < <(awg show "$iface" latest-handshakes 2>/dev/null | head -n1) || true
-    [ -n "$hs" ] || hs=0
+    case $hs in ''|*[!0-9]*) hs=0 ;; esac
     UP_HS[i]=$hs
 
     read -r _ rx tx < <(awg show "$iface" transfer 2>/dev/null | head -n1) || true
@@ -1508,8 +1526,11 @@ uplinks_write_state() {
         --argjson bypass_active "$([ "$BYPASS_ACTIVE" = "true" ] && echo true || echo false)" \
         --argjson bypass_runtime "$bypass_runtime" \
         --argjson fallback_active "$([ "$FALLBACK_ACTIVE" = "true" ] && echo true || echo false)" \
+        --argjson handshake_timeout "$CASCADE_HANDSHAKE_TIMEOUT" \
+        --argjson failover_seconds "$CASCADE_FAILOVER_SECONDS" \
         --argjson now "$(date -u +%s)" '
-        {
+        ($handshake_timeout + $failover_seconds) as $dead_after
+        | {
             updated_at: $now,
             reload_id: $reload,
             source: $source,
@@ -1522,6 +1543,11 @@ uplinks_write_state() {
             # The old name for the same choice, still published so that a panel
             # older than the container it is talking to keeps working.
             killswitch: ($fallback == "block"),
+            # What "healthy" below was decided against, so that whoever reads this
+            # file can apply the same rule to it rather than trusting a flag whose
+            # age it cannot judge.
+            handshake_timeout: $handshake_timeout,
+            failover_seconds: $failover_seconds,
             direct: {
                 source: $direct_source,
                 routes: $direct_routes,
@@ -1543,7 +1569,9 @@ uplinks_write_state() {
                 error: (if $bypass_error == "" then null else $bypass_error end)
             },
             nodes: (
-                split("\n") | map(select(length > 0)) | map(split("\t")) | map({
+                split("\n") | map(select(length > 0)) | map(split("\t")) | map(
+                (.[9] | tonumber) as $hs
+                | {
                     name: .[0],
                     iface: .[1],
                     endpoint: (if .[2] == "" then null else .[2] end),
@@ -1551,9 +1579,19 @@ uplinks_write_state() {
                     priority: (.[4] | tonumber),
                     public_key: .[5],
                     peer_public_key: (if .[6] == "" then null else .[6] end),
-                    healthy: (.[7] == "true"),
+                    # An uplink is only as healthy as its last handshake, so a
+                    # verdict that has outlived the one it was made on is not
+                    # published as a verdict. Without this, a monitor that stops
+                    # evaluating health — because it is wedged, or because it never
+                    # got as far as its first tick — leaves the last "healthy" it
+                    # wrote standing for as long as the container runs, and the
+                    # panel has no way to tell that from a working exit node.
+                    healthy: (.[7] == "true" and $hs > 0 and ($now - $hs) <= $dead_after),
+                    # Whether client traffic is being pointed at this uplink, which
+                    # stays true for a dead one until the route is moved — that is
+                    # what a healthy node and a stalled one look like differently.
                     active: (.[8] == "true"),
-                    last_handshake: (.[9] | tonumber),
+                    last_handshake: $hs,
                     latency_ms: (if .[10] == "" then null else (.[10] | tonumber) end),
                     rx_bytes: (.[11] | tonumber),
                     tx_bytes: (.[12] | tonumber),

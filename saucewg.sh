@@ -642,6 +642,11 @@ services:
       AWG_ENDPOINT_PORT: ${AWG_PORT:-51820}
       CASCADE_ENABLED: ${CASCADE_ENABLED:-true}
       CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
+      # The same failover tuning the node container runs on: the panel checks every
+      # health flag it reads against the handshake published beside it.
+      CASCADE_PROBE_INTERVAL: ${CASCADE_PROBE_INTERVAL:-10}
+      CASCADE_FAIL_THRESHOLD: ${CASCADE_FAIL_THRESHOLD:-3}
+      CASCADE_HANDSHAKE_TIMEOUT: ${CASCADE_HANDSHAKE_TIMEOUT:-180}
       CLIENT_DNS: ${CLIENT_DNS:-1.1.1.1, 1.0.0.1}
       CLIENT_MTU: ${CLIENT_MTU:-1280}
       CLIENT_ALLOWED_IPS: ${CLIENT_ALLOWED_IPS:-0.0.0.0/0, ::/0}
@@ -1554,14 +1559,32 @@ cmd_list_nodes() {
     fi
 
     if [ -n "$state" ]; then
+        # The handshake is re-judged here rather than taken from the file: the file's
+        # verdict was true when it was written, and a monitor that has stopped writing
+        # leaves a true one standing indefinitely. Same rule and same numbers the node
+        # container used, so the two only ever disagree about how long ago it was read.
         printf '%s' "$state" | jq -r '
-            "PRIO\tNAME\tIFACE\tSTATUS\tENDPOINT",
+            (now | floor) as $now
+            | ((.handshake_timeout // 180) + (.failover_seconds // 30)) as $dead_after
+            | "PRIO\tNAME\tIFACE\tSTATUS\tHANDSHAKE\tENDPOINT",
             (.nodes | sort_by(.priority)[] |
-                "\(.priority)\t\(.name)\t\(.iface)\t" +
-                (if .active then "active"
-                 elif .healthy then "standby"
+                (if (.last_handshake // 0) > 0 then $now - .last_handshake else null end) as $age
+                | (.healthy and $age != null and $age <= $dead_after) as $up
+                | "\(.priority)\t\(.name)\t\(.iface)\t" +
+                # `active` is not asked first: the route still points at a node that
+                # has stopped handshaking, and calling that active is how an exit node
+                # carrying nothing goes unnoticed. Same for one the cascade is still
+                # holding as a failover target it cannot actually fail over to.
+                (if ($up | not) and (.healthy or .active) then "stalled"
+                 elif .active then "active"
+                 elif $up then "standby"
                  elif (.peer_public_key == null) then "unpaired"
                  else "down" end) +
+                "\t" +
+                (if $age == null then "never"
+                 elif $age < 120 then "\($age)s ago"
+                 elif $age < 7200 then "\(($age / 60) | floor)m ago"
+                 else "\(($age / 3600) | floor)h ago" end) +
                 "\t\(.endpoint // "-")")'
     else
         jq -r '"PRIO\tNAME\tENDPOINT",

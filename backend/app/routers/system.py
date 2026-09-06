@@ -73,6 +73,9 @@ async def build_cascade_status() -> CascadeStatus:
     # A stale state file means the node's monitor stopped, so its verdict on the
     # link cannot be trusted any more.
     status.connected = active.healthy and not state.stale
+    # Routed at an exit node that is not answering: worse than having none, because
+    # failover is not going to step in for a node it has not noticed losing.
+    status.stalled = active.stalled and not state.stale
     return status
 
 

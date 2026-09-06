@@ -326,7 +326,9 @@ GET /api/nodes
       "paired": true,
       "healthy": true,
       "active": true,
+      "stalled": false,
       "last_handshake_at": "2026-08-14T14:30:58Z",
+      "handshake_age_seconds": 4.2,
       "latency_ms": 47.08,
       "rx_bytes": 3092,
       "tx_bytes": 87289,
@@ -347,8 +349,10 @@ GET /api/nodes
 | Field | Meaning |
 | --- | --- |
 | `priority` | **lower wins.** The healthy node with the smallest number carries traffic |
-| `healthy` | passed the last health checks (see below) |
+| `healthy` | passed the last health checks (see below), **and** handshaked recently enough for that verdict to still mean something |
 | `active` | currently carrying client traffic |
+| `stalled` | **check this.** The cascade is still treating this node as usable — offering it as a failover target, or routing clients through it — while its last handshake is too old for anything to be coming out of it. `healthy` is forced to `false` alongside, and `active` may well be `true`: that combination is an exit node carrying nothing |
+| `last_handshake_at` / `handshake_age_seconds` | when the tunnel to this node last handshaked, and how long ago in seconds. `null` if it never has |
 | `paired` | the exit node's key is installed here; an unpaired node can never become active |
 | `public_key` | the **entry node's** key for this uplink — this is what you install on the exit node |
 | `peer_public_key` | the exit node's key |
@@ -383,6 +387,51 @@ On a switch the container rewrites one route and drops stale NAT conntrack entri
 existing flows re-establish instead of black-holing. Users keep their tunnel to the
 entry node throughout — they see a new exit IP and broken TCP sessions, not a
 disconnect.
+
+### A verdict is never older than the handshake it was made on
+
+Everything above is decided by a loop, and a loop can stop: wedged on a system call,
+killed while the container carries on running, or simply not having reached its first
+tick yet. Its last verdict then stays in `uplinks.json` — `healthy: true`, `active:
+true` — beside a `last_handshake` that keeps getting older, and nothing downstream can
+tell that from a working exit node. This is how a node with a six-hour-old handshake
+gets reported as connected.
+
+So a health flag is only published, and only believed, while the handshake beside it
+could still belong to a live tunnel:
+
+```
+dead_after = CASCADE_HANDSHAKE_TIMEOUT + failover_seconds   # 180 + 30 by default
+```
+
+`failover_seconds` is `CASCADE_PROBE_INTERVAL × CASCADE_FAIL_THRESHOLD`: the hysteresis
+keeps a node healthy through three bad probes on purpose, so a handshake is allowed to
+be that much older than the timeout while the verdict is still legitimately "healthy".
+Past that sum, it is not.
+
+Both numbers are published in `uplinks.json` so that everything reading it applies the
+container's own rule rather than guessing at one. The panel falls back to `180` and `30`
+for a node container that predates them.
+
+The rule is enforced three times over, because each layer can be the stale one:
+
+* the node container will not **publish** `healthy: true` for a node whose
+  `last_handshake` is already past `dead_after` — a monitor that has stopped evaluating
+  health cannot leave a healthy verdict standing behind it;
+* the panel **re-checks** it on every read, against the timestamp in the same snapshot,
+  and downgrades `healthy` to `false` and raises `stalled` when the two disagree;
+* `saucewg nodes` does the same against the file, so the CLI does not disagree with the
+  panel about a node either.
+
+`stalled` is the name for the disagreement: not merely down, but down while the cascade
+still counts on it. It is worth alerting on separately, because failover cannot fix a
+failure it has not noticed:
+
+```python
+for node in get("/api/nodes")["nodes"]:
+    if node["stalled"] and node["active"]:
+        alert(f"{node['name']} is carrying client traffic and has stopped handshaking")
+```
 
 ### When there is nothing to fail over to
 
@@ -942,7 +991,7 @@ Host metrics, client totals, live throughput, and the cascade summary:
     "endpoint": "72.56.92.184:51820", "exit_ip": "72.56.92.184",
     "peer_public_key": "ASPc…=", "last_handshake_at": "2026-08-14T14:23:06Z",
     "rx_bytes": 3092, "tx_bytes": 87289,
-    "node": "eu-primary", "mode": "auto",
+    "node": "eu-primary", "stalled": false, "mode": "auto",
     "nodes_total": 2, "nodes_healthy": 2,
     "fallback": "direct", "fallback_active": false,
     "direct_routes": 3,
@@ -953,7 +1002,9 @@ Host metrics, client totals, live throughput, and the cascade summary:
 
 `cascade.connected` describes the cascade only: it is `false` whenever no exit node is
 carrying traffic, including while `fallback_active` is `true` and users are online
-through the entry node. `direct_routes` counts the prefixes of §7 the node container has
+through the entry node. `cascade.stalled` is the worst way for it to be `false` — `node`
+names an exit node, client traffic is routed to it, and it has stopped handshaking
+without failover moving anyone off it. `direct_routes` counts the prefixes of §7 the node container has
 actually installed as routes. `bypass_active` and `bypass_routes` are the same for §8 —
 both zero on a healthy cascade in the default mode, which is the intended state rather
 than a fault.
@@ -1053,6 +1104,10 @@ resets.
 Alert when any of these hold for more than a couple of poll cycles:
 
 * `GET /api/nodes` → `stale == true` — the node container's monitor died.
+* any node with `stalled == true` — the cascade is still counting on an exit node that
+  has stopped handshaking. With `active == true` beside it, that node is carrying client
+  traffic and delivering none of it, and failover is not going to step in for a failure
+  it has not noticed. This is the one that used to be invisible.
 * `nodes_healthy == 0` — every exit is down. What that means for users depends on
   `fallback`: they are either online from the entry node's own address or offline by
   design, and both deserve an alert.
@@ -1097,7 +1152,8 @@ Values the central system may need to know about, set in the entry node's `.env`
 | `COLLECTOR_INTERVAL_SECONDS` | 10 | counter freshness |
 | `ONLINE_TIMEOUT_SECONDS` | 180 | how long after the last handshake a client still reads as online |
 | `USAGE_BUCKET_MINUTES` / `USAGE_RETENTION_DAYS` | 60 / 90 | granularity and history of the usage series |
-| `CASCADE_PROBE_INTERVAL` / `CASCADE_FAIL_THRESHOLD` | 10 / 3 | failover detection time |
+| `CASCADE_PROBE_INTERVAL` / `CASCADE_FAIL_THRESHOLD` | 10 / 3 | failover detection time; their product is the `failover_seconds` of the staleness rule above |
+| `CASCADE_HANDSHAKE_TIMEOUT` | 180 | how old an uplink's last handshake may be before it is dead, whatever else says otherwise |
 | `CASCADE_FALLBACK` | `direct` | during a total uplink outage: `direct` carries users through the entry node, `block` cuts them off |
 | `CASCADE_KILLSWITCH` | — | the previous name for the same choice; read only when `CASCADE_FALLBACK` is unset, where `true` means `block` |
 | `CASCADE_DIRECT_ROUTES` | — | a JSON array of prefixes to route past the cascade, overriding the file and making §7 read-only |

@@ -26,6 +26,10 @@ MANUAL = "manual"
 FALLBACK_DIRECT = "direct"
 FALLBACK_BLOCK = "block"
 
+#: Nodes already reported as stalled, so that a state read on every request does not
+#: write the same warning to the log several times a second.
+_stalled: set[str] = set()
+
 
 @dataclass
 class ExitNodeState:
@@ -45,6 +49,10 @@ class ExitNodeState:
     #: The AmneziaWG generation this uplink speaks. None from a node container that
     #: predates generation selection, which is serving 1.0 either way.
     protocol: str | None = None
+    #: True when the cascade is still treating this uplink as usable — offering it as
+    #: a failover target, or routing clients through it — while its last handshake is
+    #: too old for anything to be coming out of it. See :func:`load_uplink_state`.
+    stalled: bool = False
 
     @property
     def paired(self) -> bool:
@@ -54,6 +62,13 @@ class ExitNodeState:
     @property
     def exit_ip(self) -> str | None:
         return self.endpoint.rsplit(":", 1)[0] if self.endpoint else None
+
+    @property
+    def handshake_age(self) -> float | None:
+        """Seconds since the tunnel last handshaked, or None if it never has."""
+        if self.last_handshake is None:
+            return None
+        return (datetime.now(timezone.utc) - self.last_handshake).total_seconds()
 
 
 @dataclass
@@ -68,7 +83,26 @@ class UplinkState:
     #: Whether that is happening right now.
     fallback_active: bool = False
     updated_at: datetime | None = None
+    #: How old a handshake the node container lets an uplink have before it fails it,
+    #: and how long its own hysteresis may then take to act on that. Both come out of
+    #: uplinks.json, so a node is judged by the container's rule rather than one the
+    #: panel made up; the settings are the fallback for a container too old to publish
+    #: them.
+    handshake_timeout: int = 0
+    failover_seconds: int = 0
     nodes: list[ExitNodeState] = field(default_factory=list)
+
+    @property
+    def handshake_deadline(self) -> int:
+        """Beyond this age, a handshake cannot belong to a working uplink.
+
+        The node container keeps a node healthy through ``CASCADE_FAIL_THRESHOLD``
+        bad probes on purpose, so a handshake is allowed to be that much older than
+        ``CASCADE_HANDSHAKE_TIMEOUT`` while the verdict is still legitimately
+        "healthy". Judging a node any sooner than the container does would make the
+        panel disagree with it every time a single probe was missed.
+        """
+        return self.handshake_timeout + self.failover_seconds
 
     @property
     def serving(self) -> bool:
@@ -107,8 +141,23 @@ def _timestamp(value: object) -> datetime | None:
     return datetime.fromtimestamp(value, tz=timezone.utc)
 
 
+def _seconds(value: object, fallback: int) -> int:
+    """A positive whole number of seconds out of the state file, or the fallback."""
+    if isinstance(value, (int, float)) and value > 0:
+        return int(value)
+    return fallback
+
+
 def load_uplink_state() -> UplinkState:
-    """Never raises: a missing or half-written file just reads as 'nothing known'."""
+    """Never raises: a missing or half-written file just reads as 'nothing known'.
+
+    The health flags in the file are checked against the handshake published beside
+    them rather than taken at face value. They are only as fresh as the loop that
+    wrote them, and the failure that costs clients their traffic is precisely the one
+    where that loop is not running: the file then keeps saying "healthy" and "active"
+    about an uplink whose last handshake is hours old, the panel reports an exit node
+    that is carrying nothing, and recovery leaves it alone because it looks fine.
+    """
     path = settings.uplink_state_file
     if not os.path.exists(path):
         return UplinkState()
@@ -152,7 +201,7 @@ def load_uplink_state() -> UplinkState:
     if fallback not in (FALLBACK_DIRECT, FALLBACK_BLOCK):
         fallback = FALLBACK_DIRECT
 
-    return UplinkState(
+    state = UplinkState(
         mode=raw.get("mode") or AUTO,
         pinned=raw.get("pinned"),
         active=raw.get("active"),
@@ -160,8 +209,48 @@ def load_uplink_state() -> UplinkState:
         fallback=fallback,
         fallback_active=bool(raw.get("fallback_active", False)),
         updated_at=_timestamp(raw.get("updated_at")),
+        # A node container that does not publish the rule it judged by is running the
+        # defaults these settings carry, and they are kept equal to them.
+        handshake_timeout=_seconds(
+            raw.get("handshake_timeout"), settings.cascade_handshake_timeout
+        ),
+        failover_seconds=_seconds(
+            raw.get("failover_seconds"), settings.cascade_failover_seconds
+        ),
         nodes=nodes,
     )
+
+    deadline = state.handshake_deadline
+    for node in state.nodes:
+        age = node.handshake_age
+        if age is not None and age <= deadline:
+            _stalled.discard(node.name)
+            continue
+
+        # Past the deadline nothing is coming out of this tunnel, so the only
+        # question left is whether the cascade has noticed. It has not if it still
+        # calls the node usable, and it has not acted if client traffic is still
+        # pointed at it — either way the node is worth naming rather than quietly
+        # counting among the down ones, because a peer that is merely down is not
+        # costing anyone their connection.
+        claimed = node.healthy or node.active
+        node.healthy = False  # only ever a downgrade
+        node.stalled = claimed
+        if not claimed:
+            _stalled.discard(node.name)
+            continue
+        if node.name not in _stalled:
+            _stalled.add(node.name)
+            logger.warning(
+                "exit node %s last handshaked %s, longer than the %ds this cascade "
+                "allows, but is still %s; treating it as down",
+                node.name,
+                f"{int(age)}s ago" if age is not None else "never",
+                deadline,
+                "carrying client traffic" if node.active else "offered as a failover target",
+            )
+
+    return state
 
 
 def write_control(mode: str, node: str | None = None) -> None:

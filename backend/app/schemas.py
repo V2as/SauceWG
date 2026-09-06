@@ -140,6 +140,10 @@ class CascadeStatus(BaseModel):
     exit_ip: str | None = None
     # Which of the configured exit nodes is carrying traffic right now.
     node: str | None = None
+    # True when that node is not handshaking any more and failover has not moved
+    # traffic off it. `node` names it and `connected` is false: the cascade has an
+    # exit node, and it is carrying nothing.
+    stalled: bool = False
     mode: str = "auto"
     nodes_total: int = 0
     nodes_healthy: int = 0
@@ -192,7 +196,15 @@ class ExitNode(BaseModel):
     paired: bool
     healthy: bool
     active: bool
+    # True when the node container still calls this uplink usable but its last
+    # handshake is older than the cascade allows — so it is reported as unhealthy
+    # here whatever the container said. `active` may still be true alongside it:
+    # that is client traffic being pointed at an exit node that is not answering.
+    stalled: bool = False
     last_handshake_at: datetime | None = None
+    # Seconds since that handshake, so a caller need not trust its own clock against
+    # the node's. Null when the uplink has never handshaked.
+    handshake_age_seconds: float | None = None
     latency_ms: float | None = None
     rx_bytes: int = 0
     tx_bytes: int = 0

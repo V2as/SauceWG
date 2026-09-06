@@ -33,6 +33,7 @@ from app.config import settings  # noqa: E402
 from app.db import get_session  # noqa: E402
 from app.deps import get_current_admin, get_sudo_admin  # noqa: E402
 from app.main import app  # noqa: E402
+from app.routers.system import build_cascade_status  # noqa: E402
 from app.services import recovery  # noqa: E402
 from app.services.tasks import tasks  # noqa: E402
 
@@ -748,12 +749,20 @@ async def main() -> None:
 
         print("putting a failed exit node back")
 
-        def uplink(name: str, *, healthy: bool = False) -> dict:
-            """One entry of the node container's view of the cascade."""
+        def uplink(name: str, *, healthy: bool = False, handshake: float | None = None) -> dict:
+            """One entry of the node container's view of the cascade.
+
+            A healthy node handshaked a moment ago unless the caller says otherwise.
+            The panel reads the two against each other rather than trusting the flag,
+            so a test that sets one without the other is not testing a real cascade.
+            """
+            if handshake is None:
+                handshake = time.time() if healthy else 0
             return {
                 "name": name, "iface": f"awg-{name}", "address": "10.77.0.2/32",
                 "priority": 10, "public_key": "KEY-D", "endpoint": "192.0.2.9:51820",
                 "peer_public_key": "PEER", "healthy": healthy, "active": healthy,
+                "last_handshake": handshake,
             }
 
         # A node the panel installed and holds a key for, whose SSH port is closed:
@@ -836,6 +845,36 @@ async def main() -> None:
         response = await client.post("/api/nodes/eu-down/recover")
         task = await drain(client, response.json()["id"])
         check("asking anyway does not restart a working node", task["result"]["acted"] is False, task)
+
+        print("an exit node that stopped handshaking hours ago")
+        # The failure this exists for: the container's monitor is not evaluating
+        # health any more, so the last verdict it wrote stands — healthy, active,
+        # and contradicted by the timestamp published beside it.
+        recovery.forget("eu-down")
+        publish(nodes=[uplink("eu-down", healthy=True, handshake=time.time() - 6 * 3600)])
+        body = (await client.get("/api/nodes")).json()
+        node = body["nodes"][0]
+        check("the container's verdict is not taken at its word", node["healthy"] is False, node)
+        check("the node is reported as stalled", node["stalled"] is True, node)
+        check("and still as the one traffic is routed to", node["active"] is True, node)
+        check("with how long it has been silent", node["handshake_age_seconds"] > 21000, node)
+
+        cascade = await build_cascade_status()
+        check("the cascade is not called connected", cascade.connected is False, cascade)
+        check("the exit node carrying nothing is named", cascade.node == "eu-down", cascade)
+        check("and named as the reason", cascade.stalled is True, cascade)
+        check("nothing is counted as a failover target", cascade.nodes_healthy == 0, cascade)
+
+        check("recovery works on it like any other dead node", await recovery.sweep() == 1, recovery.state())
+        recovery.forget("eu-down")
+
+        # A single missed keepalive is not an outage: the container keeps a node
+        # healthy through CASCADE_FAIL_THRESHOLD bad probes, and the panel is not
+        # entitled to fail it over sooner than the container would.
+        publish(nodes=[uplink("eu-down", healthy=True, handshake=time.time() - 185)])
+        node = (await client.get("/api/nodes")).json()["nodes"][0]
+        check("a handshake inside the failover window is left alone", node["healthy"] is True, node)
+        check("and the node is not called stalled", node["stalled"] is False, node)
 
         print("an operator's own repair resets it")
         publish(nodes=[uplink("eu-down")])

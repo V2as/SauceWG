@@ -87,7 +87,10 @@ onUnmounted(() => window.clearInterval(timer))
           <i class="dot" :class="{ on: stats.cascade.connected }"></i>
           <span>{{ stats.cascade.node ?? (stats.cascade.connected ? 'Connected' : 'Down') }}</span>
         </div>
-        <div class="stat-sub">
+        <div v-if="stats.cascade.stalled" class="stat-sub" style="color: var(--danger)">
+          routed here but not handshaking — clients are getting nowhere
+        </div>
+        <div v-else class="stat-sub">
           exit {{ stats.cascade.exit_ip ?? 'unknown' }}
           <template v-if="stats.cascade.nodes_total > 1">
             · {{ stats.cascade.nodes_healthy }}/{{ stats.cascade.nodes_total }} nodes up

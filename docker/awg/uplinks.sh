@@ -268,7 +268,13 @@ uplink_other_family() {
         4|v4|ipv4|inet|6|v6|ipv6|inet6) return 0 ;;
     esac
     case ${UP_EPFAM[$i]:-} in
-        4) [ -n "${UP_ENDPOINT6[$i]:-}" ] && printf '6' ;;
+        # Somewhere this host cannot send from is not somewhere else to go. Moving a
+        # silent uplink onto an IPv6 endpoint from a node with no IPv6 of its own
+        # cannot handshake, and costs the tunnel the window it would have spent
+        # retrying a family that does work — which, on an entry node whose IPv4 is
+        # filtered to some exit nodes and not others, is how one working uplink ends
+        # up oscillating instead of carrying traffic.
+        4) [ -n "${UP_ENDPOINT6[$i]:-}" ] && has_ipv6_egress && printf '6' ;;
         6) [ -n "${UP_ENDPOINT4[$i]:-}" ] && printf '4' ;;
     esac
     return 0
@@ -1388,6 +1394,7 @@ uplink_setup() {
         uplink_stop "$i"
         return 1
     fi
+    uplink_bridge6_route "$i"
 
     # shellcheck disable=SC2034  # params_store reads these by name
     {
@@ -1509,12 +1516,27 @@ uplinks_route6_set() {
     esac
 }
 
+# One uplink's way out for the bridge's own IPv6. Installed as the interface comes
+# up, because deleting an interface takes its routes with it and an uplink is
+# rebuilt whenever it moves between families — reinstating this only on a full
+# reload would mean the first flip silently cost that node its IPv6 reporting.
+#
+# The metric only keeps the routes from replacing one another; a send bound to an
+# interface takes the route on it whatever the metric says, and nothing sends from
+# this prefix unbound.
+uplink_bridge6_route() {
+    local i=$1
+    bridge_has_v6 || return 0
+    [ -n "${UP_IFACE[$i]:-}" ] || return 0
+    [ -n "${UP_ADDR6[$i]:-}" ] || return 0
+    ip -6 route replace default dev "${UP_IFACE[$i]}" table "$CASCADE_BRIDGE6_TABLE" \
+        metric "$((1024 + i))" 2>/dev/null || true
+}
+
 # A way out through every uplink at once, which is what asking each exit node
-# about its own IPv6 needs. The metric only separates the routes so that one does
-# not replace another; a send bound to an interface picks the route on it whatever
-# the metric says, and an unbound one has no business here.
+# about its own IPv6 needs.
 uplinks_bridge6_routes() {
-    local i iface
+    local i
     bridge_has_v6 || return 0
 
     # Removed by the table it points at rather than the prefix it was added for, so
@@ -1526,11 +1548,7 @@ uplinks_bridge6_routes() {
 
     ip -6 route flush table "$CASCADE_BRIDGE6_TABLE" 2>/dev/null || true
     for i in "${!UP_NAME[@]}"; do
-        iface=${UP_IFACE[$i]}
-        [ -n "$iface" ] || continue
-        [ -n "${UP_ADDR6[$i]:-}" ] || continue
-        ip -6 route replace default dev "$iface" table "$CASCADE_BRIDGE6_TABLE" \
-            metric "$((1024 + i))" 2>/dev/null || true
+        uplink_bridge6_route "$i"
     done
 }
 

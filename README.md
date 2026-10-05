@@ -517,9 +517,12 @@ address it is being dialled on does not work from here — a route that disappea
 provider that started dropping one family, an address that was wrong when it was typed.
 The uplink is rebuilt on the other endpoint and the next window judges that one. A node
 pinned to a family with `--family 4` or `--family 6` is never moved: it was told, not
-asked. The flip survives a reload of the node list, so editing an unrelated node does
-not throw away what the container found out, but changing `CASCADE_ENDPOINT_FAMILY`
-overrules it — the operator said something newer.
+asked. Nor is one moved onto a family this entry node cannot send from at all, by the
+same test `auto` uses — an uplink that cannot handshake is not an alternative, and the
+window it wastes is one the family that might answer would have spent retrying. The flip
+survives a reload of the node list, so editing an unrelated node does not throw away
+what the container found out, but changing `CASCADE_ENDPOINT_FAMILY` overrules it — the
+operator said something newer.
 
 `saucewg nodes` grows a `VIA` column — and an `IPV6` one — once the cascade has an
 IPv6 half, and lists exactly as it always did while it does not:

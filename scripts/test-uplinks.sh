@@ -1344,6 +1344,26 @@ uplinks_reload
 uplinks_write_state
 check "the bridge's own ULA is not IPv6 egress either" \
     "4 198.51.100.20:51820" "$(dialling ula)"
+# Giving up on a silent family is for finding one that works. Somewhere this host
+# cannot send from is not somewhere else to go: the flip cannot handshake, and it
+# spends a window the family that does work would have spent retrying.
+export CASCADE_ENDPOINT_FAMILY=4
+nodes "[$(node_both noflip 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10)]"
+uplinks_reload
+FAKE_HS[$(iface_of noflip)]=0
+uplinks_refresh_health
+uplinks_refresh_health
+uplinks_refresh_health
+uplinks_refresh_health
+check "and a silent uplink is not moved onto one it cannot reach" "4" "${UP_EPFAM[0]}"
+check "so it keeps retrying the endpoint that might answer" \
+    "198.51.100.20:51820" "$(conf_field noflip Endpoint)"
+# Left handshaking, so the slot's failure count does not follow this node into
+# whatever the next test puts in it.
+FAKE_HS[$(iface_of noflip)]=$(date +%s)
+uplinks_refresh_health
+uplinks_refresh_health
+export CASCADE_ENDPOINT_FAMILY=auto
 FAKE_GLOBAL6="2001:db8:ffff::1/128"
 
 echo "64. the operator's preference overrides what the host can reach"
@@ -1574,6 +1594,13 @@ check "and only the bridge's own traffic is sent that way" \
 uplink_activate 0 force
 check "the active uplink is still what carries clients" "$(iface_of one)" "$(cascade_default)"
 check "and both ways out are still there" \
+    "$(iface_of one) $(iface_of two)" "$(bridge6_exits)"
+# Deleting an interface takes its routes with it, and an uplink is rebuilt every
+# time it moves between families. Putting the route back only on a full reload
+# would mean the first flip quietly cost that node its IPv6 reporting.
+uplink_stop 1
+uplink_setup 1
+check "a rebuilt uplink gets its way out back" \
     "$(iface_of one) $(iface_of two)" "$(bridge6_exits)"
 uplinks_teardown
 check "tearing down takes them with it" "" "$(bridge6_exits)"

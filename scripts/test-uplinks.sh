@@ -57,7 +57,9 @@ IPT="$WORK/iptables"       # table|chain|rule, in chain order
 IPT_CHAINS="$WORK/chains"  # table|chain, for the ones created with -N
 IPT_COUNT="$WORK/counters" # rule key <US> packets, what the kernel would have counted
 SETS="$WORK/ipsets"        # one file per set: address <TAB> packets <TAB> timeout
+PINGBIND="$WORK/pingbind"  # what the last IPv6 probe passed to -I
 : > "$ROUTES"; : > "$RULES"; : > "$IPT"; : > "$IPT_CHAINS"; : > "$IPT_COUNT"; : > "$IFACE_ADDRS"
+: > "$PINGBIND"
 mkdir -p "$SETS"
 
 # What the entry node's own default route looks like, per family. Reassigned by the
@@ -314,10 +316,25 @@ conntrack() { :; }
 FAKE_PING=fail
 FAKE_PING6=fail
 ping() {
-    local want=$FAKE_PING x
+    local want=$FAKE_PING six=false bind="" next=false x
     for x in "$@"; do
-        [ "$x" != -6 ] || want=$FAKE_PING6
+        if $next; then bind=$x; next=false; continue; fi
+        case $x in
+            -6) six=true; want=$FAKE_PING6 ;;
+            -I) next=true ;;
+        esac
     done
+    if $six; then
+        printf '%s\n' "$bind" > "$PINGBIND"
+        # The kernel refuses a device-bound IPv6 send whose route is not in the main
+        # table, and the bridge's way out lives in CASCADE_BRIDGE6_TABLE behind a rule
+        # keyed on the source address. Source selection happens after the route
+        # lookup, so an interface-bound probe has nothing for the rule to match on and
+        # gets ENETUNREACH — however healthy the bridge is. Modelled rather than
+        # swallowed, because binding the interface is the obvious thing to write and
+        # it reports a working bridge as broken.
+        case $bind in *:*) ;; *) return 1 ;; esac
+    fi
     [ "$want" = ok ] || return 1
     printf 'rtt min/avg/max/mdev = 11.1/22.2/33.3/4.4 ms\n'
 }
@@ -1521,6 +1538,8 @@ check "once IPv6 answers, it is published as up" "true" "$(node_field dual healt
 check "with the round trip it took" "22.2" "$(node_field dual latency6_ms)"
 check "beside the target it was measured against" \
     "2606:4700:4700::1111" "$(jq -r .bridge.probe_target6 "$UPLINK_STATE_FILE")"
+check "and it was sent from the bridge address, not bound to the interface" \
+    "fd00:77::2" "$(cat "$PINGBIND")"
 
 echo "72. one exit node can sit out the IPv6 bridge while the others use it"
 # Half a dual-stack cascade can be IPv4-only — an exit node not rebuilt yet, or

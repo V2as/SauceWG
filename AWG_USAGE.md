@@ -745,6 +745,13 @@ no route at all, and IPv6 refuses it, which is why a bridge configured correctly
 ends can still report every node `healthy6: false` on an entry node that has not been
 updated to a version with that route.
 
+The address is what the probe binds, not the interface, and the difference is not
+cosmetic. The rule that reaches that table matches on the bridge prefix as a source,
+and the kernel selects a source only after it has looked a route up: an
+interface-bound send therefore has nothing for the rule to match on and fails with
+`ENETUNREACH` no matter how healthy the bridge is. If you reimplement this probe,
+bind the address.
+
 The reason to care, as an integrator: **`healthy6` is reported and never acted on.**
 An exit node whose IPv6 has broken keeps `healthy: true`, stays active and carries
 client traffic. Clients are IPv4, so failing them over would cost them a working
@@ -1104,7 +1111,7 @@ Host metrics, client totals, live throughput, and the cascade summary:
 
 ```json
 {
-  "panel_title": "SauceWG", "version": "1.5.0",
+  "panel_title": "SauceWG", "version": "1.5.1",
   "cpu_percent": 3.4, "cpu_cores": 2,
   "mem_total": 2084986880, "mem_used": 903168000,
   "disk_total": 41660260352, "disk_used": 9331159040,
@@ -1336,6 +1343,11 @@ Values the central system may need to know about, set in the entry node's `.env`
 * **`healthy6: false` is not an outage.** An exit node that cannot reach the IPv6
   internet keeps carrying clients, who are IPv4. It is worth an alert to you and
   deliberately not a failover to SauceWG.
+* **`healthy6: false` on every node at once is a claim about the entry node.** A
+  per-node IPv6 failure is a per-node fault; all of them failing together is the entry
+  node unable to send from the bridge at all, and the bridge may be carrying traffic
+  perfectly while it says so. Check it by hand before believing it:
+  `ping -6 -I <address6> <probe_target6>` from the `awg` container.
 * **IPv6 is two switches, not one.** Dialling an exit node over IPv6 and carrying IPv6
   through the cascade are independent: either without the other is a valid, working
   configuration.

@@ -1725,9 +1725,15 @@ uplinks_fallback() {
 # fix a family none of them is using. What this is for is telling an operator that
 # the IPv6 bridge they configured is or is not working — before anything depends
 # on it. When client IPv6 arrives, this becomes a second gate rather than a report.
+#
+# Binds the bridge address rather than the interface, unlike the IPv4 probe. The
+# route that carries this lives in CASCADE_BRIDGE6_TABLE behind a rule matching the
+# bridge prefix as source, and source selection happens after the route lookup: a
+# device-bound send has no source yet, so the rule cannot match and the kernel
+# answers ENETUNREACH from the main table. Naming the address makes the rule match.
 uplink_probe6() {
     local i=$1
-    local iface=${UP_IFACE[$i]} out rtt
+    local out rtt
 
     UP_HEALTHY6[i]=false
     UP_LATENCY6[i]=""
@@ -1735,7 +1741,8 @@ uplink_probe6() {
     [ "$CASCADE_PROBE_ENABLED" = "true" ] || return 0
     [ -n "$CASCADE_PROBE_TARGET6" ] || return 0
 
-    if out=$(ping -6 -I "$iface" -c 1 -W "$CASCADE_PROBE_TIMEOUT" -q "$CASCADE_PROBE_TARGET6" 2>/dev/null); then
+    if out=$(ping -6 -I "${UP_ADDR6[$i]%%/*}" -c 1 -W "$CASCADE_PROBE_TIMEOUT" \
+        -q "$CASCADE_PROBE_TARGET6" 2>/dev/null); then
         rtt=$(printf '%s' "$out" | awk -F'/' '/min\/avg/ {print $5; exit}' 2>/dev/null) || rtt=""
         UP_LATENCY6[i]=$rtt
         UP_HEALTHY6[i]=true

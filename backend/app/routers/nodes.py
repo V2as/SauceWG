@@ -95,6 +95,7 @@ def _serialise(
         address6=node.address6 or meta.get("address6") or None,
         healthy6=node.healthy6,
         latency6_ms=node.latency6_ms,
+        listen_port=node.listen_port,
         public_key=node.public_key,
         peer_public_key=node.peer_public_key,
         paired=node.paired,

@@ -147,6 +147,16 @@ setup_server_iface() {
             echo "PublicKey = ${AWG_PEER_PUBLIC_KEY}"
             [ -n "${AWG_PEER_PSK:-}" ] && echo "PresharedKey = ${AWG_PEER_PSK}"
             echo "AllowedIPs = $(peer_allowed_ips)"
+            # Normally the entry node dials this one and there is nothing to put
+            # here. An endpoint turns that around: this node reaches inwards and
+            # the tunnel is established in whichever direction works, which is not
+            # always both. The keepalive is what holds it open afterwards — without
+            # it the tunnel goes quiet the moment clients do, and the entry node has
+            # no address to wake it up at.
+            if [ -n "${AWG_PEER_ENDPOINT:-}" ]; then
+                echo "Endpoint = ${AWG_PEER_ENDPOINT}"
+                echo "PersistentKeepalive = ${AWG_PEER_KEEPALIVE:-25}"
+            fi
         fi
         if [ -f "${AWG_CONFIG_DIR}/peers.conf" ]; then
             echo

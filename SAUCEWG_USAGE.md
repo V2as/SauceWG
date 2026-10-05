@@ -116,6 +116,7 @@ Global flags may appear before or after the subcommand, with one exception:
 | `--uplink-subnet CIDR` | `10.77.0.0/24` | Address pool for cascade uplinks |
 | `--uplink-subnet6 CIDR` | none | IPv6 half of the cascade bridge, e.g. `fd00:77::/64`. Omitted is an IPv4-only cascade; see [§4.10](#410-ipv6) |
 | `--endpoint-family F` | `auto` | Which family exit nodes publishing both are dialled over: `auto`, `4` or `6` |
+| `--uplink-port-base N` | none | Fixed ports for the uplinks so an exit node can dial this node; see [§4.11](#411-exit-nodes-that-dial-in) |
 | `--endpoint-host HOST` | detected | Public address written into client configs. Set it on a NATed server |
 | `--protocol V` | `2.0` | AmneziaWG generation clients connect with — `1.0` (alias `legacy`), `1.5` or `2.0` |
 | `--signature NAME` | `quic` | The `I1` disguise on 1.5 and 2.0: `quic`, `dns`, `random`, `short`, `none`, or a literal spec |
@@ -778,6 +779,42 @@ an IPv6 `host`, or **Exit nodes → Add exit node** with an IPv6 address in the 
 The panel needs IPv6 of its own to reach it, which is the one prerequisite nothing here
 can work around.
 
+### 4.11 Exit nodes that dial in
+
+Sometimes an exit node is fine and the path to it is not — in one direction. The
+symptom is an exit node that reads `down` with `never` for a handshake, while on the
+exit server itself `awg show awg0` shows bytes arriving from the entry node, or shows
+it sending to the entry node and getting nothing back. Filtering does not have to be
+symmetrical, and a tunnel established from the exit node carries traffic both ways just
+like one established from here.
+
+On the entry node, give the uplinks fixed ports and read off what to run:
+
+```bash
+saucewg dial-in on
+saucewg dial-in
+#   port base 51820       uplinks listen on 51822-52074/udp
+#   host      203.0.113.10
+#
+#   NAME    PORT   RUN ON THE EXIT NODE
+#   eu-nl   51822  saucewg node-pair --peer-key <key> --peer-endpoint 203.0.113.10:51822
+#   eu-de   51823  saucewg node-pair --peer-key <key> --peer-endpoint 203.0.113.10:51823
+```
+
+Then run that line on the exit node that cannot be reached. It keeps the tunnel open
+with a keepalive, because otherwise the tunnel goes quiet when clients do and the entry
+node has no address at which to wake it.
+
+Only the nodes you tell start dialling; the rest behave exactly as before. Both ends
+dialling at once is fine — whichever handshake lands first wins, and the entry node
+adopts the address it hears from.
+
+Two things worth knowing. The port follows the uplink's address rather than its
+position, so the node on `10.77.0.4` keeps `51824` when you remove the node in front of
+it. And this helps even where both directions work: an exit node sends to the port it
+last heard from, so an entry node whose port the kernel picked gets talked to at the
+wrong port for a keepalive interval after every restart.
+
 ---
 
 ## 5. Driving it from a bot
@@ -1203,6 +1240,8 @@ Settings that matter for node management specifically:
 | `CASCADE_UPLINK_SUBNET6` | | The IPv6 half of the bridge to the exit nodes (§4.10). Empty is an IPv4-only cascade; `saucewg bridge` sets it |
 | `CASCADE_ENDPOINT_FAMILY` | `auto` | Which family a node publishing both endpoints is dialled over: `auto`, `4`, `6` |
 | `CASCADE_PROBE_TARGET6` | `2606:4700:4700::1111` | What `healthy6` is measured against, through the tunnel |
+| `CASCADE_UPLINK_PORT_BASE` | | Fixed ports for the uplinks, counted up by host number, so an exit node can dial in (§4.11). Empty leaves the port to the kernel; `saucewg dial-in` sets it |
+| `AWG_PEER_ENDPOINT` | | **Exit node only.** Where to dial the entry node, as `host:port`, instead of waiting to be dialled (§4.11). `AWG_PEER_KEEPALIVE` holds it open |
 | `AWG_SUBNET6` | | **Exit node only.** The IPv6 uplink subnet it serves and NATs; must equal the entry node's `CASCADE_UPLINK_SUBNET6` |
 | `CASCADE_DIRECT_FILE` | `/etc/amnezia/host/direct-routes.json` | Where the *node container* reads the direct route list |
 | `CASCADE_DIRECT_ROUTES` | | The same list inline, overriding the file |

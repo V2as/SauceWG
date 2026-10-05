@@ -1606,7 +1606,47 @@ uplinks_teardown
 check "tearing down takes them with it" "" "$(bridge6_exits)"
 check "and stops routing anything there" "" "$(bridge6_rule)"
 
-echo "76. tearing the node down leaves no torrent rule behind"
+echo "76. an uplink can be given a port of its own to be dialled on"
+# Filtering is not always symmetrical, so a tunnel the exit node establishes is
+# worth having. That needs a port it can be pointed at, and one the kernel picks
+# changes on every restart.
+nodes "[$(node_both one 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10),
+        $(node two 203.0.113.31:51820 9 20)]"
+uplinks_reload
+uplinks_write_state
+check "no port is fixed by default" "null" "$(node_field one listen_port)"
+check "and none appears in the config" "" "$(conf_field one ListenPort)"
+export CASCADE_UPLINK_PORT_BASE=51820
+uplinks_reload
+uplinks_write_state
+# Numbered off the host number rather than the slot, so editing the list around a
+# node does not move the port an exit node has already been told to dial.
+check "the port follows the uplink's own address" "51822" "$(node_field one listen_port)"
+check "and so does its neighbour's" "51829" "$(node_field two listen_port)"
+check "which is what the interface listens on" "51822" "$(conf_field one ListenPort)"
+nodes "[$(node two 203.0.113.31:51820 9 20)]"
+uplinks_reload
+uplinks_write_state
+check "removing the node in front of it leaves its port alone" \
+    "51829" "$(node_field two listen_port)"
+export CASCADE_UPLINK_PORT_BASE=
+uplinks_reload
+uplinks_write_state
+check "and turning it off gives the port back to the kernel" "null" "$(node_field two listen_port)"
+
+echo "77. an uplink with a key but no endpoint waits to be dialled"
+# An endpoint is what lets this end dial; a peer is what lets the other end. An
+# exit node reaching inwards needs the second without the first, and treating a
+# missing endpoint as "unpaired" left nothing for it to reach.
+nodes "[{\"name\":\"inbound\",\"public_key\":\"KEY-inbound\",\"address\":\"10.77.0.2/32\",\"priority\":10}]"
+uplinks_reload
+uplinks_write_state
+check "the peer is configured" "KEY-inbound" "$(conf_field inbound PublicKey)"
+check "with nothing to dial" "" "$(conf_field inbound Endpoint)"
+check "and the panel is told there is no endpoint" "null" "$(node_field inbound endpoint)"
+check "while the uplink itself is up" "0.0.0.0/0, ::/0" "$(conf_field inbound AllowedIPs)"
+
+echo "78. tearing the node down leaves no torrent rule behind"
 torrent_switch '{"enabled": true, "mode": "strict"}'
 torrent_reload
 check "the guard is up" "-i awg0" "$(torrent_hook_of "$TORRENT_CHAIN")"

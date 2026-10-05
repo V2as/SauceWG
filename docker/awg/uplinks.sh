@@ -66,6 +66,22 @@ CASCADE_PROBE_TARGET6=${CASCADE_PROBE_TARGET6:-2606:4700:4700::1111}
 # The port to assume for an endpoint written without one, which is how a node that
 # answers on the same port over both families names it once.
 CASCADE_PORT_DEFAULT=${CASCADE_PORT_DEFAULT:-51820}
+
+# Where an uplink listens, so that an exit node can dial the entry node instead of
+# only being dialled by it. Empty leaves the port to the kernel, which is what an
+# uplink has always done and what every installation made before this is.
+#
+# The reason to set it: filtering is not always symmetrical. An exit node whose
+# inbound path is dropped can still reach the entry node, and a tunnel established
+# in that direction carries traffic both ways like any other. It also keeps the
+# port stable across a restart, which matters because an exit node goes on sending
+# to the port it last heard from — a restarted entry node with an ephemeral port
+# spends the next keepalive interval being talked to at an address nobody is
+# listening on.
+#
+# One port per uplink, numbered off the uplink's own host number rather than its
+# slot, so a node keeps its port when the list around it is edited.
+CASCADE_UPLINK_PORT_BASE=${CASCADE_UPLINK_PORT_BASE:-}
 # The entrypoint sets these too; defaulting them here as well keeps this file
 # sourceable on its own, which is what the reload tests do.
 CASCADE_TABLE=${CASCADE_TABLE:-451}
@@ -122,7 +138,7 @@ UPLINK_SLOTS_FILE=${UPLINK_SLOTS_FILE:-${AWG_CONFIG_DIR:-/etc/amnezia/amneziawg}
 UP_NAME=(); UP_IFACE=(); UP_ENDPOINT=(); UP_PEERKEY=(); UP_PSK=(); UP_ADDR=()
 UP_PRIO=(); UP_MTU=(); UP_KEEPALIVE=(); UP_PROTOCOL=()
 UP_PUBKEY=(); UP_HEALTHY=(); UP_FAILS=(); UP_OKS=(); UP_LATENCY=(); UP_HS=(); UP_RX=(); UP_TX=()
-UP_PID=()
+UP_PID=(); UP_PORT=()
 
 # The two endpoints a node may publish, as configured, and which of them
 # UP_ENDPOINT currently holds. UP_ENDPOINT is the one being dialled rather than the
@@ -214,6 +230,16 @@ uplink_index_of() {
 # True when this cascade's bridge carries IPv6 as well as IPv4.
 bridge_has_v6() {
     [ -n "${CASCADE_UPLINK_SUBNET6:-}" ]
+}
+
+# Where one uplink listens, or empty when the kernel picks. Out-of-range values are
+# ignored rather than fatal, for the same reason a bad family preference is.
+uplink_listen_port() {
+    local i=$1 base=${CASCADE_UPLINK_PORT_BASE:-} port
+    case $base in ''|*[!0-9]*) return 0 ;; esac
+    port=$((base + $(addr_host4 "${UP_ADDR[$i]:-}" "$((i + 2))")))
+    [ "$port" -gt 0 ] && [ "$port" -le 65535 ] || return 0
+    printf '%s' "$port"
 }
 
 # The configured preference, canonicalised. Anything unrecognised is `auto`
@@ -510,7 +536,7 @@ uplinks_parse() {
     UP_NAME=(); UP_IFACE=(); UP_ENDPOINT=(); UP_PEERKEY=(); UP_PSK=(); UP_ADDR=()
     UP_PRIO=(); UP_MTU=(); UP_KEEPALIVE=(); UP_PROTOCOL=()
     UP_PUBKEY=(); UP_HEALTHY=(); UP_FAILS=(); UP_OKS=(); UP_LATENCY=(); UP_HS=()
-    UP_RX=(); UP_TX=(); UP_PID=()
+    UP_RX=(); UP_TX=(); UP_PID=(); UP_PORT=()
     UP_ENDPOINT4=(); UP_ENDPOINT6=(); UP_FAMILY=(); UP_EPFAM=(); UP_FLIPS=()
     UP_ADDR6=(); UP_HEALTHY6=(); UP_LATENCY6=(); UP_SILENT=()
     UP_OBF=()
@@ -551,6 +577,10 @@ uplinks_parse() {
         # halves stay in step — 10.77.0.5/32 beside fd00:77::5/128 — when the list
         # pins addresses, which it does as soon as a node has ever been removed.
         UP_ADDR6[idx]=$(uplink_bridge_address6 "$name" "$addr6" "$(addr_host4 "${UP_ADDR[$idx]}" "$((idx + 2))")")
+        # Decided here rather than when the interface is built, so that a changed
+        # port base is something a reload can see: the signature a rebuild is
+        # judged by is compared before anything is built.
+        UP_PORT[idx]=$(uplink_listen_port "$idx")
         UP_PRIO[idx]=${prio:-$((idx + 1))}
         UP_MTU[idx]=${mtu:-${CASCADE_MTU:-1380}}
         UP_KEEPALIVE[idx]=${keepalive:-${CASCADE_KEEPALIVE:-25}}
@@ -626,6 +656,7 @@ uplinks_parse() {
         UP_PSK[0]=""
         UP_ADDR[0]="${base}.2/32"
         UP_ADDR6[0]=$(uplink_bridge_address6 "exit-1" "" 2)
+        UP_PORT[0]=$(uplink_listen_port 0)
         UP_PRIO[0]=1
         UP_MTU[0]=${CASCADE_MTU:-1380}
         UP_KEEPALIVE[0]=${CASCADE_KEEPALIVE:-25}
@@ -662,10 +693,10 @@ uplinks_parse() {
 # rebuilt — and one that was moved to the other family does.
 uplink_signature() {
     local i=$1 suffix
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
         "${UP_IFACE[$i]}" "${UP_ENDPOINT[$i]}" "${UP_PEERKEY[$i]}" "${UP_PSK[$i]}" \
         "${UP_ADDR[$i]}" "${UP_ADDR6[$i]:-}" "${UP_MTU[$i]}" "${UP_KEEPALIVE[$i]}" \
-        "${UP_PROTOCOL[$i]}"
+        "${UP_PROTOCOL[$i]}" "${UP_PORT[$i]:-}"
     for suffix in $AWG_OBF_SUFFIXES; do
         printf '|%s' "${UP_OBF[$i,$suffix]:-}"
     done
@@ -1360,15 +1391,23 @@ uplink_setup() {
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv}"
+        [ -z "${UP_PORT[$i]}" ] || echo "ListenPort = ${UP_PORT[$i]}"
         emit_obfuscation "NODE_" "$protocol"
-        if [ -n "${UP_PEERKEY[$i]}" ] && [ -n "${UP_ENDPOINT[$i]}" ]; then
+        # An endpoint is what lets this end dial; it is not what makes a peer. A
+        # peer with a key and no endpoint waits to be dialled instead, which is the
+        # whole of what an exit node reaching inwards needs from this side.
+        if [ -n "${UP_PEERKEY[$i]}" ]; then
             echo
             echo "[Peer]"
             echo "PublicKey = ${UP_PEERKEY[$i]}"
             [ -n "${UP_PSK[$i]}" ] && echo "PresharedKey = ${UP_PSK[$i]}"
             echo "AllowedIPs = ${allowed}"
-            echo "Endpoint = ${UP_ENDPOINT[$i]}"
-            echo "PersistentKeepalive = ${UP_KEEPALIVE[$i]}"
+            if [ -n "${UP_ENDPOINT[$i]}" ]; then
+                echo "Endpoint = ${UP_ENDPOINT[$i]}"
+                echo "PersistentKeepalive = ${UP_KEEPALIVE[$i]}"
+            else
+                log "uplink ${name}: no endpoint to dial; ${iface} waits to be dialled"
+            fi
         else
             log "uplink ${name} has no peer yet; ${iface} starts unpaired"
         fi
@@ -1421,7 +1460,7 @@ uplink_setup() {
     done
     params_store "$parfile" "${stored[@]}"
 
-    log "uplink ${name} up on ${iface} (${UP_ADDR[$i]}${UP_ADDR6[$i]:+, ${UP_ADDR6[$i]}}) speaking AmneziaWG ${protocol} towards ${UP_ENDPOINT[$i]:-<unpaired>}${UP_EPFAM[$i]:+ over IPv${UP_EPFAM[$i]}} (pub ${UP_PUBKEY[$i]})"
+    log "uplink ${name} up on ${iface} (${UP_ADDR[$i]}${UP_ADDR6[$i]:+, ${UP_ADDR6[$i]}})${UP_PORT[$i]:+ listening on ${UP_PORT[$i]}} speaking AmneziaWG ${protocol} towards ${UP_ENDPOINT[$i]:-<unpaired>}${UP_EPFAM[$i]:+ over IPv${UP_EPFAM[$i]}} (pub ${UP_PUBKEY[$i]})"
     return 0
 }
 
@@ -1900,7 +1939,7 @@ uplinks_write_state() {
 
     if for i in "${!UP_NAME[@]}"; do
         if [ "$i" -eq "$ACTIVE_INDEX" ]; then is_active=true; else is_active=false; fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "${UP_NAME[$i]}" "${UP_IFACE[$i]}" "${UP_ENDPOINT[$i]}" "${UP_ADDR[$i]}" \
             "${UP_PRIO[$i]}" "${UP_PUBKEY[$i]}" "${UP_PEERKEY[$i]}" \
             "${UP_HEALTHY[$i]}" "$is_active" \
@@ -1908,7 +1947,7 @@ uplinks_write_state() {
             "${UP_PROTOCOL[$i]}" \
             "${UP_ENDPOINT4[$i]:-}" "${UP_ENDPOINT6[$i]:-}" "${UP_EPFAM[$i]:-}" \
             "${UP_ADDR6[$i]:-}" "${UP_HEALTHY6[$i]:-false}" "${UP_LATENCY6[$i]:-}" \
-            "${UP_FAMILY[$i]:-}"
+            "${UP_FAMILY[$i]:-}" "${UP_PORT[$i]:-}"
     done | jq -R -s \
         --arg mode "$UPLINK_MODE" \
         --arg pin "$UPLINK_PIN" \
@@ -2013,6 +2052,11 @@ uplinks_write_state() {
                     healthy6: ((.[18] // "") == "true"),
                     latency6_ms: (if (.[19] // "") == "" then null else (.[19] | tonumber) end),
                     priority: (.[4] | tonumber),
+                    # Where this uplink listens, when it has been given a port of
+                    # its own. That is what an exit node configured to dial inwards
+                    # is pointed at, and null is the kernel having picked — which
+                    # nothing can be pointed at, because it changes on restart.
+                    listen_port: (if (.[21] // "") == "" then null else (.[21] | tonumber) end),
                     public_key: .[5],
                     peer_public_key: (if .[6] == "" then null else .[6] end),
                     # An uplink is only as healthy as its last handshake, so a

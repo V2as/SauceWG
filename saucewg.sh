@@ -290,6 +290,31 @@ require_protocol() {
 # fd00:77::/64 pairs with 10.77.0.0/24 so the two halves read as one link.
 CASCADE_UPLINK_SUBNET6_DEFAULT="fd00:77::/64"
 
+# Uplink ports are counted up from here by host number, so the first exit node on
+# 10.77.0.2 listens on 51822. Clear of the node's own port, which defaults to 443.
+CASCADE_UPLINK_PORT_BASE_DEFAULT=51820
+
+# The whole range the uplinks can be given, which is what gets opened in the
+# firewall: one rule that stays correct when an exit node is added, rather than a
+# rule per node and a trap for whoever adds the next one.
+uplink_port_range() {
+    printf '%s %s' "$(($1 + 2))" "$(($1 + 254))"
+}
+
+require_port_base() {
+    local base=${1:-}
+    case $base in
+        ''|no|off|false) printf '' ;;
+        auto|yes|on|true) printf '%s' "$CASCADE_UPLINK_PORT_BASE_DEFAULT" ;;
+        *[!0-9]*) die "--uplink-port-base takes a port number, auto, or none" ;;
+        *)
+            [ "$base" -ge 1024 ] && [ "$((base + 254))" -le 65535 ] \
+                || die "--uplink-port-base must leave room for 254 ports below 65535"
+            printf '%s' "$base"
+            ;;
+    esac
+}
+
 require_endpoint_family() {
     case $(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]') in
         ''|auto|any) printf 'auto' ;;
@@ -704,6 +729,9 @@ services:
       # or 6. `auto` prefers IPv6 when this node has IPv6, because an entry node's
       # IPv4 is the address a blocklist has.
       CASCADE_ENDPOINT_FAMILY: ${CASCADE_ENDPOINT_FAMILY:-auto}
+      # Fixed ports for the uplinks, so an exit node can dial this node rather than
+      # only being dialled by it. Empty leaves the port to the kernel.
+      CASCADE_UPLINK_PORT_BASE: ${CASCADE_UPLINK_PORT_BASE:-}
       CASCADE_PROBE_ENABLED: ${CASCADE_PROBE_ENABLED:-true}
       CASCADE_PROBE_TARGET: ${CASCADE_PROBE_TARGET:-1.1.1.1}
       CASCADE_PROBE_TARGET6: ${CASCADE_PROBE_TARGET6:-2606:4700:4700::1111}
@@ -861,6 +889,10 @@ services:
       AWG_I5: ${AWG_I5:-}
       AWG_PEER_PUBLIC_KEY: ${AWG_PEER_PUBLIC_KEY:-}
       AWG_PEER_PSK: ${AWG_PEER_PSK:-}
+      # Set to dial the entry node from here instead of waiting to be dialled,
+      # for a path that carries what this node sends but not what it is sent.
+      AWG_PEER_ENDPOINT: ${AWG_PEER_ENDPOINT:-}
+      AWG_PEER_KEEPALIVE: ${AWG_PEER_KEEPALIVE:-25}
       AWG_PEER_ALLOWED_IPS: ${AWG_PEER_ALLOWED_IPS:-10.77.0.0/24}
       WAN_IFACE: ${WAN_IFACE:-}
       TORRENT_BLOCK: ${TORRENT_BLOCK:-}
@@ -890,7 +922,7 @@ cmd_install() {
 
     local domain="" http_port="" https_port="" admin_user="admin" admin_password=""
     local awg_port=443 subnet=10.8.0.0/24 uplink_subnet=10.77.0.0/24 endpoint_host=""
-    local uplink_subnet6="" endpoint_family=auto
+    local uplink_subnet6="" endpoint_family=auto uplink_port_base=""
     local start=true reinstall=false protocol="" signature=""
 
     while [ $# -gt 0 ]; do
@@ -907,6 +939,9 @@ cmd_install() {
             # takes the default ULA prefix, which is what anyone who just wants it
             # on means; a prefix of your own goes here instead.
             --uplink-subnet6) uplink_subnet6=$2; shift 2 ;;
+            # Fixed ports for the uplinks, so an exit node can dial inwards.
+            # `--uplink-port-base auto` takes the default.
+            --uplink-port-base) uplink_port_base=$2; shift 2 ;;
             --endpoint-family) endpoint_family=$2; shift 2 ;;
             --endpoint-host|--host) endpoint_host=$2; shift 2 ;;
             --protocol|--awg-version) protocol=$2; shift 2 ;;
@@ -921,6 +956,7 @@ cmd_install() {
         auto|yes|on|true) uplink_subnet6=$CASCADE_UPLINK_SUBNET6_DEFAULT ;;
         no|off|false) uplink_subnet6="" ;;
     esac
+    uplink_port_base=$(require_port_base "$uplink_port_base")
     endpoint_family=$(require_endpoint_family "$endpoint_family")
 
     # A fresh install has no clients to keep working, so it starts on the newest
@@ -1047,6 +1083,10 @@ CASCADE_UPLINK_SUBNET6=${uplink_subnet6}
 # a blocklist has, and the same exit node answers on IPv6 through filters that were
 # never built to look there.
 CASCADE_ENDPOINT_FAMILY=${endpoint_family}
+# Where the uplinks listen, one port per exit node counted up from here, so that an
+# exit node can dial this node instead of only being dialled. Empty leaves the port
+# to the kernel, which is what an uplink has always done. See: saucewg dial-in
+CASCADE_UPLINK_PORT_BASE=${uplink_port_base}
 
 # Destinations blocked by dropping the TCP handshake to their IPv4, which this
 # entry node reopens over IPv6 or by retrying. auto engages only while clients are
@@ -1334,6 +1374,10 @@ AWG_I5=
 AWG_PEER_PUBLIC_KEY=${peer_key}
 AWG_PEER_PSK=${psk}
 AWG_PEER_ALLOWED_IPS=${peer_allowed}
+# Where to dial the entry node, when this node reaches inwards rather than waiting
+# to be dialled. Empty is the usual arrangement. See: saucewg node-pair --peer-endpoint
+AWG_PEER_ENDPOINT=
+AWG_PEER_KEEPALIVE=25
 WAN_IFACE=
 
 # BitTorrent, blocked in the traffic this node forwards. This is the server a
@@ -1391,14 +1435,25 @@ EOF
 
 # The node is only dialled by the entry node, but a default-deny firewall would
 # still swallow the handshake, so punch the port through the common ones.
+# Takes a single port, or "from to" for a range. The two firewalls spell a range
+# differently, which is the only reason this knows about ranges at all.
 open_node_port() {
-    local port=$1
+    local from=$1 to=${2:-} ufw_spec firewalld_spec label
+    if [ -n "$to" ]; then
+        ufw_spec="${from}:${to}"
+        firewalld_spec="${from}-${to}"
+        label="${from}-${to}"
+    else
+        ufw_spec=$from
+        firewalld_spec=$from
+        label=$from
+    fi
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
-        ufw allow "${port}/udp" >/dev/null 2>&1 && log "opened ${port}/udp in ufw" || true
+        ufw allow "${ufw_spec}/udp" >/dev/null 2>&1 && log "opened ${label}/udp in ufw" || true
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 && log "opened ${port}/udp in firewalld" || true
+        firewall-cmd --permanent --add-port="${firewalld_spec}/udp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 && log "opened ${label}/udp in firewalld" || true
     fi
 }
 
@@ -1510,29 +1565,54 @@ cmd_node_pair() {
     [ "$(role)" = "exit" ] || die "node-pair only applies to an exit node"
 
     local peer_key="" psk="" clear_psk=false
+    local peer_endpoint="" keepalive="" set_endpoint=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --peer-key|--key) peer_key=$2; shift 2 ;;
             --psk) psk=$2; shift 2 ;;
             --psk-stdin) psk=$(read_stdin_secret); shift ;;
             --no-psk) clear_psk=true; shift ;;
+            # Dial the entry node from here instead of waiting to be dialled. For
+            # the case the entry node cannot reach this one but this one can reach
+            # it, which is what one-directional filtering looks like.
+            --peer-endpoint|--dial) peer_endpoint=$2; set_endpoint=true; shift 2 ;;
+            --no-peer-endpoint|--no-dial) peer_endpoint=""; set_endpoint=true; shift ;;
+            --keepalive) keepalive=$2; shift 2 ;;
             *) die "unknown option for node-pair: $1" ;;
         esac
     done
     [ -n "$peer_key" ] || die "--peer-key is required"
 
+    case $peer_endpoint in
+        '') ;;
+        *:*) ;;
+        *) die "--peer-endpoint takes host:port, like 203.0.113.10:51822" ;;
+    esac
+    case $keepalive in
+        ''|*[!0-9]*) [ -z "$keepalive" ] || die "--keepalive takes a number of seconds" ;;
+    esac
+
     env_set "$ENV_FILE" AWG_PEER_PUBLIC_KEY "$peer_key"
     [ -z "$psk" ] || env_set "$ENV_FILE" AWG_PEER_PSK "$psk"
     [ "$clear_psk" = false ] || env_set "$ENV_FILE" AWG_PEER_PSK ""
+    [ "$set_endpoint" = false ] || env_set "$ENV_FILE" AWG_PEER_ENDPOINT "$peer_endpoint"
+    [ -z "$keepalive" ] || env_set "$ENV_FILE" AWG_PEER_KEEPALIVE "$keepalive"
 
     log "pairing with the entry node and restarting"
     compose up -d --force-recreate awg >&2
     wait_for_params
 
+    local dialling
+    dialling=$(env_get "$ENV_FILE" AWG_PEER_ENDPOINT || true)
     if [ "$JSON_OUTPUT" = true ]; then
-        jq -n --arg key "$peer_key" '{ok: true, paired: true, peer_public_key: $key}'
+        jq -n --arg key "$peer_key" --arg dial "$dialling" \
+            '{ok: true, paired: true, peer_public_key: $key,
+              peer_endpoint: (if $dial == "" then null else $dial end)}'
     else
         log "paired with ${peer_key}"
+        if [ -n "$dialling" ]; then
+            note "this node dials ${dialling} rather than waiting to be dialled"
+        fi
     fi
 }
 
@@ -2398,6 +2478,121 @@ cmd_bridge() {
 }
 
 # ---------------------------------------------------------------------------
+# Dial-in
+# ---------------------------------------------------------------------------
+#
+# Normally this node dials its exit nodes. Filtering is not always symmetrical,
+# though: a path that drops what this node sends can still carry what the exit node
+# sends, and a tunnel established from the far end carries traffic both ways like
+# any other. Turning this on gives each uplink a fixed port and prints what to run
+# on each exit node to point it here.
+#
+# It is worth having even where both directions work, because an uplink whose port
+# the kernel picks gets a new one on every restart, and an exit node goes on
+# sending to the port it last heard from.
+cmd_dial_in() {
+    require_entry
+
+    local action="${1:-}" base="" restart=true
+    case "$action" in
+        on|enable) base=$CASCADE_UPLINK_PORT_BASE_DEFAULT; shift ;;
+        off|disable) base=none; shift ;;
+        show|status) shift ;;
+        [0-9]*) base=$action; shift ;;
+        ''|-*) ;;
+        *) die "dial-in takes on, off, or a base port number" ;;
+    esac
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port-base|--base) base=$2; shift 2 ;;
+            --no-restart) restart=false; shift ;;
+            *) die "unknown option for dial-in: $1" ;;
+        esac
+    done
+
+    if [ -z "$base" ]; then
+        local configured host state
+        configured=$(env_get "$ENV_FILE" CASCADE_UPLINK_PORT_BASE || true)
+        host=$(env_get "$ENV_FILE" AWG_ENDPOINT_HOST || true)
+        [ -n "$host" ] || host=$(public_ip || echo "<this node>")
+        state=$(compose exec -T awg cat /var/run/amneziawg/uplinks.json 2>/dev/null) || state=""
+        printf '%s' "$state" | jq -e 'has("nodes")' >/dev/null 2>&1 || state=""
+
+        if [ "$JSON_OUTPUT" = true ]; then
+            jq -n --arg base "$configured" --arg host "$host" \
+                  --argjson live "$(printf '%s' "${state:-null}")" '
+                {port_base: (if $base == "" then null else ($base | tonumber) end),
+                 host: $host,
+                 nodes: (if $live == null then null else
+                     [$live.nodes[] | {name, listen_port,
+                        dial: (if .listen_port == null then null
+                               else "\($host):\(.listen_port)" end)}] end)}'
+            return
+        fi
+
+        if [ -z "$configured" ]; then
+            note "port base -         the kernel picks each uplink's port"
+            note ""
+            note "Exit nodes cannot be pointed at a port that changes on every restart."
+            note "Give the uplinks fixed ports with: saucewg dial-in on"
+            return
+        fi
+        local from to
+        read -r from to <<<"$(uplink_port_range "$configured")"
+        note "port base ${configured}       uplinks listen on ${from}-${to}/udp"
+        note "host      ${host}"
+        if [ -n "$state" ]; then
+            note ""
+            printf '%s' "$state" | jq -r --arg host "$host" '
+                "NAME\tPORT\tRUN ON THE EXIT NODE",
+                (.nodes | sort_by(.priority)[] |
+                    "\(.name)\t\(.listen_port // "-")\t" +
+                    (if .listen_port == null then "-"
+                     else "saucewg node-pair --peer-key \(.public_key) --peer-endpoint \($host):\(.listen_port)"
+                     end))' \
+                | column -t -s "$(printf '\t')"
+        fi
+        return
+    fi
+
+    need_root dial-in
+
+    case $base in
+        none|off|no|false) base="" ;;
+        *) base=$(require_port_base "$base") ;;
+    esac
+    env_set "$ENV_FILE" CASCADE_UPLINK_PORT_BASE "$base"
+
+    if [ -n "$base" ]; then
+        local from to
+        read -r from to <<<"$(uplink_port_range "$base")"
+        open_node_port "$from" "$to"
+        log "the uplinks now listen on ${from}-${to}/udp"
+        note ""
+        note "Each exit node has to be told where to dial before it will:"
+        note "  saucewg dial-in            # here, for the command to run on each"
+        note ""
+        note "Nothing changes for an exit node that is not told. This node goes on"
+        note "dialling as it always has, and a tunnel the far end builds is the same"
+        note "tunnel either way."
+    else
+        log "the uplinks go back to whatever port the kernel picks"
+        note "an exit node still configured to dial in will stop finding this node"
+    fi
+
+    if [ "$restart" = true ]; then
+        step "Applying"
+        compose up -d awg >&2
+        note "connected clients reconnect on their own within a few seconds"
+    else
+        note "not applied yet; apply it with: saucewg restart"
+    fi
+
+    [ "$JSON_OUTPUT" = false ] || jq -n --arg base "$base" \
+        '{ok: true, port_base: (if $base == "" then null else ($base | tonumber) end)}'
+}
+
+# ---------------------------------------------------------------------------
 # Bypass
 # ---------------------------------------------------------------------------
 #
@@ -3065,6 +3260,10 @@ cmd_update() {
             || env_set "$ENV_FILE" CASCADE_UPLINK_SUBNET6 ""
         grep -q '^CASCADE_ENDPOINT_FAMILY=' "$ENV_FILE" \
             || env_set "$ENV_FILE" CASCADE_ENDPOINT_FAMILY auto
+        # Empty, so an uplink goes on using whatever port the kernel picks and no
+        # exit node starts dialling inwards because of an update.
+        grep -q '^CASCADE_UPLINK_PORT_BASE=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" CASCADE_UPLINK_PORT_BASE ""
         grep -q '^CASCADE_PROBE_TARGET6=' "$ENV_FILE" \
             || env_set "$ENV_FILE" CASCADE_PROBE_TARGET6 2606:4700:4700::1111
     else
@@ -3324,6 +3523,9 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
     bridge on | off          Carry IPv6 inside the tunnels as well as IPv4
                              (or name a prefix: bridge fd00:77::/64)
     bridge auto | 4 | 6      Which endpoint to dial an exit node over when it has both
+    dial-in                  Each uplink's fixed port, and what to run on each exit node
+    dial-in on | off         Let an exit node dial this node instead of being dialled
+                             (or name a base port: dial-in 51820)
 
   Blocked destinations (entry node)
     bypass                   Destinations this node reopens, and whether it is doing so
@@ -3341,6 +3543,8 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
   Exit node
     node-info                Print this node's pairing object
     node-pair --peer-key K   Install the entry node's uplink key here
+                             (--peer-endpoint HOST:PORT dials the entry node from
+                             here instead of waiting to be dialled)
 
   AmneziaWG generation
     protocol                 Which generation this node serves
@@ -3448,6 +3652,7 @@ main() {
         remove-route)     cmd_remove_route "$@" ;;
         fallback)         cmd_fallback "$@" ;;
         bridge)           cmd_bridge "$@" ;;
+        dial-in|dialin)   cmd_dial_in "$@" ;;
         bypass)           cmd_bypass "$@" ;;
         torrents|torrent) cmd_torrents "$@" ;;
         node-info)        cmd_node_info "$@" ;;

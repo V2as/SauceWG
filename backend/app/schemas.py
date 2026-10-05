@@ -266,6 +266,10 @@ class ExitNode(BaseModel):
     # unhealthy and does not trigger failover.
     healthy6: bool = False
     latency6_ms: float | None = None
+    # Where this uplink listens, when it has a port of its own, which is what an exit
+    # node told to dial inwards is pointed at. Null is the kernel having picked — and
+    # nothing can be pointed at that, because it changes on restart.
+    listen_port: int | None = None
     # The entry node's own key for this uplink; install it on the exit node.
     public_key: str
     peer_public_key: str | None = None

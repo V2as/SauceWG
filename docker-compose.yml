@@ -122,6 +122,9 @@ services:
       # the address a blocklist has, and the same exit node answers on IPv6 through
       # filters that were never built to look there.
       CASCADE_ENDPOINT_FAMILY: ${CASCADE_ENDPOINT_FAMILY:-auto}
+      # Fixed ports for the uplinks, so an exit node can dial this node rather
+      # than only being dialled by it. Empty leaves the port to the kernel.
+      CASCADE_UPLINK_PORT_BASE: ${CASCADE_UPLINK_PORT_BASE:-}
       # Failover tuning.
       CASCADE_PROBE_ENABLED: ${CASCADE_PROBE_ENABLED:-true}
       CASCADE_PROBE_TARGET: ${CASCADE_PROBE_TARGET:-1.1.1.1}
@@ -199,6 +202,9 @@ services:
       # exit node its address on both halves of the bridge.
       CASCADE_UPLINK_SUBNET6: ${CASCADE_UPLINK_SUBNET6:-}
       CASCADE_ENDPOINT_FAMILY: ${CASCADE_ENDPOINT_FAMILY:-auto}
+      # Fixed ports for the uplinks, so an exit node can dial this node rather
+      # than only being dialled by it. Empty leaves the port to the kernel.
+      CASCADE_UPLINK_PORT_BASE: ${CASCADE_UPLINK_PORT_BASE:-}
       # The same failover tuning the node container runs on. The panel checks every
       # health flag it reads against the handshake published beside it, and these are
       # what it measures "too old" with when the node container is old enough not to

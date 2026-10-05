@@ -578,6 +578,43 @@ a node that carries their traffic perfectly well, to fix a family none of them u
 would be a net loss. When clients get IPv6 this becomes a failover input; until then it
 is a signal that an exit node's provider has broken something.
 
+### Letting an exit node dial the entry node
+
+An uplink is normally dialled from the entry node outwards. Filtering is not always
+symmetrical, though: a path can drop what the entry node sends while carrying what the
+exit node sends, and the symptom is an exit node that looks dead from the panel while
+its own `awg show` reports the uplink's traffic arriving. A tunnel established from the
+far end carries traffic both ways like any other, so turning the direction around is a
+fix rather than a workaround.
+
+It needs a port the exit node can be pointed at, which an uplink does not have by
+default — the kernel picks one and picks a different one after every restart:
+
+```bash
+saucewg dial-in on            # fixed ports for the uplinks: 51822, 51823, …
+saucewg dial-in               # each uplink's port, and what to run on each exit node
+saucewg dial-in off           # back to whatever the kernel picks
+```
+
+Ports are counted up from the base by the uplink's own host number, so the node on
+`10.77.0.4` listens on `51824` and keeps that port when the list around it is edited.
+The whole range is opened in `ufw` or `firewalld` as one rule, so adding an exit node
+later needs nothing here. Then, on the exit node that cannot be reached:
+
+```bash
+saucewg node-pair --peer-key <uplink key> --peer-endpoint 203.0.113.10:51824
+```
+
+`saucewg dial-in` prints that line per node with the keys and ports filled in. Nothing
+starts dialling because the base is set: each exit node is told separately, and one
+that is not told behaves exactly as before. Both ends may dial at once — whichever
+handshake lands first establishes the tunnel, and the entry node adopts the source
+address it hears from.
+
+This is worth having even where both directions work. An exit node sends to the port it
+last heard from, so a restarted entry node with a kernel-assigned port spends the next
+keepalive interval being talked to at a port nobody is listening on.
+
 ### Installing an exit node on an IPv6-only VPS
 
 `POST /api/nodes` and `saucewg install-node` both take an IPv6 `host`, so a VPS with no

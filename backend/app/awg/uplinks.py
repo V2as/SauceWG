@@ -100,6 +100,10 @@ class ExitNodeState:
     #: fail the node over.
     healthy6: bool = False
     latency6_ms: float | None = None
+    #: The port this uplink listens on, when it has one of its own. That is what an
+    #: exit node configured to dial inwards is pointed at. None is the kernel having
+    #: picked, which nothing can be pointed at because it changes on restart.
+    listen_port: int | None = None
     #: True when the cascade is still treating this uplink as usable — offering it as
     #: a failover target, or routing clients through it — while its last handshake is
     #: too old for anything to be coming out of it. See :func:`load_uplink_state`.
@@ -107,8 +111,14 @@ class ExitNodeState:
 
     @property
     def paired(self) -> bool:
-        """False until the exit node's public key has been installed here."""
-        return bool(self.peer_public_key and self.endpoint)
+        """False until the exit node's public key has been installed here.
+
+        An endpoint is one of two ways a tunnel can exist. The other is the exit
+        node dialling in, which needs a port here rather than an address there — so
+        an uplink with a key and a port of its own is paired even with nowhere to
+        dial, and reporting it otherwise would describe a working tunnel as broken.
+        """
+        return bool(self.peer_public_key and (self.endpoint or self.listen_port))
 
     @property
     def exit_ip(self) -> str | None:
@@ -298,6 +308,7 @@ def load_uplink_state() -> UplinkState:
                     address6=item.get("address6") or None,
                     healthy6=bool(item.get("healthy6")),
                     latency6_ms=item.get("latency6_ms"),
+                    listen_port=item.get("listen_port"),
                 )
             )
         except (KeyError, TypeError, ValueError) as exc:

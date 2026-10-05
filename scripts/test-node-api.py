@@ -362,6 +362,29 @@ async def main() -> None:
         check("how many nodes do", status.nodes_healthy6 == 1, status)
         check("and the bridge it crosses", status.bridge_subnet6 == "fd00:77::/64", status)
 
+        print("an exit node that dials the entry node rather than being dialled")
+        # Filtering is not always symmetrical, so a tunnel the exit node establishes
+        # is worth having. An uplink with a key and a port of its own is paired even
+        # with nothing to dial: reporting it unpaired would call a working tunnel
+        # broken, and is what the panel would do if it only looked for an endpoint.
+        publish(
+            nodes=[
+                {
+                    "name": "inbound", "iface": "awg1", "address": "10.77.0.2/32",
+                    "priority": 10, "listen_port": 51822,
+                    "public_key": "UPLINK-IN", "peer_public_key": "KEY-IN",
+                    "endpoint": None, "healthy": True, "active": True,
+                    "last_handshake": int(time.time()),
+                    "latency_ms": 9.0, "rx_bytes": 1, "tx_bytes": 2,
+                },
+            ],
+        )
+        node = (await client.get("/api/nodes")).json()["nodes"][0]
+        check("the port it is dialled on is published", node["listen_port"] == 51822, node)
+        check("it has nothing to dial itself", node["endpoint"] is None, node)
+        check("and is paired all the same", node["paired"] is True, node)
+        check("and healthy", node["healthy"] is True, node)
+
         print("an exit node whose IPv6 is broken is still an exit node")
         # Clients are IPv4, so failing a node over for this would cost them a working
         # tunnel to fix a family none of them use.

@@ -367,7 +367,7 @@ GET /api/nodes
 | `active` | currently carrying client traffic |
 | `stalled` | **check this.** The cascade is still treating this node as usable — offering it as a failover target, or routing clients through it — while its last handshake is too old for anything to be coming out of it. `healthy` is forced to `false` alongside, and `active` may well be `true`: that combination is an exit node carrying nothing |
 | `last_handshake_at` / `handshake_age_seconds` | when the tunnel to this node last handshaked, and how long ago in seconds. `null` if it never has |
-| `paired` | the exit node's key is installed here; an unpaired node can never become active |
+| `paired` | the exit node's key is installed here; an unpaired node can never become active. True with no `endpoint` when the node dials in instead — a key and a `listen_port` are a tunnel that can exist |
 | `public_key` | the **entry node's** key for this uplink — this is what you install on the exit node |
 | `peer_public_key` | the exit node's key |
 | `latency_ms` | round trip through the tunnel to `CASCADE_PROBE_TARGET` |
@@ -378,6 +378,7 @@ GET /api/nodes
 | `address6` | this uplink's address on the IPv6 half of the bridge. `null` when the cascade has no IPv6 half, or `"none"` in the list when this node sits it out |
 | `healthy6` | the exit node reaches the IPv6 internet through the bridge. **Reported, not acted on** — see [§6 IPv6](#ipv6-through-the-cascade) |
 | `latency6_ms` | round trip to `CASCADE_PROBE_TARGET6`, or `null` |
+| `listen_port` | where this uplink listens, when it has a port of its own, which is what an exit node told to dial inwards is pointed at. `null` means the kernel picked, and nothing can be pointed at it because it changes on restart |
 | `bridge` | the link between the entry node and its exit nodes, not the endpoints it is dialled over. `subnet6: null` is an IPv4-only cascade, which is the default |
 | `fallback` | what happens if every uplink dies: `direct` carries client traffic through the entry node, `block` drops it |
 | `fallback_active` | **check this too.** `true` means that is happening now: with `direct`, users are online but leaving from the entry node's address; with `block`, they are cut off |
@@ -755,6 +756,24 @@ Clients are unaffected by any of this. `awg0` has no IPv6 address, profiles carr
 `AllowedIPs = 0.0.0.0/0`, and no packet a client sends can reach the IPv6 bridge.
 A node container older than this version publishes no `bridge` key at all, which reads
 as an IPv4-only cascade rather than an error.
+
+### Exit nodes that dial inwards
+
+Which end dials is separate from which family it is dialled over, and separate again
+from what the bridge carries. An uplink is normally dialled from the entry node; an
+exit node can be configured to dial the entry node instead, for a path that drops what
+the entry node sends while carrying what the exit node sends.
+
+What that looks like through the API: `listen_port` is where the uplink listens, and it
+is what the exit node is pointed at. `endpoint` may be `null` while `paired` is `true`
+and `healthy` is `true` — a tunnel the far end built is a tunnel. A monitor that reads
+`paired` as "has an endpoint" will report a working node as broken, which is why
+`paired` is published rather than left to be inferred.
+
+`listen_port` is `null` unless the entry node has been given `CASCADE_UPLINK_PORT_BASE`,
+and a null port is not a port an exit node can be sent to: without a base the kernel
+picks, and picks again on every restart. There is nothing to configure per node here —
+the port follows the uplink's own host number, so it survives edits to the list.
 
 ---
 
@@ -1278,6 +1297,7 @@ Values the central system may need to know about, set in the entry node's `.env`
 | `CASCADE_UPLINK_SUBNET6` | — | the IPv6 half of the bridge to the exit nodes, e.g. `fd00:77::/64`. Empty is an IPv4-only cascade, and each exit node's `AWG_SUBNET6` must match |
 | `CASCADE_ENDPOINT_FAMILY` | `auto` | which family exit nodes are dialled over when they publish both: `auto`, `4` or `6`. A node's own `family` overrides it |
 | `CASCADE_PROBE_TARGET6` | `2606:4700:4700::1111` | what `healthy6` is measured against, through the tunnel |
+| `CASCADE_UPLINK_PORT_BASE` | — | gives each uplink a fixed port, counted up from here by host number, so an exit node can dial the entry node. Empty leaves the port to the kernel, which no exit node can be pointed at |
 | `BYPASS_MODE` | `auto` | when the reopened destinations of §8 are actually reopened: `auto`, `always`, `off` |
 | `BYPASS_GROUPS` | `telegram` | built-in destination tables in force; empty ships none |
 | `BYPASS_ROUTES` | — | prefixes to reopen, overriding the file and making §8 read-only |
@@ -1319,6 +1339,9 @@ Values the central system may need to know about, set in the entry node's `.env`
 * **IPv6 is two switches, not one.** Dialling an exit node over IPv6 and carrying IPv6
   through the cascade are independent: either without the other is a valid, working
   configuration.
+* **`endpoint: null` is not necessarily unpaired.** An exit node told to dial the entry
+  node needs a port here, not an address there. Read `paired`, and read `listen_port`
+  to know which arrangement a node is in.
 * **"The entry node has IPv6" means a routable address, not a route and not a ULA.**
   A VPS whose provider advertises a router but allocates nothing has a default route and
   nothing to send from, and the bridge's own `fd00:77::2` has global scope without being

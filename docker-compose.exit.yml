@@ -51,6 +51,10 @@ services:
       AWG_I5: ${AWG_I5:-}
       AWG_PEER_PUBLIC_KEY: ${AWG_PEER_PUBLIC_KEY:-}
       AWG_PEER_PSK: ${AWG_PEER_PSK:-}
+      # Set to dial the entry node from here instead of waiting to be dialled,
+      # for a path that carries what this node sends but not what it is sent.
+      AWG_PEER_ENDPOINT: ${AWG_PEER_ENDPOINT:-}
+      AWG_PEER_KEEPALIVE: ${AWG_PEER_KEEPALIVE:-25}
       # Each entry-node uplink terminates on its own address inside this subnet, so
       # accepting the whole range keeps one exit image usable for any slot.
       #

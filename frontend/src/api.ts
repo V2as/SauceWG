@@ -103,6 +103,7 @@ export interface ExitNode {
   // unhealthy and does not trigger failover.
   healthy6: boolean
   latency6_ms: number | null
+  listen_port: number | null
   public_key: string
   peer_public_key: string | null
   paired: boolean

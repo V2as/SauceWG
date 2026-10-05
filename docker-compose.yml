@@ -22,7 +22,7 @@ services:
 
   awg:
     <<: *restart
-    image: ${IMAGE_AWG:-saucewg/awg:1.5.0}
+    image: ${IMAGE_AWG:-saucewg/awg:1.5.1}
     build:
       context: ./docker/awg
       args:
@@ -166,7 +166,7 @@ services:
 
   panel:
     <<: *restart
-    image: ${IMAGE_PANEL:-saucewg/panel:1.5.0}
+    image: ${IMAGE_PANEL:-saucewg/panel:1.5.1}
     build:
       # The repository root, so the image can carry saucewg.sh and install exit
       # nodes with the same script an operator would run by hand.
@@ -266,7 +266,7 @@ services:
 
   caddy:
     <<: *restart
-    image: ${IMAGE_WEB:-saucewg/web:1.5.0}
+    image: ${IMAGE_WEB:-saucewg/web:1.5.1}
     build:
       context: .
       dockerfile: docker/caddy/Dockerfile

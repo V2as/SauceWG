@@ -5,7 +5,7 @@ name: ${COMPOSE_PROJECT_NAME:-saucewg-exit}
 
 services:
   awg:
-    image: ${IMAGE_AWG:-saucewg/awg:1.4.0}
+    image: ${IMAGE_AWG:-saucewg/awg:1.5.0}
     build:
       context: ./docker/awg
       args:

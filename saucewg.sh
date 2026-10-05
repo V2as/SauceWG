@@ -17,7 +17,7 @@
 # makes the script safe to drive from a bot or a provisioning service.
 set -euo pipefail
 
-SAUCEWG_VERSION="1.4.0"
+SAUCEWG_VERSION="1.5.0"
 
 SAUCEWG_REPO="${SAUCEWG_REPO:-V2as/SauceWG}"
 SAUCEWG_REF="${SAUCEWG_REF:-main}"

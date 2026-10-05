@@ -82,9 +82,9 @@ if [ ! -f "$ENV_FILE" ]; then
 
     cat > "$ENV_FILE" <<EOF
 COMPOSE_PROJECT_NAME=saucewg
-IMAGE_AWG=saucewg/awg:1.4.0
-IMAGE_PANEL=saucewg/panel:1.4.0
-IMAGE_WEB=saucewg/web:1.4.0
+IMAGE_AWG=saucewg/awg:1.5.0
+IMAGE_PANEL=saucewg/panel:1.5.0
+IMAGE_WEB=saucewg/web:1.5.0
 
 PANEL_TITLE=SauceWG
 PANEL_HTTP_PORT=${HTTP_PORT}

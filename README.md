@@ -199,7 +199,7 @@ its IPv6 address as the host, or by hand pass `--endpoint-host6` to `install-nod
 detects the server's own addresses either way and reports both. See [IPv6](#ipv6).
 
 Optionally add a pre-shared key to an uplink for post-quantum resistance: generate one
-with `docker run --rm --entrypoint awg saucewg/awg:1.4.0 genpsk` and pass it as
+with `docker run --rm --entrypoint awg saucewg/awg:1.5.0 genpsk` and pass it as
 `--psk` to `install-node` and `preshared_key` in the object above.
 
 Private keys are generated inside the node container on first start and persisted in the
@@ -942,9 +942,9 @@ It needs no secrets.
 ### From your machine
 
 ```bash
-export IMAGE_AWG=yourname/saucewg-awg:1.4.0
-export IMAGE_PANEL=yourname/saucewg-panel:1.4.0
-export IMAGE_WEB=yourname/saucewg-web:1.4.0
+export IMAGE_AWG=yourname/saucewg-awg:1.5.0
+export IMAGE_PANEL=yourname/saucewg-panel:1.5.0
+export IMAGE_WEB=yourname/saucewg-web:1.5.0
 
 make build
 make push

@@ -79,7 +79,7 @@ if [ ! -f "$ENV_FILE" ]; then
 
     cat > "$ENV_FILE" <<EOF
 COMPOSE_PROJECT_NAME=saucewg-exit
-IMAGE_AWG=saucewg/awg:1.4.0
+IMAGE_AWG=saucewg/awg:1.5.0
 
 AWG_IFACE=awg0
 AWG_PORT=${PORT}

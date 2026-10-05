@@ -96,7 +96,7 @@ bash /tmp/saucewg.sh --json --yes install \
   "admin_username": "admin",
   "admin_password": "a-strong-one",
   "endpoint": "203.0.113.7:443",
-  "version": "1.4.0"
+  "version": "1.5.0"
 }
 ```
 
@@ -193,7 +193,7 @@ release:
 | `NO_COLOR` | — | Any value disables ANSI colour |
 
 ```bash
-SAUCEWG_TAG=1.4.0 bash /tmp/saucewg.sh --json --yes install --domain panel.example.com
+SAUCEWG_TAG=1.5.0 bash /tmp/saucewg.sh --json --yes install --domain panel.example.com
 ```
 
 `--dir` also means several deployments can share one server for testing; each is a
@@ -245,7 +245,7 @@ rather than stopping.
 
 ```json
 {
-  "cli_version": "1.4.0",
+  "cli_version": "1.5.0",
   "role": "entry",
   "dir": "/opt/saucewg",
   "endpoint": "203.0.113.7:443",
@@ -1053,13 +1053,13 @@ none of them need credentials once it carries the panel's key.
 | `POST /api/nodes/{name}/restart` | `{}` | `202` + task. Recreates its containers and waits for the uplink to come back |
 | `POST /api/nodes/{name}/stop` | `{}` | `202` + task. The cascade fails over to the next healthy node |
 | `POST /api/nodes/{name}/start` | `{}` | `202` + task |
-| `POST /api/nodes/{name}/upgrade` | `{}` or `{"tag": "1.4.0"}` | `202` + task. Pulls newer images and recreates. Minutes, like an install |
+| `POST /api/nodes/{name}/upgrade` | `{}` or `{"tag": "1.5.0"}` | `202` + task. Pulls newer images and recreates. Minutes, like an install |
 | `POST /api/nodes/{name}/recover` | — | `202` + task. Restart, then re-pair if that was not enough — the escalation of §4.9, run now |
 
 ```json
 {
   "name": "eu-fr", "reachable": true, "error": null, "ssh_host": "203.0.113.9",
-  "role": "exit", "cli_version": "1.4.0", "dir": "/opt/saucewg",
+  "role": "exit", "cli_version": "1.5.0", "dir": "/opt/saucewg",
   "os": "Debian GNU/Linux 12 (bookworm)", "kernel": "Linux 6.1.0-18-amd64",
   "arch": "x86_64", "cpus": 2, "memory_mb": 1966, "disk_free_mb": 17980,
   "uptime_seconds": 934221, "docker": true, "saucewg": true,

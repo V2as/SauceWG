@@ -45,23 +45,35 @@ log() { [ "$VERBOSE" != true ] || printf '    [awg] %s\n' "$*" >&2; }
 # `ip` and `iptables` are modelled rather than swallowed: which table holds which
 # route, and where the REJECT rule sits in FORWARD, is exactly what decides whether
 # client traffic leaves through an exit node, through the entry node or nowhere.
-ROUTES="$WORK/routes"      # table <TAB> destination <TAB> as `ip route show` would print
-RULES="$WORK/rules"        # one policy rule per line
+#
+# The two address families are modelled apart, because in the kernel they are: a
+# routing table number names one table per family, so the cascade's IPv4 default
+# route and its IPv6 one coexist under the same 451 and a stub that conflated them
+# would let a test pass while the bridge carried nothing.
+ROUTES="$WORK/routes"      # family <TAB> table <TAB> destination <TAB> as `ip route show` would print
+RULES="$WORK/rules"        # family <TAB> one policy rule per line
+IFACE_ADDRS="$WORK/addrs"  # iface <TAB> v4 address <TAB> v6 address, as iface_up was called
 IPT="$WORK/iptables"       # table|chain|rule, in chain order
 IPT_CHAINS="$WORK/chains"  # table|chain, for the ones created with -N
 IPT_COUNT="$WORK/counters" # rule key <US> packets, what the kernel would have counted
 SETS="$WORK/ipsets"        # one file per set: address <TAB> packets <TAB> timeout
-: > "$ROUTES"; : > "$RULES"; : > "$IPT"; : > "$IPT_CHAINS"; : > "$IPT_COUNT"
+: > "$ROUTES"; : > "$RULES"; : > "$IPT"; : > "$IPT_CHAINS"; : > "$IPT_COUNT"; : > "$IFACE_ADDRS"
 mkdir -p "$SETS"
 
-# What the entry node's own default route looks like. Reassigned by the tests that
-# move it.
+# What the entry node's own default route looks like, per family. Reassigned by the
+# tests that move it; FAKE_DEFAULT6 empty is a host with no IPv6 at all, which is
+# what decides the automatic endpoint family.
 FAKE_DEFAULT="default via 192.0.2.1 dev eth0"
+FAKE_DEFAULT6=""
 
 ip() {
-    local args=() x table=main i
+    local args=() x table=main i family=4
     for x in "$@"; do
-        case $x in -4|-6) ;; *) args+=("$x") ;; esac
+        case $x in
+            -4) family=4 ;;
+            -6) family=6 ;;
+            *) args+=("$x") ;;
+        esac
     done
     for ((i = 0; i < ${#args[@]}; i++)); do
         [ "${args[$i]}" = table ] && table=${args[$((i + 1))]}
@@ -73,25 +85,31 @@ ip() {
             case "${args[1]:-}" in
                 show)
                     if [ "$dest" = default ] && [ "$table" = main ]; then
-                        printf '%s\n' "$FAKE_DEFAULT"
+                        if [ "$family" = 6 ]; then
+                            [ -z "$FAKE_DEFAULT6" ] || printf '%s\n' "$FAKE_DEFAULT6"
+                        else
+                            printf '%s\n' "$FAKE_DEFAULT"
+                        fi
                     else
-                        awk -F'\t' -v t="$table" '$1 == t {print $3}' "$ROUTES"
+                        awk -F'\t' -v f="$family" -v t="$table" \
+                            '$1 == f && $2 == t {print $4}' "$ROUTES"
                     fi
                     ;;
                 replace|add)
                     # "unreachable default" names the type before the destination.
                     [ "$dest" != unreachable ] || dest=${args[3]:-}
                     display=$(printf '%s' "${args[*]:2}" | sed 's/ table [0-9]*$//')
-                    ip route del "$dest" table "$table" >/dev/null 2>&1
-                    printf '%s\t%s\t%s\n' "$table" "$dest" "$display" >> "$ROUTES"
+                    ip "-${family}" route del "$dest" table "$table" >/dev/null 2>&1
+                    printf '%s\t%s\t%s\t%s\n' "$family" "$table" "$dest" "$display" >> "$ROUTES"
                     ;;
                 del)
-                    awk -F'\t' -v t="$table" -v d="$dest" \
-                        '!($1 == t && $2 == d)' "$ROUTES" > "$ROUTES.tmp" || true
+                    awk -F'\t' -v f="$family" -v t="$table" -v d="$dest" \
+                        '!($1 == f && $2 == t && $3 == d)' "$ROUTES" > "$ROUTES.tmp" || true
                     mv "$ROUTES.tmp" "$ROUTES"
                     ;;
                 flush)
-                    awk -F'\t' -v t="$table" '$1 != t' "$ROUTES" > "$ROUTES.tmp" || true
+                    awk -F'\t' -v f="$family" -v t="$table" \
+                        '!($1 == f && $2 == t)' "$ROUTES" > "$ROUTES.tmp" || true
                     mv "$ROUTES.tmp" "$ROUTES"
                     ;;
             esac
@@ -100,9 +118,10 @@ ip() {
             local selector="${args[*]:2}"
             selector=${selector% priority *}
             case "${args[1]:-}" in
-                add) printf '%s\n' "${args[*]:2}" >> "$RULES" ;;
+                add) printf '%s\t%s\n' "$family" "${args[*]:2}" >> "$RULES" ;;
                 del)
-                    awk -v s="$selector" 'index($0, s) != 1' "$RULES" > "$RULES.tmp" || true
+                    awk -F'\t' -v f="$family" -v s="$selector" \
+                        '!($1 == f && index($2, s) == 1)' "$RULES" > "$RULES.tmp" || true
                     mv "$RULES.tmp" "$RULES"
                     ;;
             esac
@@ -265,10 +284,17 @@ ipset() {
 conntrack() { :; }
 
 # Whether the far end still reaches the internet, which is the second half of a
-# probe: a tunnel can be handshaking and still be carrying nothing.
+# probe: a tunnel can be handshaking and still be carrying nothing. The two
+# families answer separately, because an exit node whose IPv6 is broken and whose
+# IPv4 is fine is the case the bridge has to report rather than fail over for.
 FAKE_PING=fail
+FAKE_PING6=fail
 ping() {
-    [ "$FAKE_PING" = ok ] || return 1
+    local want=$FAKE_PING x
+    for x in "$@"; do
+        [ "$x" != -6 ] || want=$FAKE_PING6
+    done
+    [ "$want" = ok ] || return 1
     printf 'rtt min/avg/max/mdev = 11.1/22.2/33.3/4.4 ms\n'
 }
 
@@ -295,7 +321,13 @@ awg() {
 # Redirected so a backgrounded stub never holds this script's stdout open.
 amneziawg-go() { sleep 600 >/dev/null 2>&1; }
 wait_for_socket() { return 0; }
-iface_up() { return 0; }
+# Recorded rather than swallowed: whether an uplink was brought up with an address
+# on both halves of the bridge is the whole question for an IPv6 cascade, and the
+# real one needs an interface that exists.
+iface_up() {
+    printf '%s\t%s\t%s\n' "$1" "$2" "${4:-}" >> "$IFACE_ADDRS"
+    return 0
+}
 
 # The relay stands in for the real one, publishing the counters file it would so
 # that the path from its table to uplinks.json is exercised. What it does with a
@@ -371,6 +403,19 @@ node_v() {
         "$1" "$2" "$1" "$3" "$4" "$5"
 }
 
+# An exit node reachable over both families, which is what gives the endpoint
+# choice something to choose between.
+node_both() {
+    printf '{"name":"%s","endpoint":"%s","endpoint6":"%s","public_key":"KEY-%s","address":"10.77.0.%s/32","priority":%s}' \
+        "$1" "$2" "$3" "$1" "$4" "$5"
+}
+
+# An exit node on an IPv6-only VPS: no IPv4 endpoint exists to fall back to.
+node_6() {
+    printf '{"name":"%s","endpoint6":"%s","public_key":"KEY-%s","address":"10.77.0.%s/32","priority":%s}' \
+        "$1" "$2" "$1" "$3" "$4"
+}
+
 protocol_of() {
     local i
     for i in "${!UP_NAME[@]}"; do
@@ -395,6 +440,13 @@ node_field() {
 
 # The obfuscation parameters one uplink's generated .conf actually carries, in order.
 # This is what decides which generation the far end sees.
+conf_field() {
+    local iface
+    iface=$(iface_of "$1")
+    [ "$iface" != missing ] || { printf 'missing'; return; }
+    sed -n "s/^${2} = //p" "${AWG_CONFIG_DIR}/${iface}.conf" | tail -1
+}
+
 conf_params() {
     local i iface
     for i in "${!UP_NAME[@]}"; do
@@ -419,8 +471,19 @@ conf_value() {
 # or nothing at all (which means the lookup falls through to the entry node's own
 # routes).
 cascade_default() {
+    cascade_default_family 4
+}
+
+# The same for the IPv6 half of the bridge, which the kernel keeps in its own table
+# under the same number.
+cascade_default6() {
+    cascade_default_family 6
+}
+
+cascade_default_family() {
     local line
-    line=$(awk -F'\t' -v t="$CASCADE_TABLE" '$1 == t && $2 == "default" {print $3}' "$ROUTES")
+    line=$(awk -F'\t' -v f="$1" -v t="$CASCADE_TABLE" \
+        '$1 == f && $2 == t && $3 == "default" {print $4}' "$ROUTES")
     case $line in
         "") printf 'none' ;;
         unreachable*) printf 'unreachable' ;;
@@ -430,18 +493,35 @@ cascade_default() {
 
 # The destinations in the bypass table, sorted, plus where each is sent.
 direct_table() {
-    awk -F'\t' -v t="$CASCADE_DIRECT_TABLE" '$1 == t {print $2}' "$ROUTES" | sort | tr '\n' ' ' | sed 's/ $//'
+    awk -F'\t' -v t="$CASCADE_DIRECT_TABLE" '$1 == 4 && $2 == t {print $3}' "$ROUTES" | sort | tr '\n' ' ' | sed 's/ $//'
 }
 
 direct_route_of() {
-    awk -F'\t' -v t="$CASCADE_DIRECT_TABLE" -v d="$1" '$1 == t && $2 == d {print $3}' "$ROUTES"
+    awk -F'\t' -v t="$CASCADE_DIRECT_TABLE" -v d="$1" '$1 == 4 && $2 == t && $3 == d {print $4}' "$ROUTES"
 }
 
 # The routing tables client traffic is looked up in, in the order the kernel would
 # consult them.
 rule_tables() {
-    sed -n 's/.*lookup \([0-9]*\) priority \([0-9]*\)/\2 \1/p' "$RULES" \
+    awk -F'\t' '$1 == 4 {print $2}' "$RULES" \
+        | sed -n 's/.*lookup \([0-9]*\) priority \([0-9]*\)/\2 \1/p' \
         | sort -n | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# The addresses one uplink was last brought up with: "<v4> <v6>", or just the v4
+# one when the cascade has no IPv6 half.
+iface_addrs() {
+    local iface
+    iface=$(iface_of "$1")
+    awk -F'\t' -v i="$iface" '$1 == i {v4 = $2; v6 = $3} END {
+        if (v4 == "") { print "missing" } else if (v6 == "") { print v4 } else { print v4 " " v6 }
+    }' "$IFACE_ADDRS"
+}
+
+# Which of its two endpoints an uplink is dialling, as the published state reports
+# it: "<family> <endpoint>".
+dialling() {
+    printf '%s %s' "$(node_field "$1" endpoint_family)" "$(node_field "$1" endpoint)"
 }
 
 forward_chain() {
@@ -1142,13 +1222,286 @@ uplinks_write_state
 check "and the node is published as down" "false" "$(node_field hs-one healthy)"
 FAKE_PING=fail
 
-echo "59. tearing the node down leaves no torrent rule behind"
+echo "59. an exit node listed with both endpoints keeps working without an IPv6 bridge"
+# The opt-in half of the contract: a list that gained an endpoint6 must change
+# nothing until the bridge itself is switched on, because an uplink that starts
+# announcing ::/0 to an exit node with no IPv6 route loses every packet it sends.
+FAKE_PING=ok
+nodes "[$(node_both dual 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10)]"
+uplinks_reload
+uplinks_write_state
+check "the uplink is still addressed on IPv4 only" "10.77.0.2/32" "$(iface_addrs dual)"
+check "and still offers the far end IPv4 only" "0.0.0.0/0" "$(conf_field dual AllowedIPs)"
+check "the cascade has no IPv6 default to point anywhere" "none" "$(cascade_default6)"
+check "and no IPv6 half is published" "null" "$(jq -r .bridge.subnet6 "$UPLINK_STATE_FILE")"
+check "though both endpoints are on file for when it is" \
+    "[2001:db8::20]:51820" "$(node_field dual endpoint6)"
+
+echo "60. switching the bridge on gives every uplink an address on it"
+export CASCADE_UPLINK_SUBNET6=fd00:77::/64
+nodes "[$(node_both dual 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10),$(node plain 203.0.113.31:51820 3 20)]"
+uplinks_reload
+uplinks_write_state
+check "the first uplink is dual-stack" "10.77.0.2/32 fd00:77::2/128" "$(iface_addrs dual)"
+check "and so is the second, on the next address" "10.77.0.3/32 fd00:77::3/128" "$(iface_addrs plain)"
+check "both now offer the far end both families" "0.0.0.0/0, ::/0" "$(conf_field dual AllowedIPs)"
+check "the IPv6 half is published" "fd00:77::/64" "$(jq -r .bridge.subnet6 "$UPLINK_STATE_FILE")"
+check "with the address this uplink holds on it" "fd00:77::2/128" "$(node_field dual address6)"
+
+echo "61. the IPv6 cascade route follows the active uplink, in its own table"
+FAKE_HS[$(iface_of dual)]=$(date +%s)
+uplinks_refresh_health
+uplinks_refresh_health
+uplink_activate 0
+check "client traffic goes out over the uplink" "$(iface_of dual)" "$(cascade_default)"
+check "and so does IPv6, under the same table number" "$(iface_of dual)" "$(cascade_default6)"
+uplinks_fallback
+check "losing every uplink takes the IPv6 default with it" "none" "$(cascade_default6)"
+
+echo "62. blocking on failure blocks both families, not just the one clients use"
+# Leaving the IPv6 table empty here would let the lookup fall through to the main
+# table and out of the entry node's own address — which is the single thing this
+# mode exists to prevent, whichever family it happens over.
+FALLBACK_MODE=block
+uplink_activate 0 force
+uplinks_fallback
+check "a blocking fallback refuses IPv6 too" "unreachable" "$(cascade_default6)"
+uplink_activate 0 force
+FALLBACK_MODE=direct
+uplinks_fallback
+check "and a direct one stops refusing it" "none" "$(cascade_default6)"
+
+echo "63. which endpoint is dialled follows what this host can actually reach"
+# No IPv6 route of its own: dialling an IPv6 endpoint from here could only fail.
+FAKE_DEFAULT6=""
+nodes "[$(node_both dual 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10)]"
+uplinks_reload
+uplinks_write_state
+check "an IPv4-only entry node dials IPv4" "4 198.51.100.20:51820" "$(dialling dual)"
+FAKE_DEFAULT6="default via 2001:db8::1 dev eth0"
+nodes "[$(node_both dual2 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10)]"
+uplinks_reload
+uplinks_write_state
+check "an entry node with IPv6 prefers it" "6 [2001:db8::20]:51820" "$(dialling dual2)"
+check "and that is the endpoint in the tunnel's own config" \
+    "[2001:db8::20]:51820" "$(conf_field dual2 Endpoint)"
+
+echo "64. the operator's preference overrides what the host can reach"
+export CASCADE_ENDPOINT_FAMILY=4
+nodes "[$(node_both pref 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10)]"
+uplinks_reload
+uplinks_write_state
+check "a cascade pinned to IPv4 dials IPv4" "4 198.51.100.20:51820" "$(dialling pref)"
+check "and says which preference is in force" "4" "$(jq -r .bridge.family "$UPLINK_STATE_FILE")"
+export CASCADE_ENDPOINT_FAMILY=6
+uplinks_reload
+uplinks_write_state
+check "pinned to IPv6, it dials IPv6" "6 [2001:db8::20]:51820" "$(dialling pref)"
+export CASCADE_ENDPOINT_FAMILY=nonsense
+uplinks_reload
+uplinks_write_state
+check "a typo falls back to choosing automatically" "auto" "$(jq -r .bridge.family "$UPLINK_STATE_FILE")"
+export CASCADE_ENDPOINT_FAMILY=auto
+
+echo "65. one node can be pinned to a family without pinning the cascade"
+nodes "[$(node_both a 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10),
+        {\"name\":\"b\",\"endpoint\":\"203.0.113.31:51820\",\"endpoint6\":\"[2001:db8::31]:51820\",\"family\":\"4\",\"public_key\":\"KEY-b\",\"address\":\"10.77.0.3/32\",\"priority\":20}]"
+uplinks_reload
+uplinks_write_state
+check "the unpinned node follows the cascade" "6 [2001:db8::20]:51820" "$(dialling a)"
+check "the pinned one does not" "4 203.0.113.31:51820" "$(dialling b)"
+check "and the pin is published as the node's own" "4" "$(node_field b family)"
+check "while the node that has none says so" "null" "$(node_field a family)"
+# Being told which address to dial is also being told not to try the other one.
+# An operator who pinned a node wants to see it fail rather than have it quietly
+# come up somewhere they ruled out.
+FAKE_HS[$(iface_of b)]=0
+uplinks_refresh_health
+uplinks_refresh_health
+uplinks_refresh_health
+uplinks_refresh_health
+check "a pinned node is not moved off its family when it goes silent" \
+    "4 203.0.113.31:51820" "$(dialling b)"
+check "it is simply reported as down" "false" "${UP_HEALTHY[1]}"
+
+echo "66. an IPv6-only exit node is dialled over IPv6 whatever the preference says"
+# There is nothing to prefer: an exit node on an IPv6-only VPS has one endpoint.
+export CASCADE_ENDPOINT_FAMILY=4
+nodes "[$(node_6 only6 '[2001:db8::99]:51820' 2 10)]"
+uplinks_reload
+uplinks_write_state
+check "it is dialled over IPv6" "6 [2001:db8::99]:51820" "$(dialling only6)"
+check "and has no IPv4 endpoint to report" "null" "$(node_field only6 endpoint4)"
+export CASCADE_ENDPOINT_FAMILY=auto
+
+echo "67. an IPv6 endpoint written in the plain endpoint field is still IPv6"
+# What the panel sends when an operator types an address rather than picking a
+# field, and what every pre-IPv6 config file looks like. A literal in the IPv4
+# column has to be read for what it is, bracketed, and given the default port.
+nodes "[$(node bare '[2001:db8::7]:51821' 2 10),$(node bareless 2001:db8::8 3 20)]"
+uplinks_reload
+uplinks_write_state
+check "a bracketed literal is taken as the IPv6 endpoint" "6 [2001:db8::7]:51821" "$(dialling bare)"
+check "and leaves the IPv4 one empty" "null" "$(node_field bare endpoint4)"
+check "an unbracketed one is bracketed before it reaches a config" \
+    "6 [2001:db8::8]:51820" "$(dialling bareless)"
+check "with the default port filled in" "[2001:db8::8]:51820" "$(conf_field bareless Endpoint)"
+
+echo "68. a family that never produces a handshake is given up on for the other one"
+# The case this exists for: an exit node is up and reachable over IPv6, but the
+# path to its IPv4 endpoint is filtered. Nothing distinguishes that from a dead
+# server except trying the other address.
+export CASCADE_ENDPOINT_FAMILY=4
+nodes "[$(node_both flip 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10)]"
+uplinks_reload
+uplinks_write_state
+check "it starts on the preferred family" "4" "$(node_field flip endpoint_family)"
+FAKE_HS[$(iface_of flip)]=0
+uplinks_refresh_health
+uplinks_refresh_health
+check "two silent probes are not enough to move" "4" "${UP_EPFAM[0]}"
+uplinks_refresh_health
+check "the third tries the other endpoint" "6" "${UP_EPFAM[0]}"
+check "and rebuilds the tunnel onto it" "[2001:db8::20]:51820" "$(conf_field flip Endpoint)"
+FAKE_HS[$(iface_of flip)]=$(date +%s)
+uplinks_refresh_health
+uplinks_refresh_health
+check "a handshake over the second family ends the search" "true" "${UP_HEALTHY[0]}"
+check "and it stays on the family that answered" "6" "${UP_EPFAM[0]}"
+uplinks_write_state
+check "which is the endpoint the panel is shown" "[2001:db8::20]:51820" "$(node_field flip endpoint)"
+check "beside both the ones it could have been" \
+    "198.51.100.20:51820 [2001:db8::20]:51820" \
+    "$(node_field flip endpoint4) $(node_field flip endpoint6)"
+
+echo "69. a tunnel that is handshaking is never flipped away from"
+# A handshaking uplink has found the right server over this family. The probe
+# target being unreachable is the exit node's problem, and rebuilding the tunnel
+# onto another address would throw away a working path to fix something else.
+FAKE_PING=fail
+uplinks_refresh_health
+uplinks_refresh_health
+uplinks_refresh_health
+check "it fails, as it should" "false" "${UP_HEALTHY[0]}"
+check "but not onto the other family" "6" "${UP_EPFAM[0]}"
+FAKE_PING=ok
+
+echo "70. a flip survives an edit to an unrelated part of the list"
+# A reload rebuilds from the list, which still names IPv4 first. Re-dialling the
+# family that was just given up on would undo the search on every unrelated edit,
+# and take the working tunnel down to do it.
+nodes "[$(node_both flip 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10),$(node other 203.0.113.9:51820 4 30)]"
+uplinks_reload
+check "the flipped uplink is still on the family that answered" "6" "${UP_EPFAM[0]}"
+check "and was not rebuilt" "$(pid_of flip)" "${UP_PID[0]}"
+# An endpoint that actually changed is a different question: the operator has said
+# something new about where this node is, so the search starts over from their
+# preference.
+nodes "[$(node_both flip 198.51.100.21:51820 '[2001:db8::21]:51820' 2 10)]"
+uplinks_reload
+check "a new pair of endpoints starts the search again" "4" "${UP_EPFAM[0]}"
+
+# And an operator who changes the preference has said something newer than the
+# flip did — they may have just given this host the IPv6 it was missing.
+export CASCADE_ENDPOINT_FAMILY=6
+nodes "[$(node_both repref 198.51.100.22:51820 '[2001:db8::22]:51820' 2 10)]"
+uplinks_reload
+check "a cascade pinned to IPv6 starts there" "6" "${UP_EPFAM[0]}"
+FAKE_HS[$(iface_of repref)]=0
+uplinks_refresh_health
+uplinks_refresh_health
+uplinks_refresh_health
+check "and gives up on it when nothing answers" "4" "${UP_EPFAM[0]}"
+export CASCADE_ENDPOINT_FAMILY=auto
+uplinks_reload
+check "but a changed preference overrules the flip" "6" "${UP_EPFAM[0]}"
+
+echo "71. the IPv6 half of the bridge is reported, not failed over for"
+# Client traffic is IPv4 today, so an exit node whose IPv6 is broken is still the
+# best way out for every client on it. Failing it over would cost them a working
+# tunnel to fix a family none of them use.
+export CASCADE_ENDPOINT_FAMILY=auto
+nodes "[$(node_both dual 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10)]"
+uplinks_reload
+FAKE_HS[$(iface_of dual)]=$(date +%s)
+FAKE_PING=ok
+FAKE_PING6=fail
+uplinks_refresh_health
+uplinks_refresh_health
+uplink_activate 0
+uplinks_write_state
+check "the node is healthy" "true" "$(node_field dual healthy)"
+check "and still carrying traffic" "$(iface_of dual)" "$(cascade_default)"
+check "while its IPv6 is published as down" "false" "$(node_field dual healthy6)"
+check "with no latency to show for it" "null" "$(node_field dual latency6_ms)"
+FAKE_PING6=ok
+uplinks_refresh_health
+uplinks_write_state
+check "once IPv6 answers, it is published as up" "true" "$(node_field dual healthy6)"
+check "with the round trip it took" "22.2" "$(node_field dual latency6_ms)"
+check "beside the target it was measured against" \
+    "2606:4700:4700::1111" "$(jq -r .bridge.probe_target6 "$UPLINK_STATE_FILE")"
+
+echo "72. one exit node can sit out the IPv6 bridge while the others use it"
+# Half a dual-stack cascade can be IPv4-only — an exit node not rebuilt yet, or
+# one on a VPS with no IPv6 at all. Saying so by name beats having the entry node
+# hold an address on a bridge half the far end never built and then report the
+# resulting silence as a fault.
+nodes "[$(node_both dual 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10),
+        {\"name\":\"v4only\",\"endpoint\":\"203.0.113.31:51820\",\"address6\":\"none\",\"public_key\":\"KEY-v4only\",\"address\":\"10.77.0.3/32\",\"priority\":20}]"
+uplinks_reload
+FAKE_HS[$(iface_of v4only)]=$(date +%s)
+uplinks_refresh_health
+uplinks_refresh_health
+uplinks_write_state
+check "the node is healthy on IPv4" "true" "$(node_field v4only healthy)"
+check "and has no IPv6 address on the bridge" "null" "$(node_field v4only address6)"
+check "so its IPv6 is not claimed to work" "false" "$(node_field v4only healthy6)"
+check "and it offers the far end IPv4 only" "0.0.0.0/0" "$(conf_field v4only AllowedIPs)"
+check "while the node beside it still has both" "0.0.0.0/0, ::/0" "$(conf_field dual AllowedIPs)"
+# Pointing the IPv6 table at a tunnel whose far end has no IPv6 would black-hole
+# the family rather than leave it to the main table.
+uplink_activate 1 force
+check "and carrying traffic over it leaves IPv6 unrouted" "none" "$(cascade_default6)"
+
+echo "73. an IPv6 subnet that cannot be numbered is refused, not guessed"
+# Appending a host number to a prefix that already has host bits set would hand
+# two uplinks the same address, which is worse than no IPv6 at all.
+export CASCADE_UPLINK_SUBNET6=fd00:77:0:0:0:0:0:abcd/64
+nodes "[$(node_both odd 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10)]"
+uplinks_reload
+uplinks_write_state
+check "no address is invented" "null" "$(node_field odd address6)"
+check "and the IPv4 half still works" "10.77.0.2/32" "$(node_field odd address)"
+# An explicit address is always honoured, which is the way out of the above.
+nodes "[{\"name\":\"odd\",\"endpoint\":\"198.51.100.20:51820\",\"address6\":\"fd00:77::abcd\",\"public_key\":\"KEY-odd\",\"address\":\"10.77.0.2/32\",\"priority\":10}]"
+uplinks_reload
+uplinks_write_state
+check "an address given by name is used as given" "fd00:77::abcd/128" "$(node_field odd address6)"
+export CASCADE_UPLINK_SUBNET6=fd00:77::/64
+
+echo "74. an auto IPv6 address follows the IPv4 one, not the slot it sits in"
+# The list pins IPv4 addresses so that removing a node never renumbers the
+# survivors — which means slot order stops matching host numbers the first time
+# anyone removes one. Numbering IPv6 off the slot instead would quietly hand a
+# node an address its IPv4 half does not match.
+nodes "[$(node_both five 198.51.100.20:51820 '[2001:db8::20]:51820' 5 10),
+        $(node_both nine 203.0.113.31:51820 '[2001:db8::31]:51820' 9 20)]"
+uplinks_reload
+uplinks_write_state
+check "the first node is numbered off its own address" "fd00:77::5/128" "$(node_field five address6)"
+check "and so is the second" "fd00:77::9/128" "$(node_field nine address6)"
+check "which is also what the interface came up on" \
+    "10.77.0.9/32 fd00:77::9/128" "$(iface_addrs nine)"
+
+echo "75. tearing the node down leaves no torrent rule behind"
 torrent_switch '{"enabled": true, "mode": "strict"}'
 torrent_reload
 check "the guard is up" "-i awg0" "$(torrent_hook_of "$TORRENT_CHAIN")"
 uplinks_teardown
 check "the chains are gone" "" "$(torrent_chains)"
 check "and so is every rule they held" "" "$(grep -c 'saucewg:torrent' "$IPT" | grep -v '^0$' || true)"
+check "and no IPv6 route of the cascade's" "none" "$(cascade_default6)"
 
 echo
 printf '%s passed, %s failed\n' "$PASSED" "$FAILED"

@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     cascade_enabled: bool = True
     cascade_iface: str = "awg1"
     cascade_uplink_subnet: str = "10.77.0.0/24"
+    # The IPv6 half of the link to the exit nodes. Empty is a cascade that carries
+    # IPv4 only, which is the default and what every installation made before this
+    # existed is. Needed here as well as in the node container, because the panel
+    # allocates each new exit node its address on both halves of the bridge.
+    cascade_uplink_subnet6: str = ""
+    # Which endpoint to dial an exit node over when it publishes both: "auto", "4"
+    # or "6". The node container decides; this is read to report the setting and to
+    # pass a per-node override through unchanged.
+    cascade_endpoint_family: str = "auto"
     # The node container republishes uplinks.json on every health tick; anything
     # older than this means its monitor stopped.
     uplink_state_max_age_seconds: int = 60

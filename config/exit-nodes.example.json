@@ -2,9 +2,11 @@
   {
     "name": "eu-nl",
     "endpoint": "198.51.100.20:51820",
+    "endpoint6": "[2001:db8:1::20]:51820",
     "public_key": "REPLACE_WITH_THE_EXIT_NODE_PUBLIC_KEY=",
     "preshared_key": "",
     "address": "10.77.0.2/32",
+    "address6": "fd00:77::2/128",
     "priority": 10,
     "protocol": "2.0",
     "s1": 96,
@@ -23,6 +25,7 @@
     "public_key": "REPLACE_WITH_THE_EXIT_NODE_PUBLIC_KEY=",
     "preshared_key": "",
     "address": "10.77.0.3/32",
+    "address6": "none",
     "priority": 20,
     "protocol": "1.0",
     "s1": 71,
@@ -31,5 +34,23 @@
     "h2": 1732298144,
     "h3": 1035461285,
     "h4": 1512994177
+  },
+  {
+    "name": "eu-fi",
+    "endpoint6": "[2001:db8:3::9]:51820",
+    "public_key": "REPLACE_WITH_THE_EXIT_NODE_PUBLIC_KEY=",
+    "preshared_key": "",
+    "address": "10.77.0.4/32",
+    "address6": "fd00:77::4/128",
+    "priority": 30,
+    "protocol": "2.0",
+    "s1": 88,
+    "s2": 52,
+    "s3": 21,
+    "s4": 47,
+    "h1": 1836281425,
+    "h2": 1109347716,
+    "h3": 2016448853,
+    "h4": 1247851093
   }
 ]

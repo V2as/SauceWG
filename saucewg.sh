@@ -17,7 +17,7 @@
 # makes the script safe to drive from a bot or a provisioning service.
 set -euo pipefail
 
-SAUCEWG_VERSION="1.3.0"
+SAUCEWG_VERSION="1.4.0"
 
 SAUCEWG_REPO="${SAUCEWG_REPO:-V2as/SauceWG}"
 SAUCEWG_REF="${SAUCEWG_REF:-main}"
@@ -109,6 +109,71 @@ public_ip() {
         [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
     done
     return 1
+}
+
+# The server's own global IPv6 address, or nothing when it has none.
+#
+# Asked of the network first and the echo services second. A VPS with one static
+# address knows it locally and answers instantly, and an echo service forced onto
+# IPv6 is the only way to learn it behind NAT64 or a tunnel broker — but it is also
+# the thing that hangs for six seconds per provider on a host with no IPv6 at all,
+# which is most of them, so it is not reached unless there is a route to try it
+# over.
+public_ip6() {
+    local ip url
+    ip=$(ip -6 -o addr show scope global 2>/dev/null \
+        | awk '$3 == "inet6" {split($4, a, "/"); print a[1]; exit}') || ip=""
+    case $ip in
+        ''|f[cd]*) ;;
+        *) printf '%s' "$ip"; return 0 ;;
+    esac
+
+    ip -6 route show default 2>/dev/null | grep -q . || return 1
+    for url in https://api6.ipify.org https://v6.ident.me https://icanhazip.com; do
+        ip=$(curl -fsS -6 --max-time 6 "$url" 2>/dev/null | tr -d '[:space:]') || continue
+        [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
+    done
+    return 1
+}
+
+# 4 for an IPv4 literal, 6 for an IPv6 one, empty for a hostname — which is not
+# resolved here, because the family it answers with is not ours to assume.
+ip_family() {
+    local value=${1:-}
+    case $value in
+        '') return 0 ;;
+        *:*) printf '6'; return 0 ;;
+        *[!0-9.]*) return 0 ;;
+        *.*.*.*) printf '4' ;;
+    esac
+}
+
+# host:port the way amneziawg-tools wants it written, which for IPv6 means the
+# address in brackets. An endpoint that reaches a .conf unbracketed is read as a
+# truncated address with the last group taken for the port, and the tunnel never
+# handshakes.
+endpoint_format() {
+    local host=$1 port=${2:-}
+    [ -n "$host" ] || return 0
+    [ "$(ip_family "$host")" != 6 ] || host="[${host}]"
+    if [ -n "$port" ]; then
+        printf '%s:%s' "$host" "$port"
+    else
+        printf '%s' "$host"
+    fi
+}
+
+# The host out of an endpoint, brackets removed.
+endpoint_host() {
+    local value=${1:-}
+    case $value in
+        '') ;;
+        \[*\]:*) value=${value%%\]:*}; printf '%s' "${value#\[}" ;;
+        \[*\]) value=${value%\]}; printf '%s' "${value#\[}" ;;
+        *:*:*) printf '%s' "$value" ;;
+        *:*) printf '%s' "${value%:*}" ;;
+        *) printf '%s' "$value" ;;
+    esac
 }
 
 # Rewrites KEY=value in a .env file, appending the key when it is not there yet.
@@ -203,6 +268,35 @@ require_protocol() {
     resolved=$(awg_protocol "${1:-}") \
         || die "AmneziaWG ${1} is not a generation SauceWG can serve (one of: ${AWG_PROTOCOLS})"
     printf '%s' "$resolved"
+}
+
+# ---------------------------------------------------------------------------
+# Address families
+# ---------------------------------------------------------------------------
+#
+# The link between an entry node and its exit nodes carries IPv4 out of the box.
+# Adding IPv6 to it is two separate choices, and conflating them is the mistake
+# worth naming here:
+#
+#   the endpoint family   which address the tunnel is dialled over, i.e. what a
+#                         censor between the two servers sees
+#   the bridge family     which families travel inside the tunnel, i.e. what a
+#                         destination on the far side sees
+#
+# They are independent. An exit node reached over IPv4 can carry IPv6 for its
+# clients, and one reached over IPv6 can carry nothing but IPv4.
+
+# ULA by default, because the bridge is not meant to be reachable from outside.
+# fd00:77::/64 pairs with 10.77.0.0/24 so the two halves read as one link.
+CASCADE_UPLINK_SUBNET6_DEFAULT="fd00:77::/64"
+
+require_endpoint_family() {
+    case $(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]') in
+        ''|auto|any) printf 'auto' ;;
+        4|v4|ipv4|inet) printf '4' ;;
+        6|v6|ipv6|inet6) printf '6' ;;
+        *) die "--endpoint-family takes auto, 4 or 6, not ${1}" ;;
+    esac
 }
 
 # A signature packet goes out ahead of the handshake so that the first thing a
@@ -601,8 +695,18 @@ services:
       TORRENT_TCP_PORTS: ${TORRENT_TCP_PORTS:-}
       TORRENT_UDP_PORTS: ${TORRENT_UDP_PORTS:-}
       CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
+      # The IPv6 half of the link to the exit nodes. Empty is a cascade that
+      # carries IPv4 only, which is what every installation made before this
+      # existed is, and turning it on is the operator's decision rather than
+      # something an update makes for them.
+      CASCADE_UPLINK_SUBNET6: ${CASCADE_UPLINK_SUBNET6:-}
+      # Which endpoint to dial an exit node over when it publishes both: auto, 4
+      # or 6. `auto` prefers IPv6 when this node has IPv6, because an entry node's
+      # IPv4 is the address a blocklist has.
+      CASCADE_ENDPOINT_FAMILY: ${CASCADE_ENDPOINT_FAMILY:-auto}
       CASCADE_PROBE_ENABLED: ${CASCADE_PROBE_ENABLED:-true}
       CASCADE_PROBE_TARGET: ${CASCADE_PROBE_TARGET:-1.1.1.1}
+      CASCADE_PROBE_TARGET6: ${CASCADE_PROBE_TARGET6:-2606:4700:4700::1111}
       CASCADE_PROBE_INTERVAL: ${CASCADE_PROBE_INTERVAL:-10}
       CASCADE_PROBE_TIMEOUT: ${CASCADE_PROBE_TIMEOUT:-3}
       CASCADE_FAIL_THRESHOLD: ${CASCADE_FAIL_THRESHOLD:-3}
@@ -732,6 +836,10 @@ services:
       AWG_IFACE: ${AWG_IFACE:-awg0}
       AWG_PORT: ${AWG_PORT:-51820}
       AWG_SUBNET: ${AWG_SUBNET:-10.77.0.0/24}
+      # This exit node's side of the IPv6 half of the bridge. Empty is an exit
+      # node that carries IPv4 only, and the entry node reports it as such rather
+      # than treating it as broken.
+      AWG_SUBNET6: ${AWG_SUBNET6:-}
       AWG_MTU: ${AWG_MTU:-1420}
       AWG_PRIVATE_KEY: ${AWG_PRIVATE_KEY:-}
       AWG_PROTOCOL: ${AWG_PROTOCOL:-}
@@ -782,6 +890,7 @@ cmd_install() {
 
     local domain="" http_port="" https_port="" admin_user="admin" admin_password=""
     local awg_port=443 subnet=10.8.0.0/24 uplink_subnet=10.77.0.0/24 endpoint_host=""
+    local uplink_subnet6="" endpoint_family=auto
     local start=true reinstall=false protocol="" signature=""
 
     while [ $# -gt 0 ]; do
@@ -794,6 +903,11 @@ cmd_install() {
             --port) awg_port=$2; shift 2 ;;
             --subnet) subnet=$2; shift 2 ;;
             --uplink-subnet) uplink_subnet=$2; shift 2 ;;
+            # The IPv6 half of the link to the exit nodes. `--uplink-subnet6 auto`
+            # takes the default ULA prefix, which is what anyone who just wants it
+            # on means; a prefix of your own goes here instead.
+            --uplink-subnet6) uplink_subnet6=$2; shift 2 ;;
+            --endpoint-family) endpoint_family=$2; shift 2 ;;
             --endpoint-host|--host) endpoint_host=$2; shift 2 ;;
             --protocol|--awg-version) protocol=$2; shift 2 ;;
             --signature|--cps) signature=$2; shift 2 ;;
@@ -802,6 +916,12 @@ cmd_install() {
             *) die "unknown option for install: $1" ;;
         esac
     done
+
+    case $uplink_subnet6 in
+        auto|yes|on|true) uplink_subnet6=$CASCADE_UPLINK_SUBNET6_DEFAULT ;;
+        no|off|false) uplink_subnet6="" ;;
+    esac
+    endpoint_family=$(require_endpoint_family "$endpoint_family")
 
     # A fresh install has no clients to keep working, so it starts on the newest
     # generation KeeneticOS accepts rather than on 1.0.
@@ -918,6 +1038,15 @@ CASCADE_NODES_FILE=/etc/amnezia/host/exit-nodes.json
 CASCADE_DIRECT_FILE=/etc/amnezia/host/direct-routes.json
 CASCADE_DIRECT_ROUTES=
 CASCADE_UPLINK_SUBNET=${uplink_subnet}
+# The IPv6 half of the link to the exit nodes, which is what lets an exit node
+# reach the IPv6 internet on behalf of this one. Empty carries IPv4 only.
+# See: saucewg bridge
+CASCADE_UPLINK_SUBNET6=${uplink_subnet6}
+# Which endpoint to dial an exit node over when it publishes both: auto, 4 or 6.
+# auto prefers IPv6 when this node has IPv6 — an entry node's IPv4 is the address
+# a blocklist has, and the same exit node answers on IPv6 through filters that were
+# never built to look there.
+CASCADE_ENDPOINT_FAMILY=${endpoint_family}
 
 # Destinations blocked by dropping the TCP handshake to their IPv4, which this
 # entry node reopens over IPv6 or by retrying. auto engages only while clients are
@@ -947,6 +1076,10 @@ TORRENT_UDP_PORTS=
 
 CASCADE_PROBE_ENABLED=true
 CASCADE_PROBE_TARGET=1.1.1.1
+# Where the IPv6 half of the bridge is probed, when there is one. Its result is
+# reported rather than acted on: clients are IPv4, so an exit node whose IPv6 is
+# broken is still carrying everything it is asked to.
+CASCADE_PROBE_TARGET6=2606:4700:4700::1111
 CASCADE_PROBE_INTERVAL=10
 CASCADE_PROBE_TIMEOUT=3
 CASCADE_FAIL_THRESHOLD=3
@@ -1094,7 +1227,8 @@ wait_for_containers() {
 cmd_install_node() {
     need_root install-node
 
-    local name="" port=51820 subnet=10.77.0.0/24 peer_allowed=10.77.0.0/24
+    local name="" port=51820 subnet=10.77.0.0/24 peer_allowed=""
+    local subnet6="" endpoint_host6=""
     local peer_key="" psk="" endpoint_host="" reinstall=false start=true
     local protocol="" signature="" requested_protocol=false
 
@@ -1103,11 +1237,15 @@ cmd_install_node() {
             --name) name=$2; shift 2 ;;
             --port) port=$2; shift 2 ;;
             --subnet) subnet=$2; shift 2 ;;
+            # This node's side of the IPv6 half of the bridge. `auto` takes the
+            # default ULA prefix, which has to be the same one the entry node uses.
+            --subnet6) subnet6=$2; shift 2 ;;
             --peer-allowed-ips) peer_allowed=$2; shift 2 ;;
             --peer-key) peer_key=$2; shift 2 ;;
             --psk) psk=$2; shift 2 ;;
             --psk-stdin) psk=$(read_stdin_secret); shift ;;
             --endpoint-host|--host) endpoint_host=$2; shift 2 ;;
+            --endpoint-host6|--host6) endpoint_host6=$2; shift 2 ;;
             --protocol|--awg-version) protocol=$2; requested_protocol=true; shift 2 ;;
             --signature|--cps) signature=$2; requested_protocol=true; shift 2 ;;
             --no-start) start=false; shift ;;
@@ -1118,6 +1256,17 @@ cmd_install_node() {
 
     [ -n "$name" ] || name=$(hostname -s 2>/dev/null || echo exit)
     protocol=$(require_protocol "${protocol:-$AWG_PROTOCOL_LATEST}")
+
+    case $subnet6 in
+        auto|yes|on|true) subnet6=$CASCADE_UPLINK_SUBNET6_DEFAULT ;;
+        no|off|false) subnet6="" ;;
+    esac
+    # AllowedIPs is the inbound filter as well as the route, so it has to name
+    # every family the bridge carries or the node drops what it is sent.
+    if [ -z "$peer_allowed" ]; then
+        peer_allowed=$subnet
+        [ -z "$subnet6" ] || peer_allowed="${subnet}, ${subnet6}"
+    fi
 
     if [ -f "$ENV_FILE" ] && [ "$reinstall" = false ]; then
         [ "$(role)" = "exit" ] || die "${APP_DIR} already holds a $(role) installation"
@@ -1157,6 +1306,10 @@ SAUCEWG_TAG=${IMAGE_TAG}
 AWG_IFACE=awg0
 AWG_PORT=${port}
 AWG_SUBNET=${subnet}
+# This node's side of the IPv6 half of the bridge: what the entry node reaches the
+# IPv6 internet through. Empty carries IPv4 only, and has to match whether the
+# entry node has CASCADE_UPLINK_SUBNET6 set.
+AWG_SUBNET6=${subnet6}
 AWG_MTU=1420
 AWG_PRIVATE_KEY=
 
@@ -1204,6 +1357,16 @@ EOF
     [ -z "$peer_key" ] || env_set "$ENV_FILE" AWG_PEER_PUBLIC_KEY "$peer_key"
     [ -z "$psk" ] || env_set "$ENV_FILE" AWG_PEER_PSK "$psk"
     [ -z "$endpoint_host" ] || env_set "$ENV_FILE" SAUCEWG_ENDPOINT_HOST "$endpoint_host"
+    [ -z "$endpoint_host6" ] || env_set "$ENV_FILE" SAUCEWG_ENDPOINT_HOST6 "$endpoint_host6"
+
+    # Re-running the installer on a node that is already up is how an IPv6 bridge
+    # gets added to one, so --subnet6 is applied to the .env that was kept. The
+    # peer's AllowedIPs follow from it inside the container, which is what keeps an
+    # .env written before this existed working unedited.
+    if [ -n "$subnet6" ] && [ "$(env_get "$ENV_FILE" AWG_SUBNET6)" != "$subnet6" ]; then
+        env_set "$ENV_FILE" AWG_SUBNET6 "$subnet6"
+        note "the IPv6 half of the bridge is ${subnet6} on this node"
+    fi
 
     open_node_port "$port"
 
@@ -1257,23 +1420,47 @@ emit_node_info() {
     require_installed
     [ "$(role)" = "exit" ] || die "node-info only applies to an exit node"
 
-    local iface params host port name
+    local iface params host host6 port name endpoint endpoint6 subnet6
     iface=$(env_get "$ENV_FILE" AWG_IFACE || echo awg0)
     params=$(compose exec -T awg cat "/etc/amnezia/amneziawg/${iface}.params" 2>/dev/null) \
         || die "could not read the node parameters; is the node running?"
 
     name=$(env_get "$ENV_FILE" SAUCEWG_NODE_NAME || true)
     [ -n "$name" ] || name=$(hostname -s 2>/dev/null || echo exit)
-    host=$(env_get "$ENV_FILE" SAUCEWG_ENDPOINT_HOST || true)
-    [ -n "$host" ] || host=$(public_ip) || die "could not detect the public IP; pass --endpoint-host"
     port=$(printf '%s' "$params" | sed -n 's/^SERVER_PORT=//p')
+    subnet6=$(printf '%s' "$params" | sed -n 's/^SERVER_SUBNET6=//p' | tr -d "'")
+
+    # Both endpoints are reported, because the entry node decides which to dial and
+    # can move between them when one stops answering. amneziawg-go binds a socket of
+    # each family, so a node that has IPv6 is already reachable over it — there is
+    # nothing to switch on here, only an address to tell the entry node about.
+    #
+    # An IPv6-only VPS has no IPv4 to report, and that is not an error: a node with
+    # one endpoint is dialled over the family it has.
+    host=$(env_get "$ENV_FILE" SAUCEWG_ENDPOINT_HOST || true)
+    host6=$(env_get "$ENV_FILE" SAUCEWG_ENDPOINT_HOST6 || true)
+    if [ -z "$host" ] && [ -z "$host6" ]; then
+        host=$(public_ip) || host=""
+        host6=$(public_ip6) || host6=""
+        [ -n "$host" ] || [ -n "$host6" ] \
+            || die "could not detect a public address; pass --endpoint-host or --endpoint-host6"
+    fi
+    # A single --endpoint-host carrying an IPv6 literal is the IPv6 endpoint,
+    # whichever flag it arrived through.
+    if [ "$(ip_family "$host")" = 6 ] && [ -z "$host6" ]; then
+        host6=$host
+        host=""
+    fi
+    endpoint=$(endpoint_format "$host" "$port")
+    endpoint6=$(endpoint_format "$host6" "$port")
 
     # Only the parameters the node's generation actually carries are reported: an
     # extra S3 in the list would have the entry node build a 2.0 uplink towards an
     # exit node that speaks 1.0, and the handshake would never complete.
     local json
     json=$(printf '%s' "$params" | jq -R -s \
-        --arg name "$name" --arg host "$host" --arg port "$port" \
+        --arg name "$name" --arg endpoint "$endpoint" --arg endpoint6 "$endpoint6" \
+        --arg port "$port" --arg subnet6 "$subnet6" \
         --arg shared "S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5" '
         def unquote:
             if startswith("\u0027") and endswith("\u0027")
@@ -1286,11 +1473,13 @@ emit_node_info() {
         | . as $p
         | {
             name: $name,
-            endpoint: "\($host):\($port)",
+            endpoint: (if $endpoint == "" then null else $endpoint end),
+            endpoint6: (if $endpoint6 == "" then null else $endpoint6 end),
             public_key: $p.SERVER_PUBLIC_KEY,
             port: ($port | tonumber),
             protocol: ($p.SERVER_PROTOCOL // "1.0")
           }
+        + (if $subnet6 == "" then {} else {subnet6: $subnet6} end)
         + (reduce ($shared | split(" "))[] as $k ({};
               ($p["SERVER_" + $k]) as $v
               | if ($v // "") == "" then . else . + {($k | ascii_downcase): ($v | numeric)} end))')
@@ -1386,7 +1575,8 @@ cmd_add_node() {
     need_root add-node
     require_entry
 
-    local json="" name="" endpoint="" public_key="" psk="" priority="" address=""
+    local json="" name="" endpoint="" endpoint6="" family="" public_key="" psk=""
+    local priority="" address="" address6=""
     local protocol="" reload=true
     # Parallel to AWG_OBF_PARAMS, so --s3 or --i1 needs no new variable here.
     local -A obf=()
@@ -1394,11 +1584,18 @@ cmd_add_node() {
         case "$1" in
             --json) json=$2; shift 2 ;;
             --name) name=$2; shift 2 ;;
-            --endpoint) endpoint=$2; shift 2 ;;
+            --endpoint|--endpoint4) endpoint=$2; shift 2 ;;
+            --endpoint6) endpoint6=$2; shift 2 ;;
+            # Which of the two to dial: auto, 4 or 6. Per node, overriding
+            # CASCADE_ENDPOINT_FAMILY.
+            --family|--endpoint-family) family=$2; shift 2 ;;
             --public-key) public_key=$2; shift 2 ;;
             --psk) psk=$2; shift 2 ;;
             --priority) priority=$2; shift 2 ;;
             --address) address=$2; shift 2 ;;
+            # This uplink's address on the IPv6 half of the bridge. `none` keeps
+            # one node off it while the rest of the cascade uses it.
+            --address6) address6=$2; shift 2 ;;
             --protocol|--awg-version) protocol=$2; shift 2 ;;
             --s[1-4]|--h[1-4]|--i[1-5]|--jc|--jmin|--jmax)
                 obf[$(printf '%s' "${1#--}" | tr '[:lower:]' '[:upper:]')]=$2; shift 2 ;;
@@ -1407,6 +1604,14 @@ cmd_add_node() {
         esac
     done
     [ -z "$protocol" ] || protocol=$(require_protocol "$protocol")
+    [ -z "$family" ] || family=$(require_endpoint_family "$family")
+    # An IPv6 literal given as the plain endpoint is the IPv6 endpoint. Typing one
+    # address into one field is what an operator does, and the alternative is a
+    # tunnel configured with a truncated address that never handshakes.
+    if [ "$(ip_family "$(endpoint_host "$endpoint")")" = 6 ] && [ -z "$endpoint6" ]; then
+        endpoint6=$endpoint
+        endpoint=""
+    fi
 
     local node
     if [ -n "$json" ]; then
@@ -1415,11 +1620,14 @@ cmd_add_node() {
             || die "--json did not contain a JSON object"
     else
         [ -n "$name" ] || die "--name is required"
-        [ -n "$endpoint" ] || die "--endpoint is required (host:port)"
+        [ -n "$endpoint" ] || [ -n "$endpoint6" ] \
+            || die "--endpoint or --endpoint6 is required (host:port, IPv6 in brackets)"
         [ -n "$public_key" ] || die "--public-key is required"
-        node=$(jq -n --arg name "$name" --arg endpoint "$endpoint" --arg key "$public_key" \
-                     --arg psk "$psk" --arg protocol "$protocol" '
-            {name: $name, endpoint: $endpoint, public_key: $key}
+        node=$(jq -n --arg name "$name" --arg endpoint "$endpoint" --arg endpoint6 "$endpoint6" \
+                     --arg key "$public_key" --arg psk "$psk" --arg protocol "$protocol" '
+            {name: $name, public_key: $key}
+            + (if $endpoint == "" then {} else {endpoint: $endpoint} end)
+            + (if $endpoint6 == "" then {} else {endpoint6: $endpoint6} end)
             + (if $psk == "" then {} else {preshared_key: $psk} end)
             + (if $protocol == "" then {} else {protocol: $protocol} end)')
         local param
@@ -1428,6 +1636,11 @@ cmd_add_node() {
                                             --arg v "${obf[$param]}" \
                 '. + {($k): (if ($v | test("^[0-9]+$")) then ($v | tonumber) else $v end)}')
         done
+    fi
+    # Named alongside --json these win, for the same reason --protocol does: the
+    # object may have come from a node whose addressing has since changed.
+    if [ -n "$family" ]; then
+        node=$(printf '%s' "$node" | jq --arg f "$family" '. + {family: $f}')
     fi
     # A generation named alongside --json wins: the object may have come from a node
     # that has since been moved.
@@ -1438,9 +1651,10 @@ cmd_add_node() {
     name=$(printf '%s' "$node" | jq -r '.name // ""')
     [ -n "$name" ] || die "the node object needs a name"
 
-    local file uplink_subnet
+    local file uplink_subnet uplink_subnet6
     file=$(nodes_file)
     uplink_subnet=$(env_get "$ENV_FILE" CASCADE_UPLINK_SUBNET || echo 10.77.0.0/24)
+    uplink_subnet6=$(env_get "$ENV_FILE" CASCADE_UPLINK_SUBNET6 || true)
 
     jq -e --arg n "$name" 'any(.[]; .name == $n)' "$file" >/dev/null 2>&1 \
         && die "an exit node named ${name} already exists"
@@ -1459,15 +1673,37 @@ cmd_add_node() {
         done
         [ -n "$address" ] || die "no free address left in ${uplink_subnet}"
     fi
+    # The same for the IPv6 half, when the cascade has one. The two halves are
+    # numbered in step — 10.77.0.4/32 beside fd00:77::4/128 — so that one uplink
+    # reads as one link in `ip addr` and in a packet capture.
+    if [ -n "$uplink_subnet6" ] && [ -z "$address6" ] \
+        && ! printf '%s' "$node" | jq -e 'has("address6")' >/dev/null; then
+        case ${uplink_subnet6%%/*} in
+            *::)
+                local n
+                n=${address%%/*}
+                n=${n##*.}
+                case $n in
+                    ''|*[!0-9]*) ;;
+                    *) address6=$(printf '%s%x/128' "${uplink_subnet6%%/*}" "$n") ;;
+                esac
+                ;;
+            *)
+                warn "CASCADE_UPLINK_SUBNET6=${uplink_subnet6} cannot have host numbers appended to it; pass --address6 to put ${name} on the IPv6 bridge"
+                ;;
+        esac
+    fi
     if [ -z "$priority" ] && ! printf '%s' "$node" | jq -e 'has("priority")' >/dev/null; then
         # `.[].priority // 100` would fall through to 100 on an empty list, so the
         # very first node has to be mapped explicitly.
         priority=$(jq '[.[] | .priority // 100] | (max // 0) + 10' "$file")
     fi
 
-    jq --argjson node "$node" --arg address "$address" --arg priority "$priority" '
+    jq --argjson node "$node" --arg address "$address" --arg address6 "$address6" \
+       --arg priority "$priority" '
         . + [$node
              + (if $address == "" then {} else {address: $address} end)
+             + (if $address6 == "" then {} else {address6: $address6} end)
              + (if $priority == "" then {} else {priority: ($priority | tonumber)} end)]
         ' "$file" > "${file}.tmp"
     mv "${file}.tmp" "$file"
@@ -1483,11 +1719,14 @@ cmd_add_node() {
     fi
 
     if [ "$JSON_OUTPUT" = true ]; then
-        jq -n --arg name "$name" --arg address "$address" --arg key "$uplink_key" \
+        jq -n --arg name "$name" --arg address "$address" --arg address6 "$address6" \
+            --arg key "$uplink_key" \
             '{ok: true, name: $name, address: $address,
+              address6: (if $address6 == "" then null else $address6 end),
               uplink_public_key: (if $key == "" then null else $key end)}'
     else
         note "uplink address    ${address}"
+        [ -z "$address6" ] || note "uplink address6   ${address6}"
         if [ -n "$uplink_key" ]; then
             note "uplink public key ${uplink_key}"
             note ""
@@ -1566,7 +1805,10 @@ cmd_list_nodes() {
         printf '%s' "$state" | jq -r '
             (now | floor) as $now
             | ((.handshake_timeout // 180) + (.failover_seconds // 30)) as $dead_after
-            | "PRIO\tNAME\tIFACE\tSTATUS\tHANDSHAKE\tENDPOINT",
+            | (.bridge.subnet6 != null) as $v6
+            | (["PRIO", "NAME", "IFACE", "STATUS", "HANDSHAKE"]
+               + (if $v6 then ["VIA", "IPV6"] else [] end)
+               + ["ENDPOINT"] | join("\t")),
             (.nodes | sort_by(.priority)[] |
                 (if (.last_handshake // 0) > 0 then $now - .last_handshake else null end) as $age
                 | (.healthy and $age != null and $age <= $dead_after) as $up
@@ -1585,11 +1827,20 @@ cmd_list_nodes() {
                  elif $age < 120 then "\($age)s ago"
                  elif $age < 7200 then "\(($age / 60) | floor)m ago"
                  else "\(($age / 3600) | floor)h ago" end) +
+                # Which family the tunnel is dialled over, and whether the exit node
+                # reaches the IPv6 internet through it. Only shown on a cascade that
+                # has an IPv6 half, so an IPv4-only node lists as it always did.
+                (if $v6 then
+                    "\tIPv\(.endpoint_family // 4)\t" +
+                    (if .address6 == null then "-"
+                     elif .healthy6 then "up"
+                     else "down" end)
+                 else "" end) +
                 "\t\(.endpoint // "-")")'
     else
         jq -r '"PRIO\tNAME\tENDPOINT",
                (sort_by(.priority // 100)[] |
-                   "\(.priority // 100)\t\(.name)\t\(.endpoint // "-")")' "$file"
+                   "\(.priority // 100)\t\(.name)\t\(.endpoint6 // .endpoint // "-")")' "$file"
     fi | column -t -s "$(printf '\t')"
 }
 
@@ -1636,13 +1887,16 @@ cmd_update_node() {
     need_root update-node
     require_entry
 
-    local json="" name="" endpoint="" protocol="" reload=true
+    local json="" name="" endpoint="" endpoint6="" family="" address6="" protocol="" reload=true
     local -A obf=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) json=$2; shift 2 ;;
             --name) name=$2; shift 2 ;;
-            --endpoint) endpoint=$2; shift 2 ;;
+            --endpoint|--endpoint4) endpoint=$2; shift 2 ;;
+            --endpoint6) endpoint6=$2; shift 2 ;;
+            --family|--endpoint-family) family=$2; shift 2 ;;
+            --address6) address6=$2; shift 2 ;;
             --priority) obf[PRIORITY]=$2; shift 2 ;;
             --protocol|--awg-version) protocol=$2; shift 2 ;;
             --s[1-4]|--h[1-4]|--i[1-5]|--jc|--jmin|--jmax)
@@ -1653,6 +1907,11 @@ cmd_update_node() {
         esac
     done
     [ -z "$protocol" ] || protocol=$(require_protocol "$protocol")
+    [ -z "$family" ] || family=$(require_endpoint_family "$family")
+    if [ "$(ip_family "$(endpoint_host "$endpoint")")" = 6 ] && [ -z "$endpoint6" ]; then
+        endpoint6=$endpoint
+        endpoint=""
+    fi
 
     local patch='{}'
     if [ -n "$json" ]; then
@@ -1663,7 +1922,16 @@ cmd_update_node() {
     fi
     [ -n "$name" ] || die "update-node needs a node name"
 
+    # `none` takes an endpoint away rather than replacing it. An address that has
+    # stopped working is not merely unused once a node has two: it is somewhere the
+    # uplink is rebuilt onto every time the other one has a bad minute.
+    local drop4=false drop6=false
+    case $endpoint in none|off|no|'-') drop4=true; endpoint="" ;; esac
+    case $endpoint6 in none|off|no|'-') drop6=true; endpoint6="" ;; esac
     [ -z "$endpoint" ] || patch=$(printf '%s' "$patch" | jq --arg v "$endpoint" '. + {endpoint: $v}')
+    [ -z "$endpoint6" ] || patch=$(printf '%s' "$patch" | jq --arg v "$endpoint6" '. + {endpoint6: $v}')
+    [ -z "$family" ] || patch=$(printf '%s' "$patch" | jq --arg v "$family" '. + {family: $v}')
+    [ -z "$address6" ] || patch=$(printf '%s' "$patch" | jq --arg v "$address6" '. + {address6: $v}')
     [ -z "$protocol" ] || patch=$(printf '%s' "$patch" | jq --arg v "$protocol" '. + {protocol: $v}')
     local param key
     for param in "${!obf[@]}"; do
@@ -1677,15 +1945,32 @@ cmd_update_node() {
     jq -e --arg n "$name" 'any(.[]; .name == $n)' "$file" >/dev/null 2>&1 \
         || die "no exit node named ${name}"
 
+    # Refused rather than applied: a node with no address at all is one the cascade
+    # can do nothing with but report as permanently down.
+    if [ "$drop4" = true ] || [ "$drop6" = true ]; then
+        # The patch is consulted before the stored node, so dropping one endpoint
+        # while naming the other in the same command is allowed.
+        jq -e --arg n "$name" --argjson patch "$patch" \
+              --argjson d4 "$drop4" --argjson d6 "$drop6" '
+            (.[] | select(.name == $n)) as $node
+            | [(if $d4 then "" else ($patch.endpoint // $node.endpoint // "") end),
+               (if $d6 then "" else ($patch.endpoint6 // $node.endpoint6 // "") end)]
+            | any(.[]; . != "")' "$file" >/dev/null \
+            || die "${name} would be left with no endpoint to dial"
+    fi
+
     # The old generation's parameters are dropped rather than overwritten: a leftover
     # S3 would keep this uplink advertising 2.0 to an exit node that no longer does.
     local params_lower
     params_lower=$(printf '%s' "$AWG_OBF_PARAMS" | tr '[:upper:]' '[:lower:]')
-    jq --arg n "$name" --argjson patch "$patch" --arg obf "$params_lower" '
+    jq --arg n "$name" --argjson patch "$patch" --arg obf "$params_lower" \
+       --argjson d4 "$drop4" --argjson d6 "$drop6" '
         ($obf | split(" ")) as $keys
         | map(if .name == $n
               then (if ($patch | has("protocol")) then delpaths([$keys[] | [.]]) else . end)
                    + ($patch | del(.name))
+                   | (if $d4 then del(.endpoint) else . end)
+                   | (if $d6 then del(.endpoint6) else . end)
               else . end)' "$file" > "${file}.tmp"
     mv "${file}.tmp" "$file"
     chmod 600 "$file"
@@ -1701,7 +1986,12 @@ cmd_update_node() {
         jq -e --arg n "$name" '.[] | select(.name == $n) | {ok: true} + .' "$file"
     else
         jq -r --arg n "$name" '.[] | select(.name == $n)
-            | "protocol \(.protocol // "1.0")\naddress  \(.address // "-")\nendpoint \(.endpoint // "-")"' "$file" \
+            | "protocol  \(.protocol // "1.0")",
+              "address   \(.address // "-")",
+              (if .address6 then "address6  \(.address6)" else empty end),
+              "endpoint  \(.endpoint // "-")",
+              (if .endpoint6 then "endpoint6 \(.endpoint6)" else empty end),
+              (if .family then "family    \(.family)" else empty end)' "$file" \
             | while IFS= read -r line; do note "$line"; done
     fi
 }
@@ -1973,6 +2263,138 @@ cmd_fallback() {
     fi
 
     [ "$JSON_OUTPUT" = false ] || jq -n --arg mode "$mode" '{ok: true, fallback: $mode}'
+}
+
+# ---------------------------------------------------------------------------
+# The bridge
+# ---------------------------------------------------------------------------
+#
+# The link between this entry node and its exit nodes. It carries IPv4 out of the
+# box; this is what adds IPv6 to it, and what reports which family each tunnel is
+# actually dialled over.
+#
+# Both ends have to agree. The entry node's CASCADE_UPLINK_SUBNET6 and each exit
+# node's AWG_SUBNET6 name the same prefix, and until the exit node has one, its
+# half of the bridge has no address and nothing comes back over it. So turning the
+# bridge on here is announced as half the job, with the other half named.
+
+cmd_bridge() {
+    require_entry
+
+    local action="${1:-}" subnet6="" family="" restart=true
+    case "$action" in
+        on|enable) subnet6=$CASCADE_UPLINK_SUBNET6_DEFAULT; shift ;;
+        off|disable) subnet6=none; shift ;;
+        4|6|auto) family=$action; shift ;;
+        show|status) shift ;;
+        */*|*:*) subnet6=$action; shift ;;
+        ''|-*) ;;
+        *) die "bridge takes on, off, auto, 4, 6, or an IPv6 prefix" ;;
+    esac
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --subnet6) subnet6=$2; shift 2 ;;
+            --family|--endpoint-family) family=$2; shift 2 ;;
+            --no-restart) restart=false; shift ;;
+            *) die "unknown option for bridge: $1" ;;
+        esac
+    done
+
+    if [ -z "$subnet6" ] && [ -z "$family" ]; then
+        local configured_subnet configured_subnet6 configured_family state
+        configured_subnet=$(env_get "$ENV_FILE" CASCADE_UPLINK_SUBNET || echo 10.77.0.0/24)
+        configured_subnet6=$(env_get "$ENV_FILE" CASCADE_UPLINK_SUBNET6 || true)
+        configured_family=$(env_get "$ENV_FILE" CASCADE_ENDPOINT_FAMILY || true)
+        [ -n "$configured_family" ] || configured_family=auto
+        state=$(compose exec -T awg cat /var/run/amneziawg/uplinks.json 2>/dev/null) || state=""
+        printf '%s' "$state" | jq -e 'has("nodes")' >/dev/null 2>&1 || state=""
+
+        if [ "$JSON_OUTPUT" = true ]; then
+            jq -n --arg subnet "$configured_subnet" --arg subnet6 "$configured_subnet6" \
+                  --arg family "$configured_family" \
+                  --argjson live "$(printf '%s' "${state:-null}")" '
+                {subnet: $subnet,
+                 subnet6: (if $subnet6 == "" then null else $subnet6 end),
+                 family: $family,
+                 nodes: (if $live == null then null else
+                     [$live.nodes[] | {name, endpoint, endpoint4, endpoint6,
+                                       endpoint_family, address, address6,
+                                       healthy, healthy6, latency6_ms}] end)}'
+            return
+        fi
+
+        note "subnet    ${configured_subnet}"
+        if [ -n "$configured_subnet6" ]; then
+            note "subnet6   ${configured_subnet6}"
+        else
+            note "subnet6   -         the bridge carries IPv4 only; turn it on with: saucewg bridge on"
+        fi
+        case "$configured_family" in
+            4) note "family    4         exit nodes are dialled over IPv4" ;;
+            6) note "family    6         exit nodes are dialled over IPv6" ;;
+            *) note "family    auto      IPv6 where both ends have it, IPv4 otherwise" ;;
+        esac
+        if [ -n "$state" ]; then
+            note ""
+            printf '%s' "$state" | jq -r '
+                "NAME\tVIA\tENDPOINT\tIPV6",
+                (.nodes | sort_by(.priority)[] |
+                    "\(.name)\tIPv\(.endpoint_family // 4)\t\(.endpoint // "-")\t" +
+                    (if .address6 == null then "-"
+                     elif .healthy6 then "\(.address6) up"
+                     else "\(.address6) down" end))' \
+                | column -t -s "$(printf '\t')"
+        fi
+        return
+    fi
+
+    need_root bridge
+
+    if [ -n "$family" ]; then
+        family=$(require_endpoint_family "$family")
+        env_set "$ENV_FILE" CASCADE_ENDPOINT_FAMILY "$family"
+        case "$family" in
+            4|6) log "exit nodes will be dialled over IPv${family}" ;;
+            *) log "exit nodes will be dialled over IPv6 where both ends have it, IPv4 otherwise" ;;
+        esac
+    fi
+
+    if [ -n "$subnet6" ]; then
+        case $subnet6 in
+            none|off|no|false) subnet6="" ;;
+            auto|yes|on|true) subnet6=$CASCADE_UPLINK_SUBNET6_DEFAULT ;;
+            *:*/*) ;;
+            *) die "--subnet6 takes an IPv6 prefix like ${CASCADE_UPLINK_SUBNET6_DEFAULT}, or none" ;;
+        esac
+        env_set "$ENV_FILE" CASCADE_UPLINK_SUBNET6 "$subnet6"
+        if [ -n "$subnet6" ]; then
+            log "the bridge now carries IPv6 on ${subnet6}"
+            note ""
+            note "Each exit node needs the same prefix before anything comes back over it:"
+            note "  saucewg install-node --subnet6 ${subnet6} --reinstall   # on each exit node"
+            note "Then give each uplink an address on it:"
+            note "  saucewg update-node <name> --address6 ${subnet6%%/*}<n>"
+            note ""
+            note "Clients stay on IPv4: this is the link between the servers, not the"
+            note "tunnel a client builds. Nothing a client sends can reach it."
+        else
+            log "the bridge carries IPv4 only again"
+        fi
+    fi
+
+    if [ "$restart" = true ]; then
+        step "Applying"
+        # An environment change only reaches the process through a new container.
+        compose up -d awg >&2
+        note "connected clients reconnect on their own within a few seconds"
+    else
+        note "not applied yet; apply it with: saucewg restart"
+    fi
+
+    [ "$JSON_OUTPUT" = false ] || jq -n --arg subnet6 "$subnet6" --arg family "$family" \
+        '{ok: true,
+          subnet6: (if $subnet6 == "" then null else $subnet6 end),
+          family: (if $family == "" then null else $family end)}'
 }
 
 # ---------------------------------------------------------------------------
@@ -2633,6 +3055,18 @@ cmd_update() {
 
         grep -q '^TORRENT_REGISTRY_FILE=' "$ENV_FILE" \
             || env_set "$ENV_FILE" TORRENT_REGISTRY_FILE /etc/saucewg/host/torrent-block.json
+
+        # The IPv6 half of the link to the exit nodes, and which endpoint to dial
+        # them over. Both arrive switched off rather than on: an update must leave a
+        # running cascade doing exactly what it did, and an IPv6 bridge needs the
+        # exit nodes rebuilt with a matching AWG_SUBNET6 before it carries anything.
+        # `saucewg bridge on` is the one step that turns it on at both ends.
+        grep -q '^CASCADE_UPLINK_SUBNET6=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" CASCADE_UPLINK_SUBNET6 ""
+        grep -q '^CASCADE_ENDPOINT_FAMILY=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" CASCADE_ENDPOINT_FAMILY auto
+        grep -q '^CASCADE_PROBE_TARGET6=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" CASCADE_PROBE_TARGET6 2606:4700:4700::1111
     else
         write_exit_compose
         env_set "$ENV_FILE" IMAGE_AWG "$(image_ref awg)"
@@ -2640,6 +3074,8 @@ cmd_update() {
         # The exit compose file gained a bind mount for this directory, and docker
         # would otherwise create it root-owned on first start.
         mkdir -p "$CONFIG_DIR"
+
+        grep -q '^AWG_SUBNET6=' "$ENV_FILE" || env_set "$ENV_FILE" AWG_SUBNET6 ""
     fi
 
     grep -q '^TORRENT_BLOCK_FILE=' "$ENV_FILE" \
@@ -2850,7 +3286,8 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
   Installation
     install                  Install the entry node: panel, database and cascade
     install-node             Install an exit node and print its pairing object
-                             (both take --protocol ${AWG_PROTOCOL_LATEST} and --signature quic)
+                             (both take --protocol ${AWG_PROTOCOL_LATEST} and --signature quic;
+                             --uplink-subnet6 auto / --subnet6 auto adds IPv6 to the bridge)
     update                   Pull the newest images and recreate the containers
     uninstall [--purge]      Remove the containers and volumes
 
@@ -2881,6 +3318,12 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
                              (--note GROUP labels them, --from-file PATH reads a list)
     remove-route CIDR…       Put them back on the cascade (--note GROUP removes a group)
     fallback [direct|block]  What happens while every exit node is down
+
+  The bridge to the exit nodes (entry node)
+    bridge                   Which families the link carries, and how each node is dialled
+    bridge on | off          Carry IPv6 inside the tunnels as well as IPv4
+                             (or name a prefix: bridge fd00:77::/64)
+    bridge auto | 4 | 6      Which endpoint to dial an exit node over when it has both
 
   Blocked destinations (entry node)
     bypass                   Destinations this node reopens, and whether it is doing so
@@ -2924,6 +3367,8 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
     bash <(curl -fsSL ${RAW_BASE}/saucewg.sh) install --domain panel.example.com
     bash <(curl -fsSL ${RAW_BASE}/saucewg.sh) install-node --name eu-nl --json
     bash <(curl -fsSL ${RAW_BASE}/saucewg.sh) install --protocol 1.0   # older Keenetic
+    bash <(curl -fsSL ${RAW_BASE}/saucewg.sh) install-node --subnet6 auto --json
+                                                           # exit node with IPv6
 
   Generations
     1.0   Jc Jmin Jmax S1 S2 H1-H4       every KeeneticOS from 4.2 Alpha 2 on
@@ -3002,6 +3447,7 @@ main() {
         add-route)        cmd_add_route "$@" ;;
         remove-route)     cmd_remove_route "$@" ;;
         fallback)         cmd_fallback "$@" ;;
+        bridge)           cmd_bridge "$@" ;;
         bypass)           cmd_bypass "$@" ;;
         torrents|torrent) cmd_torrents "$@" ;;
         node-info)        cmd_node_info "$@" ;;

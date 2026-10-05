@@ -33,11 +33,18 @@ NODE_FIELDS = frozenset(
     {
         "name",
         "endpoint",
+        "endpoint4",
+        "endpoint6",
+        "endpoint_family",
+        "family",
         "public_key",
         "peer_public_key",
         "preshared_key",
         "psk",
         "address",
+        "address6",
+        "address_v6",
+        "endpoint_v6",
         "priority",
         "mtu",
         "keepalive",
@@ -112,10 +119,61 @@ def allocate_address(nodes: list[dict[str, Any]], subnet: str | None = None) -> 
     network = ipaddress.ip_network(subnet or settings.cascade_uplink_subnet, strict=False)
     taken = {str(node.get("address", "")).split("/")[0] for node in nodes}
     # .1 belongs to the exit node itself on the far side of every uplink.
-    for host in list(network.hosts())[1:]:
+    hosts = network.hosts()
+    next(hosts, None)
+    for host in hosts:
         if str(host) not in taken:
             return f"{host}/32"
     raise RegistryError(f"no free uplink address left in {network}")
+
+
+def allocate_address6(
+    nodes: list[dict[str, Any]],
+    subnet: str | None = None,
+    pair: str | None = None,
+) -> str | None:
+    """This uplink's address on the IPv6 half of the bridge, or None if there is none.
+
+    Numbered in step with the IPv4 side when ``pair`` names it — 10.77.0.4/32 beside
+    fd00:77::4/128 — so one uplink reads as one link in ``ip addr`` and in a capture.
+    Falling back to the lowest free address keeps it correct when the two sides do
+    not line up, which is any cascade whose IPv4 numbering has gaps in it.
+
+    Never iterated to exhaustion: a /64 has more addresses than there is time to
+    enumerate, so the search gives up well before the subnet does.
+    """
+    configured = subnet if subnet is not None else settings.cascade_uplink_subnet6
+    if not configured:
+        return None
+    try:
+        network = ipaddress.ip_network(configured, strict=False)
+    except ValueError as exc:
+        raise RegistryError(f"{configured} is not a valid IPv6 prefix: {exc}") from exc
+    if network.version != 6:
+        raise RegistryError(f"{configured} is not an IPv6 prefix")
+
+    taken = {str(node.get("address6", "")).split("/")[0] for node in nodes}
+
+    # The nth address of the prefix, where n is the host number of the IPv4 address
+    # this uplink already has.
+    if pair:
+        try:
+            offset = int(str(ipaddress.ip_address(pair.split("/")[0])).rsplit(".", 1)[1])
+        except (ValueError, IndexError):
+            offset = 0
+        if offset > 1:
+            candidate = network.network_address + offset
+            if candidate in network and str(candidate) not in taken:
+                return f"{candidate}/128"
+
+    # ::1 belongs to the exit node itself on the far side of every uplink.
+    for offset in range(2, 4096):
+        candidate = network.network_address + offset
+        if candidate not in network:
+            break
+        if str(candidate) not in taken:
+            return f"{candidate}/128"
+    raise RegistryError(f"no free uplink address left in the first 4094 hosts of {network}")
 
 
 def next_priority(nodes: list[dict[str, Any]]) -> int:

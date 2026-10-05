@@ -16,6 +16,7 @@ from ..config import settings
 from ..deps import AdminDep, SudoAdminDep
 from ..models import Admin
 from ..schemas import (
+    CascadeBridge,
     ExitNode,
     ExitNodeAdopt,
     ExitNodeCreate,
@@ -84,6 +85,16 @@ def _serialise(
         priority=node.priority,
         endpoint=node.endpoint,
         exit_ip=node.exit_ip,
+        # The running interface is the authority here too, but a node container that
+        # predates dual-stack endpoints reports none of this — so the registry entry
+        # stands in, which is what the operator asked for even if nothing applied it.
+        endpoint4=node.endpoint4 or meta.get("endpoint") or None,
+        endpoint6=node.endpoint6 or meta.get("endpoint6") or None,
+        endpoint_family=node.endpoint_family,
+        family=node.family or meta.get("family") or None,
+        address6=node.address6 or meta.get("address6") or None,
+        healthy6=node.healthy6,
+        latency6_ms=node.latency6_ms,
         public_key=node.public_key,
         peer_public_key=node.peer_public_key,
         paired=node.paired,
@@ -129,6 +140,13 @@ def _snapshot(mode: str | None = None, pinned: str | None = None) -> ExitNodeLis
         updated_at=state.updated_at,
         config_error=registry.config_error(),
         provisioning=registry.writable(),
+        bridge=CascadeBridge(
+            subnet=state.bridge.subnet,
+            subnet6=state.bridge.subnet6,
+            family=state.bridge.family,
+            probe_target=state.bridge.probe_target,
+            probe_target6=state.bridge.probe_target6,
+        ),
         nodes=[
             _serialise(node, meta.get(node.name), recovering.get(node.name))
             for node in state.nodes
@@ -391,10 +409,30 @@ def _copy_profile(reported: dict[str, Any], entry: dict[str, Any]) -> dict[str, 
     return entry
 
 
+def _bridge_subnet6(requested: str | None) -> str:
+    """Which IPv6 prefix to install on an exit node's side of the bridge.
+
+    Both ends have to name the same one, so the entry node's own setting is the
+    default and a caller normally leaves this alone. "none" is how one IPv4-only node
+    joins a cascade that otherwise carries both, and an entry node with no IPv6 half
+    installs none regardless — an exit node addressed on a bridge the entry node does
+    not share would be talking to nothing.
+    """
+    if requested and requested.strip().lower() in ("none", "off", "no", "false", "-"):
+        return ""
+    if requested:
+        return requested.strip()
+    return settings.cascade_uplink_subnet6
+
+
 def _register(node: dict[str, Any], nodes: list[dict[str, Any]]) -> dict[str, Any]:
     """Fills in the address and priority the entry node assigns, then persists."""
     if not node.get("address"):
         node["address"] = registry.allocate_address(nodes)
+    # Only when the cascade has an IPv6 half. "none" keeps one node off it, and is
+    # left alone so that it stays on file rather than being re-allocated next time.
+    if node.get("address6") is None and settings.cascade_uplink_subnet6:
+        node["address6"] = registry.allocate_address6(nodes, pair=node["address"])
     if node.get("priority") is None:
         node["priority"] = registry.next_priority(nodes)
     node.setdefault("created_at", datetime.now(timezone.utc).isoformat())
@@ -539,6 +577,10 @@ async def create_node(payload: ExitNodeCreate, admin: SudoAdminDep) -> TaskOut:
             credentials=credentials,
             port=payload.port,
             subnet=payload.subnet,
+            # Null follows the entry node's own prefix, which is what the two ends
+            # have to agree on; "none" installs an IPv4-only node into a dual-stack
+            # cascade. An entry node with no IPv6 half passes nothing either way.
+            subnet6=_bridge_subnet6(payload.subnet6),
             preshared_key=payload.preshared_key,
             protocol=payload.protocol,
             signature=payload.signature,
@@ -548,7 +590,6 @@ async def create_node(payload: ExitNodeCreate, admin: SudoAdminDep) -> TaskOut:
         task.begin("Joining the cascade")
         entry = {
             "name": node["name"],
-            "endpoint": node["endpoint"],
             "public_key": node["public_key"],
             "managed": True,
             "ssh_host": payload.host,
@@ -560,11 +601,27 @@ async def create_node(payload: ExitNodeCreate, admin: SudoAdminDep) -> TaskOut:
             # credentials, which is what makes the API usable from a bot.
             "ssh_key": credentials.enrolled,
         }
+        # The installer reports whichever endpoints the server actually has, so an
+        # IPv6-only VPS arrives with no `endpoint` at all. Only what it reported is
+        # recorded: inventing the other family would have the cascade dial an address
+        # that does not answer and call the node down for it.
+        for key in ("endpoint", "endpoint6"):
+            if node.get(key):
+                entry[key] = node[key]
         _copy_profile(node, entry)
         if payload.preshared_key:
             entry["preshared_key"] = payload.preshared_key
+        if payload.family:
+            entry["family"] = payload.family
         if payload.address:
             entry["address"] = payload.address
+        if payload.address6:
+            entry["address6"] = payload.address6
+        elif not node.get("subnet6"):
+            # The far end has no IPv6 bridge, so this uplink gets no address on it:
+            # holding one would have the cascade point the IPv6 route at a tunnel
+            # that black-holes the family, and report the silence as a fault.
+            entry["address6"] = "none"
         if payload.priority is not None:
             entry["priority"] = payload.priority
         if payload.note:
@@ -572,6 +629,8 @@ async def create_node(payload: ExitNodeCreate, admin: SudoAdminDep) -> TaskOut:
 
         entry = _register(entry, registry.load_nodes())
         task.emit(f"uplink address {entry['address']}, priority {entry['priority']}")
+        if entry.get("address6") and entry["address6"] != "none":
+            task.emit(f"uplink IPv6 address {entry['address6']} on {settings.cascade_uplink_subnet6}")
 
         await _apply_and_wait(task)
 
@@ -587,8 +646,10 @@ async def create_node(payload: ExitNodeCreate, admin: SudoAdminDep) -> TaskOut:
         _remember_key(payload.name, credentials)
         task.result = {
             "name": payload.name,
-            "endpoint": entry["endpoint"],
+            "endpoint": entry.get("endpoint"),
+            "endpoint6": entry.get("endpoint6"),
             "address": entry["address"],
+            "address6": entry.get("address6"),
             "priority": entry["priority"],
             "uplink_public_key": uplink_key,
             "protocol": entry.get("protocol"),
@@ -664,9 +725,12 @@ async def adopt_node(payload: ExitNodeAdopt, admin: SudoAdminDep) -> ExitNodeLis
 
 @router.put("/{name}", response_model=ExitNodeList)
 async def update_node(name: str, payload: ExitNodeUpdate, admin: SudoAdminDep) -> ExitNodeList:
-    """Changes an exit node's failover priority, endpoint or note.
+    """Changes an exit node's failover priority, endpoints, family or note.
 
     A priority change is only a routing decision, so the tunnel is never rebuilt.
+    An endpoint, a family or an IPv6 bridge address is part of the tunnel, so
+    changing one rebuilds just that uplink — a few seconds of interruption for the
+    clients on it, and none for anyone else.
     """
     _require_provisioning()
     _reject_if_busy(name)
@@ -680,6 +744,20 @@ async def update_node(name: str, payload: ExitNodeUpdate, admin: SudoAdminDep) -
         changes = payload.model_dump(exclude_none=True)
         if not changes:
             return _snapshot()
+        # "none" is a removal, so it is popped rather than stored. Refused when it
+        # would leave the node with no address to dial at all, which is a node the
+        # cascade can only report as permanently down.
+        removing = {k for k in ("endpoint", "endpoint6") if changes.get(k) == "none"}
+        if removing and not any(
+            node.get(k) for k in ("endpoint", "endpoint6") if k not in removing
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{name} has no other endpoint, so removing this one leaves nothing to dial",
+            )
+        for key in removing:
+            changes.pop(key)
+            node.pop(key, None)
         node.update(changes)
         registry.save_nodes(nodes)
         registry.request_reload()
@@ -689,7 +767,12 @@ async def update_node(name: str, payload: ExitNodeUpdate, admin: SudoAdminDep) -
     # A new endpoint or SSH address is a different server as far as recovery is
     # concerned, so whatever it had given up on no longer applies.
     recovery.forget(name)
-    logger.info("admin %s updated exit node %s: %s", admin.username, name, sorted(changes))
+    logger.info(
+        "admin %s updated exit node %s: %s",
+        admin.username,
+        name,
+        sorted(set(changes) | {f"-{k}" for k in removing}),
+    )
     return _snapshot()
 
 

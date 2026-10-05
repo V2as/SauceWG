@@ -115,11 +115,13 @@ def publish(
     fallback_active: bool = False,
     direct: dict | None = None,
     bypass: dict | None = None,
+    bridge: dict | None = None,
 ) -> None:
     """Writes the state file the way the node container would.
 
-    ``fallback=None``, ``direct=None`` and ``bypass=None`` leave those keys out
-    entirely, which is what a node container older than this panel publishes.
+    ``fallback=None``, ``direct=None``, ``bypass=None`` and ``bridge=None`` leave
+    those keys out entirely, which is what a node container older than this panel
+    publishes.
     """
     state = {
         "updated_at": time.time() - age,
@@ -139,6 +141,8 @@ def publish(
         state["direct"] = direct
     if bypass is not None:
         state["bypass"] = bypass
+    if bridge is not None:
+        state["bridge"] = bridge
     with open(settings.uplink_state_file, "w", encoding="utf-8") as handle:
         json.dump(state, handle)
 
@@ -268,6 +272,209 @@ async def main() -> None:
         registry.save_nodes(
             [n for n in registry.load_nodes() if n["name"] not in ("eu-v2", "eu-legacy")]
         )
+
+        print("an exit node with two endpoints")
+        response = await client.post(
+            "/api/nodes/adopt",
+            json={
+                "name": "dual", "endpoint": "198.51.100.40:51820",
+                "endpoint6": "[2001:db8::40]:51820", "public_key": "KEY-DUAL",
+            },
+        )
+        check("both endpoints are accepted", response.status_code == 201, response.text)
+        stored = registry.find(registry.load_nodes(), "dual")
+        check("the IPv4 one is stored", stored["endpoint"] == "198.51.100.40:51820", stored)
+        check("and the IPv6 one beside it", stored["endpoint6"] == "[2001:db8::40]:51820", stored)
+        check(
+            "while the bridge is IPv4-only, no IPv6 address is allocated",
+            stored.get("address6") is None,
+            stored,
+        )
+
+        # Typing one address into one field is what an operator does, and an IPv6
+        # literal left in `endpoint` would reach a .conf unbracketed, where its last
+        # group is read as the port and the tunnel never handshakes.
+        response = await client.post(
+            "/api/nodes/adopt",
+            json={"name": "only6", "endpoint": "[2001:db8::99]:51820", "public_key": "KEY-V6"},
+        )
+        check("an IPv6 endpoint in the plain field is accepted", response.status_code == 201, response.text)
+        stored = registry.find(registry.load_nodes(), "only6")
+        check("and recognised for what it is", stored["endpoint6"] == "[2001:db8::99]:51820", stored)
+        check("leaving no IPv4 endpoint to dial", stored.get("endpoint") is None, stored)
+
+        response = await client.post(
+            "/api/nodes/adopt",
+            json={"name": "bare6", "endpoint6": "2001:db8::aa", "public_key": "KEY-BARE"},
+        )
+        check("an unbracketed address is accepted", response.status_code == 201, response.text)
+        check(
+            "and bracketed before it can reach a config",
+            registry.find(registry.load_nodes(), "bare6")["endpoint6"] == "[2001:db8::aa]",
+            registry.load_nodes(),
+        )
+
+        response = await client.post(
+            "/api/nodes/adopt", json={"name": "noep", "public_key": "KEY-NONE"}
+        )
+        check("a node with no endpoint at all is refused", response.status_code == 422, response.text)
+
+        print("which endpoint the cascade is dialling")
+        publish(
+            bridge={
+                "subnet": "10.77.0.0/24",
+                "subnet6": "fd00:77::/64",
+                "family": "auto",
+                "probe_target": "1.1.1.1",
+                "probe_target6": "2606:4700:4700::1111",
+            },
+            nodes=[
+                {
+                    "name": "dual", "iface": "awg1", "address": "10.77.0.2/32",
+                    "address6": "fd00:77::2/128", "priority": 10,
+                    "public_key": "UPLINK-DUAL", "peer_public_key": "KEY-DUAL",
+                    "endpoint": "[2001:db8::40]:51820",
+                    "endpoint4": "198.51.100.40:51820",
+                    "endpoint6": "[2001:db8::40]:51820",
+                    "endpoint_family": 6, "family": None,
+                    "healthy": True, "healthy6": True, "latency6_ms": 22.2,
+                    "active": True, "last_handshake": int(time.time()),
+                    "latency_ms": 11.0, "rx_bytes": 1, "tx_bytes": 2,
+                },
+            ],
+        )
+        body = (await client.get("/api/nodes")).json()
+        node = body["nodes"][0]
+        check("the bridge's IPv6 half is reported", body["bridge"]["subnet6"] == "fd00:77::/64", body)
+        check("with the preference in force", body["bridge"]["family"] == "auto", body)
+        check("the endpoint being dialled is the IPv6 one", node["endpoint_family"] == 6, node)
+        check("beside both it could have been", (node["endpoint4"], node["endpoint6"]) ==
+              ("198.51.100.40:51820", "[2001:db8::40]:51820"), node)
+        check("the address on the IPv6 bridge is published", node["address6"] == "fd00:77::2/128", node)
+        check("and that half is reported as working", node["healthy6"] is True, node)
+        check("with the round trip it took", node["latency6_ms"] == 22.2, node)
+        # Bracket-aware, or an IPv6 endpoint would read as a truncated address.
+        check("the exit address is parsed out of the endpoint", node["exit_ip"] == "2001:db8::40", node)
+
+        status = await build_cascade_status()
+        check("the cascade reports which family carries it", status.endpoint_family == 6, status)
+        check("that it reaches the IPv6 internet", status.healthy6 is True, status)
+        check("how many nodes do", status.nodes_healthy6 == 1, status)
+        check("and the bridge it crosses", status.bridge_subnet6 == "fd00:77::/64", status)
+
+        print("an exit node whose IPv6 is broken is still an exit node")
+        # Clients are IPv4, so failing a node over for this would cost them a working
+        # tunnel to fix a family none of them use.
+        publish(
+            bridge={"subnet": "10.77.0.0/24", "subnet6": "fd00:77::/64", "family": "6"},
+            nodes=[
+                {
+                    "name": "dual", "iface": "awg1", "address": "10.77.0.2/32",
+                    "address6": "fd00:77::2/128", "priority": 10,
+                    "public_key": "UPLINK-DUAL", "peer_public_key": "KEY-DUAL",
+                    "endpoint": "198.51.100.40:51820",
+                    "endpoint4": "198.51.100.40:51820",
+                    "endpoint6": "[2001:db8::40]:51820",
+                    "endpoint_family": 4, "healthy": True, "healthy6": False,
+                    "latency6_ms": None, "active": True,
+                    "last_handshake": int(time.time()), "rx_bytes": 1, "tx_bytes": 2,
+                },
+            ],
+        )
+        body = (await client.get("/api/nodes")).json()
+        node = body["nodes"][0]
+        check("the node is healthy", node["healthy"] is True, node)
+        check("its IPv6 is not", node["healthy6"] is False, node)
+        check("with no latency to show for it", node["latency6_ms"] is None, node)
+        status = await build_cascade_status()
+        check("and the cascade is still connected", status.connected is True, status)
+        check("over IPv4", status.endpoint_family == 4, status)
+        check("with no node reaching IPv6", status.nodes_healthy6 == 0, status)
+
+        print("a cascade with no IPv6 half says so rather than guessing")
+        # A node container older than this panel publishes no bridge section at all,
+        # and claiming it had an IPv6 half would be inventing one.
+        publish(nodes=[])
+        body = (await client.get("/api/nodes")).json()
+        check("no IPv6 half is claimed", body["bridge"]["subnet6"] is None, body)
+        check("the IPv4 one is still named", body["bridge"]["subnet"] == "10.77.0.0/24", body)
+        check("and the preference falls back to auto", body["bridge"]["family"] == "auto", body)
+
+        print("putting an exit node on the IPv6 bridge")
+        settings.cascade_uplink_subnet6 = "fd00:77::/64"
+        try:
+            response = await client.post(
+                "/api/nodes/adopt",
+                json={
+                    "name": "v6bridge", "endpoint": "198.51.100.50:51820",
+                    "endpoint6": "[2001:db8::50]:51820", "public_key": "KEY-BR",
+                    "address": "10.77.0.9/32",
+                },
+            )
+            check("a node joins a dual-stack cascade", response.status_code == 201, response.text)
+            stored = registry.find(registry.load_nodes(), "v6bridge")
+            # Numbered in step with the IPv4 side, so one uplink reads as one link.
+            check("and is numbered to match its IPv4 address",
+                  stored["address6"] == "fd00:77::9/128", stored)
+
+            response = await client.post(
+                "/api/nodes/adopt",
+                json={
+                    "name": "v4only", "endpoint": "198.51.100.51:51820",
+                    "public_key": "KEY-V4", "address6": "none",
+                },
+            )
+            check("one node can sit the IPv6 half out", response.status_code == 201, response.text)
+            check(
+                "and that is recorded rather than allocated around",
+                registry.find(registry.load_nodes(), "v4only")["address6"] == "none",
+                registry.load_nodes(),
+            )
+
+            response = await client.put("/api/nodes/v4only", json={"family": "ipv6"})
+            check("a family is editable", response.status_code == 200, response.text)
+            check(
+                "and stored canonically",
+                registry.find(registry.load_nodes(), "v4only")["family"] == "6",
+                registry.load_nodes(),
+            )
+            response = await client.put("/api/nodes/v4only", json={"family": "ipv7"})
+            check("a family that does not exist is refused", response.status_code == 422, response.text)
+        finally:
+            settings.cascade_uplink_subnet6 = ""
+
+        print("taking an endpoint away")
+        # An endpoint that has stopped working is not merely unused: the uplink is
+        # rebuilt onto it every time the other one has a bad minute.
+        response = await client.put("/api/nodes/dual", json={"endpoint6": "none"})
+        check("an endpoint can be removed", response.status_code == 200, response.text)
+        stored = registry.find(registry.load_nodes(), "dual")
+        check("and is gone from the list", "endpoint6" not in stored, stored)
+        check("while the other one stays", stored["endpoint"] == "198.51.100.40:51820", stored)
+
+        response = await client.put("/api/nodes/dual", json={"endpoint": "none"})
+        check("removing the last one is refused", response.status_code == 422, response.text)
+        check("saying why", "nothing to dial" in response.text, response.text)
+        check(
+            "and the node still has it",
+            registry.find(registry.load_nodes(), "dual")["endpoint"] == "198.51.100.40:51820",
+            registry.load_nodes(),
+        )
+
+        response = await client.put(
+            "/api/nodes/dual", json={"endpoint": "none", "endpoint6": "none"}
+        )
+        check("asking for both at once is refused outright", response.status_code == 422, response.text)
+
+        # Back to the two nodes the removal tests below expect.
+        registry.save_nodes(
+            [
+                n
+                for n in registry.load_nodes()
+                if n["name"] not in ("dual", "only6", "bare6", "v6bridge", "v4only")
+            ]
+        )
+        publish()
 
         print("client profiles follow the entry interface's generation")
         params = Path(settings.server_params_file)

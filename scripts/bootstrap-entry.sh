@@ -24,6 +24,9 @@ ENDPOINT_HOST=""
 PORT=443
 SUBNET=10.8.0.0/24
 UPLINK_SUBNET=10.77.0.0/24
+# The IPv6 half of the link to the exit nodes. Empty carries IPv4 only.
+UPLINK_SUBNET6=""
+ENDPOINT_FAMILY=auto
 HTTP_PORT=80
 ENV_FILE=.env
 PROTOCOL=$AWG_PROTOCOL_DEFAULT
@@ -35,6 +38,8 @@ while [ $# -gt 0 ]; do
         --port) PORT=$2; shift 2 ;;
         --subnet) SUBNET=$2; shift 2 ;;
         --uplink-subnet) UPLINK_SUBNET=$2; shift 2 ;;
+        --uplink-subnet6) UPLINK_SUBNET6=$2; shift 2 ;;
+        --endpoint-family) ENDPOINT_FAMILY=$2; shift 2 ;;
         --http-port) HTTP_PORT=$2; shift 2 ;;
         --env-file) ENV_FILE=$2; shift 2 ;;
         --protocol) PROTOCOL=$2; shift 2 ;;
@@ -42,6 +47,15 @@ while [ $# -gt 0 ]; do
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+case $UPLINK_SUBNET6 in
+    auto|yes|on|true) UPLINK_SUBNET6=fd00:77::/64 ;;
+    no|off|false) UPLINK_SUBNET6="" ;;
+esac
+case $ENDPOINT_FAMILY in
+    ''|auto|4|6) ;;
+    *) echo "--endpoint-family takes auto, 4 or 6" >&2; exit 1 ;;
+esac
 
 PROTOCOL=$(awg_protocol "$PROTOCOL") \
     || { echo "unknown AmneziaWG generation: $PROTOCOL" >&2; exit 1; }
@@ -68,9 +82,9 @@ if [ ! -f "$ENV_FILE" ]; then
 
     cat > "$ENV_FILE" <<EOF
 COMPOSE_PROJECT_NAME=saucewg
-IMAGE_AWG=saucewg/awg:1.3.0
-IMAGE_PANEL=saucewg/panel:1.3.0
-IMAGE_WEB=saucewg/web:1.3.0
+IMAGE_AWG=saucewg/awg:1.4.0
+IMAGE_PANEL=saucewg/panel:1.4.0
+IMAGE_WEB=saucewg/web:1.4.0
 
 PANEL_TITLE=SauceWG
 PANEL_HTTP_PORT=${HTTP_PORT}
@@ -108,8 +122,15 @@ CASCADE_KILLSWITCH=true
 # Exit nodes live in config/exit-nodes.json; add them with scripts/add-exit-node.sh.
 CASCADE_NODES_FILE=/etc/amnezia/host/exit-nodes.json
 CASCADE_UPLINK_SUBNET=${UPLINK_SUBNET}
+# The IPv6 half of the same link, which is what lets an exit node reach the IPv6
+# internet on behalf of this one. Each exit node needs the same prefix in its own
+# AWG_SUBNET6 before anything comes back over it.
+CASCADE_UPLINK_SUBNET6=${UPLINK_SUBNET6}
+# Which endpoint to dial an exit node over when it publishes both: auto, 4 or 6.
+CASCADE_ENDPOINT_FAMILY=${ENDPOINT_FAMILY}
 CASCADE_PROBE_ENABLED=true
 CASCADE_PROBE_TARGET=1.1.1.1
+CASCADE_PROBE_TARGET6=2606:4700:4700::1111
 CASCADE_PROBE_INTERVAL=10
 CASCADE_PROBE_TIMEOUT=3
 CASCADE_FAIL_THRESHOLD=3
@@ -142,7 +163,13 @@ fi
 mkdir -p config
 [ -f config/exit-nodes.json ] || { echo '[]' > config/exit-nodes.json; chmod 600 config/exit-nodes.json; }
 
-echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-saucewg.conf
+{
+    echo 'net.ipv4.ip_forward=1'
+    # Only where something is going to be forwarded over it: turning IPv6
+    # forwarding on also stops the host accepting router advertisements, which on a
+    # VPS that gets its own address that way would take its IPv6 away.
+    [ -z "$UPLINK_SUBNET6" ] || echo 'net.ipv6.conf.all.forwarding=1'
+} > /etc/sysctl.d/99-saucewg.conf
 sysctl -q -p /etc/sysctl.d/99-saucewg.conf
 
 docker compose --env-file "$ENV_FILE" build

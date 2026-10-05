@@ -10,6 +10,16 @@ AWG_PORT=${AWG_PORT:-51820}
 AWG_SUBNET=${AWG_SUBNET:-10.8.0.0/24}
 AWG_MTU=${AWG_MTU:-1420}
 
+# The IPv6 half of this interface's subnet. On an exit node it is the far side of
+# the bridge from the entry node, and setting it is what makes the cascade hop
+# dual-stack; the interface takes the subnet's first address and the family is
+# forwarded and NATed alongside IPv4.
+#
+# Empty — the default — leaves the node exactly as it was. On an entry node it is
+# empty and stays empty in this release: the clients' own interface is IPv4-only,
+# which is why the torrent guard below has nothing to miss. See the README.
+AWG_SUBNET6=${AWG_SUBNET6:-}
+
 CASCADE_ENABLED=${CASCADE_ENABLED:-false}
 CASCADE_MTU=${CASCADE_MTU:-1380}
 CASCADE_KEEPALIVE=${CASCADE_KEEPALIVE:-25}
@@ -32,6 +42,24 @@ SERVER_PID=0
 # ---------------------------------------------------------------------------
 # Server interface (clients on the entry node, the entry node on the exit node)
 # ---------------------------------------------------------------------------
+
+# What the static peer — the entry node, on an exit node — is allowed to send from
+# and to.
+#
+# The IPv6 half of the bridge is appended rather than required, so an .env written
+# when the cascade was IPv4-only keeps working the moment AWG_SUBNET6 is set: the
+# alternative is a node that comes up with an IPv6 address and silently drops every
+# packet carrying it, because AllowedIPs is also the inbound filter.
+peer_allowed_ips() {
+    local allowed=${AWG_PEER_ALLOWED_IPS:-${AWG_SUBNET}}
+    if [ -n "$AWG_SUBNET6" ]; then
+        case $allowed in
+            *:*) ;;
+            *) allowed="${allowed}, ${AWG_SUBNET6}" ;;
+        esac
+    fi
+    printf '%s' "$allowed"
+}
 
 setup_server_iface() {
     params_load "$SERVER_PARAMS_FILE"
@@ -85,14 +113,18 @@ setup_server_iface() {
     {
         SERVER_PORT=$AWG_PORT
         SERVER_SUBNET=$AWG_SUBNET
+        SERVER_SUBNET6=$AWG_SUBNET6
         SERVER_MTU=$AWG_MTU
     }
     SERVER_ADDRESS=$(first_host "$AWG_SUBNET")
+    SERVER_ADDRESS6=""
+    [ -z "$AWG_SUBNET6" ] || SERVER_ADDRESS6=$(first_host6 "$AWG_SUBNET6")
 
     # The panel reads these to render client profiles, so every parameter of the
     # generation in force has to be mirrored here — including the ones that were
     # cleared, so it stops handing out a profile the interface no longer speaks.
-    local stored=(SERVER_PUBLIC_KEY SERVER_PORT SERVER_SUBNET SERVER_ADDRESS SERVER_MTU SERVER_PROTOCOL)
+    local stored=(SERVER_PUBLIC_KEY SERVER_PORT SERVER_SUBNET SERVER_SUBNET6
+                  SERVER_ADDRESS SERVER_ADDRESS6 SERVER_MTU SERVER_PROTOCOL)
     local source_name
     for suffix in $AWG_OBF_SUFFIXES; do
         source_name="AWG_${suffix}"
@@ -114,7 +146,7 @@ setup_server_iface() {
             echo "[Peer]"
             echo "PublicKey = ${AWG_PEER_PUBLIC_KEY}"
             [ -n "${AWG_PEER_PSK:-}" ] && echo "PresharedKey = ${AWG_PEER_PSK}"
-            echo "AllowedIPs = ${AWG_PEER_ALLOWED_IPS:-${AWG_SUBNET}}"
+            echo "AllowedIPs = $(peer_allowed_ips)"
         fi
         if [ -f "${AWG_CONFIG_DIR}/peers.conf" ]; then
             echo
@@ -128,10 +160,11 @@ setup_server_iface() {
     PIDS+=("$SERVER_PID")
     wait_for_socket "$AWG_IFACE" || die "timed out waiting for the ${AWG_IFACE} UAPI socket"
     awg setconf "$AWG_IFACE" "$conf"
-    iface_up "$AWG_IFACE" "$SERVER_ADDRESS" "$AWG_MTU" \
-        || die "could not bring ${AWG_IFACE} up on ${SERVER_ADDRESS}"
+    iface_up "$AWG_IFACE" "$SERVER_ADDRESS" "$AWG_MTU" "$SERVER_ADDRESS6" \
+        || die "could not bring ${AWG_IFACE} up on ${SERVER_ADDRESS}${SERVER_ADDRESS6:+ and ${SERVER_ADDRESS6}}"
     ip -4 route replace "$AWG_SUBNET" dev "$AWG_IFACE"
-    log "${AWG_IFACE} up on ${SERVER_ADDRESS} port ${AWG_PORT} speaking AmneziaWG ${SERVER_PROTOCOL} (pub ${SERVER_PUBLIC_KEY})"
+    [ -z "$AWG_SUBNET6" ] || ip -6 route replace "$AWG_SUBNET6" dev "$AWG_IFACE" 2>/dev/null || true
+    log "${AWG_IFACE} up on ${SERVER_ADDRESS}${SERVER_ADDRESS6:+, ${SERVER_ADDRESS6}} port ${AWG_PORT} speaking AmneziaWG ${SERVER_PROTOCOL} (pub ${SERVER_PUBLIC_KEY})"
 }
 
 # ---------------------------------------------------------------------------
@@ -152,6 +185,40 @@ setup_exit_routing() {
         || iptables -I FORWARD 1 -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     iptables -t mangle -C FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
         || iptables -t mangle -A FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+    setup_exit_routing6
+}
+
+# The same for the IPv6 half of the bridge, when there is one.
+#
+# The WAN interface is looked up per family: a server can reach IPv4 through one
+# interface and IPv6 through another, and masquerading out of the wrong one
+# produces a NAT rule that matches nothing — which looks exactly like an exit node
+# with no IPv6 at all.
+#
+# A node with an IPv6 bridge subnet but no IPv6 route of its own is not an error.
+# It is a dual-stack bridge whose far half has nowhere to go, which the entry node
+# reports through the IPv6 probe rather than refusing to start over.
+setup_exit_routing6() {
+    local wan6
+    [ -n "$AWG_SUBNET6" ] || return 0
+
+    wan6=${WAN_IFACE6:-$(wan_iface6)}
+    if [ -z "$wan6" ]; then
+        log "this server has no IPv6 route of its own, so the IPv6 half of the bridge has no way out; clients stay on IPv4"
+        return 0
+    fi
+    log "exit routing for ${AWG_SUBNET6} via ${wan6}"
+
+    ip6tables -t nat -C POSTROUTING -s "$AWG_SUBNET6" -o "$wan6" -j MASQUERADE 2>/dev/null \
+        || ip6tables -t nat -A POSTROUTING -s "$AWG_SUBNET6" -o "$wan6" -j MASQUERADE \
+        || log "could not install the IPv6 NAT rule; does this kernel have ip6table_nat?"
+    ip6tables -C FORWARD -i "$AWG_IFACE" -j ACCEPT 2>/dev/null \
+        || ip6tables -I FORWARD 1 -i "$AWG_IFACE" -j ACCEPT || true
+    ip6tables -C FORWARD -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+        || ip6tables -I FORWARD 1 -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true
+    ip6tables -t mangle -C FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+        || ip6tables -t mangle -A FORWARD -i "$AWG_IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
 }
 
 # A node that is not running a cascade has no monitor to hang anything off, so it
@@ -205,6 +272,12 @@ do_run() {
     local initial
     mkdir -p "$AWG_CONFIG_DIR" /var/run/amneziawg
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    # Only where something is going to be forwarded over it. Turning IPv6
+    # forwarding on also disables address autoconfiguration on every interface of
+    # the netns, which on a host-networked container is the host's own.
+    if [ -n "$AWG_SUBNET6" ]; then
+        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    fi
     trap teardown EXIT INT TERM
 
     ip link del "$AWG_IFACE" 2>/dev/null || true

@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .awg import protocol as proto
+from .awg.uplinks import endpoint_host
 from .models import ClientStatus, ResetStrategy
 
 #: Accepts the spellings an operator is likely to type ("legacy", "2") and stores the
@@ -24,6 +25,51 @@ def _normalize_protocol(value: str | None) -> str | None:
         return proto.normalize_or_none(value)
     except proto.UnknownProtocol as exc:
         raise ValueError(str(exc)) from None
+
+
+def _normalize_family(value: str | None) -> str | None:
+    """Which address family to dial an exit node over, canonicalised.
+
+    Accepts the spellings an operator types and stores "auto", "4" or "6". Rejected
+    rather than silently defaulted: a typo that reads as "auto" would leave a node
+    dialled over a family nobody chose, and nothing would say so.
+    """
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text == "":
+        return None
+    if text in ("auto", "any"):
+        return "auto"
+    if text in ("4", "v4", "ipv4", "inet"):
+        return "4"
+    if text in ("6", "v6", "ipv6", "inet6"):
+        return "6"
+    raise ValueError(f"{value!r} is not an address family; use auto, 4 or 6")
+
+
+def _is_ipv6_endpoint(value: str) -> bool:
+    host = endpoint_host(value)
+    return bool(host and ":" in host)
+
+
+def _bracket_endpoint(value: str) -> str:
+    """``[2001:db8::20]:51820``, which is the only spelling amneziawg-tools reads.
+
+    Unbracketed, the last group of the address is taken for the port and the tunnel
+    never handshakes — so an endpoint is bracketed on the way in rather than at each
+    of the places it is later written out.
+    """
+    text = value.strip()
+    if text.startswith("["):
+        return text
+    host = endpoint_host(text)
+    if not host or ":" not in host:
+        return text
+    # A bare address with no port: everything after the host is the port.
+    if text == host:
+        return f"[{host}]"
+    return f"[{host}]:{text[len(host) + 1:]}"
 
 
 class Token(BaseModel):
@@ -144,9 +190,21 @@ class CascadeStatus(BaseModel):
     # traffic off it. `node` names it and `connected` is false: the cascade has an
     # exit node, and it is carrying nothing.
     stalled: bool = False
+    # Which family the active uplink is dialled over, and whether it reaches the IPv6
+    # internet for the cascade. The second is reported rather than acted on: clients
+    # are IPv4, so false here does not make the cascade unhealthy.
+    endpoint_family: int | None = None
+    healthy6: bool = False
     mode: str = "auto"
     nodes_total: int = 0
     nodes_healthy: int = 0
+    # How many exit nodes reach the IPv6 internet. Always 0 on a cascade whose
+    # bridge carries IPv4 only, which is the default.
+    nodes_healthy6: int = 0
+    # The IPv6 half of the link to the exit nodes, or null when there is none, and
+    # which endpoint family the cascade prefers: "auto", "4" or "6".
+    bridge_subnet6: str | None = None
+    bridge_family: str = "auto"
     # What happens while no exit node can carry traffic: "direct" lets the entry node
     # carry it, "block" drops it.
     fallback: str = "direct"
@@ -190,6 +248,24 @@ class ExitNode(BaseModel):
     priority: int
     endpoint: str | None = None
     exit_ip: str | None = None
+    # Both endpoints the node publishes, and which of the two `endpoint` above is.
+    # The cascade dials one and moves to the other when no handshake arrives over it,
+    # so `endpoint` is the one the tunnel exists over rather than the one listed
+    # first. `endpoint_family` is null from a node container that predates this.
+    endpoint4: str | None = None
+    endpoint6: str | None = None
+    endpoint_family: int | None = None
+    # What the list asked for: "auto", "4", "6", or null to follow the cascade-wide
+    # CASCADE_ENDPOINT_FAMILY.
+    family: str | None = None
+    # This uplink's address on the IPv6 half of the bridge, or null when the cascade
+    # has no IPv6 half or this node sits out of it.
+    address6: str | None = None
+    # Whether the exit node reaches the IPv6 internet through the bridge. Reported
+    # rather than acted on: clients are IPv4, so false here does not make the node
+    # unhealthy and does not trigger failover.
+    healthy6: bool = False
+    latency6_ms: float | None = None
     # The entry node's own key for this uplink; install it on the exit node.
     public_key: str
     peer_public_key: str | None = None
@@ -227,6 +303,24 @@ class ExitNode(BaseModel):
     recovery: NodeRecovery | None = None
 
 
+class CascadeBridge(BaseModel):
+    """The link between this entry node and its exit nodes.
+
+    Distinct from the endpoints the tunnels are dialled over: `subnet`/`subnet6` are
+    what travels inside them, `family` is which address they are dialled on. An
+    uplink can carry IPv6 over an IPv4 endpoint and the other way round.
+    """
+
+    subnet: str = ""
+    # Null is a cascade that carries IPv4 only, which is the default. Clients are
+    # unaffected either way: this is the link between the servers, and the entry node
+    # installs no IPv6 policy rule for the client subnet.
+    subnet6: str | None = None
+    family: str = "auto"
+    probe_target: str | None = None
+    probe_target6: str | None = None
+
+
 class ExitNodeList(BaseModel):
     mode: str
     active: str | None = None
@@ -244,6 +338,8 @@ class ExitNodeList(BaseModel):
     # False when the panel cannot edit the list, e.g. NODE_PROVISION_ENABLED=false
     # or ./config is not mounted read-write.
     provisioning: bool = False
+    # Which families the link to the exit nodes carries, and how they are dialled.
+    bridge: CascadeBridge = Field(default_factory=CascadeBridge)
     nodes: list[ExitNode]
 
 
@@ -251,7 +347,10 @@ class ExitNodeCreate(BaseModel):
     """Installs AmneziaWG on a server over SSH and joins it to the cascade."""
 
     name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-    host: str = Field(min_length=1, max_length=253, description="IP address or hostname")
+    # An IPv6 address works here, and is how an IPv6-only VPS is installed: SSH goes
+    # over it and the node is joined to the cascade on its IPv6 endpoint. Brackets are
+    # optional — this is a host, not an endpoint.
+    host: str = Field(min_length=1, max_length=253, description="IPv4/IPv6 address or hostname")
     ssh_port: int = Field(default=22, ge=1, le=65535)
     ssh_user: str = Field(default="root", max_length=64)
     # Used for the duration of the install and never stored. Both may be omitted on a
@@ -261,8 +360,20 @@ class ExitNodeCreate(BaseModel):
     ssh_private_key: str | None = Field(default=None, repr=False, max_length=16384)
     port: int = Field(default=51820, ge=1, le=65535, description="UDP port of the exit node")
     subnet: str = "10.77.0.0/24"
+    # This node's side of the IPv6 half of the bridge. Null follows the entry node's
+    # CASCADE_UPLINK_SUBNET6, which is what nearly every caller wants: the two ends
+    # have to name the same prefix. "none" installs an IPv4-only node into a cascade
+    # that otherwise carries both.
+    subnet6: str | None = Field(
+        default=None, max_length=64, description="IPv6 bridge prefix, or 'none'"
+    )
+    # Which endpoint to dial this node over once it is installed: auto, 4 or 6.
+    family: str | None = Field(default=None, description="auto, 4 or 6")
     priority: int | None = Field(default=None, ge=0, le=65535)
     address: str | None = Field(default=None, description="uplink address, allocated when omitted")
+    address6: str | None = Field(
+        default=None, description="uplink IPv6 address, allocated when omitted"
+    )
     preshared_key: str | None = Field(default=None, repr=False, max_length=64)
     protocol: str | None = _PROTOCOL_FIELD
     # Preset name or literal spec for the signature packet the uplink sends. Ignored
@@ -273,12 +384,19 @@ class ExitNodeCreate(BaseModel):
     @field_validator("name", "host")
     @classmethod
     def _trim(cls, v: str) -> str:
-        return v.strip()
+        # Brackets are how an IPv6 endpoint is written, and an operator pasting one
+        # into a host field is the common case rather than an error.
+        return v.strip().strip("[]")
 
     @field_validator("protocol")
     @classmethod
     def _protocol(cls, v: str | None) -> str | None:
         return _normalize_protocol(v)
+
+    @field_validator("family")
+    @classmethod
+    def _family(cls, v: str | None) -> str | None:
+        return _normalize_family(v)
 
 
 class ExitNodeAdopt(BaseModel):
@@ -289,10 +407,22 @@ class ExitNodeAdopt(BaseModel):
     """
 
     name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-    endpoint: str = Field(min_length=3, description="host:port of the exit node")
+    # One of the two is required. An IPv6 endpoint belongs in `endpoint6`, but one
+    # written here is recognised and moved, since that is what typing a single
+    # address into a single field looks like.
+    endpoint: str | None = Field(
+        default=None, min_length=3, description="host:port of the exit node"
+    )
+    endpoint6: str | None = Field(
+        default=None, min_length=3, description="[address]:port of the same node over IPv6"
+    )
+    family: str | None = Field(default=None, description="auto, 4 or 6")
     public_key: str = Field(min_length=1, max_length=128)
     preshared_key: str | None = Field(default=None, repr=False, max_length=64)
     address: str | None = None
+    address6: str | None = Field(
+        default=None, description="uplink IPv6 address, or 'none' to keep this node off it"
+    )
     priority: int | None = Field(default=None, ge=0, le=65535)
     protocol: str | None = _PROTOCOL_FIELD
     # The padding and header parameters the exit node chose. They have to be repeated
@@ -315,10 +445,44 @@ class ExitNodeAdopt(BaseModel):
     def _protocol(cls, v: str | None) -> str | None:
         return _normalize_protocol(v)
 
+    @field_validator("family")
+    @classmethod
+    def _family(cls, v: str | None) -> str | None:
+        return _normalize_family(v)
+
+    @model_validator(mode="after")
+    def _one_endpoint(self) -> "ExitNodeAdopt":
+        """An endpoint of some family is required; an IPv6 one in either field works.
+
+        Typing a single address into a single field is what an operator does, and an
+        IPv6 literal left in `endpoint` would reach a .conf unbracketed, where its
+        last group is read as the port and the tunnel never handshakes.
+        """
+        if self.endpoint and not self.endpoint6 and _is_ipv6_endpoint(self.endpoint):
+            self.endpoint6 = _bracket_endpoint(self.endpoint)
+            self.endpoint = None
+        elif self.endpoint6:
+            self.endpoint6 = _bracket_endpoint(self.endpoint6)
+        if not self.endpoint and not self.endpoint6:
+            raise ValueError("endpoint or endpoint6 is required")
+        return self
+
 
 class ExitNodeUpdate(BaseModel):
     priority: int | None = Field(default=None, ge=0, le=65535)
-    endpoint: str | None = None
+    # "none" removes an endpoint, which matters once a node has two: an address that
+    # has stopped working is not merely unused, it is somewhere the uplink will keep
+    # being rebuilt onto every time the other one has a bad minute.
+    endpoint: str | None = Field(default=None, description="host:port, or 'none' to remove it")
+    endpoint6: str | None = Field(
+        default=None, description="[address]:port, or 'none' to remove it"
+    )
+    # Which of the two to dial. Changing it rebuilds the uplink onto the other
+    # endpoint, which interrupts this node's traffic for a few seconds.
+    family: str | None = Field(default=None, description="auto, 4 or 6")
+    address6: str | None = Field(
+        default=None, description="uplink IPv6 address, or 'none' to keep this node off it"
+    )
     # Changing this rebuilds the uplink, and the exit node has to be moved to the
     # same generation or the handshake stops working.
     protocol: str | None = _PROTOCOL_FIELD
@@ -328,6 +492,35 @@ class ExitNodeUpdate(BaseModel):
     @classmethod
     def _protocol(cls, v: str | None) -> str | None:
         return _normalize_protocol(v)
+
+    @field_validator("family")
+    @classmethod
+    def _family(cls, v: str | None) -> str | None:
+        return _normalize_family(v)
+
+    @model_validator(mode="after")
+    def _endpoints(self) -> "ExitNodeUpdate":
+        if self.endpoint == "none" and self.endpoint6 == "none":
+            raise ValueError("a node needs an endpoint; removing both leaves nothing to dial")
+        if self.endpoint and self.endpoint != "none" and not self.endpoint6 \
+                and _is_ipv6_endpoint(self.endpoint):
+            self.endpoint6 = _bracket_endpoint(self.endpoint)
+            self.endpoint = None
+        elif self.endpoint6 and self.endpoint6 != "none":
+            self.endpoint6 = _bracket_endpoint(self.endpoint6)
+        return self
+
+    @field_validator("endpoint", "endpoint6")
+    @classmethod
+    def _endpoint(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        text = v.strip()
+        if text.lower() in ("none", "off", "no", "-", ""):
+            return "none"
+        if len(text) < 3:
+            raise ValueError(f"{v!r} is not an endpoint; use host:port, or 'none' to remove it")
+        return text
 
 
 class NodeCredentials(BaseModel):

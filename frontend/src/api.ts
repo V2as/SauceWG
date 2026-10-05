@@ -37,9 +37,21 @@ export interface CascadeStatus {
   // True when `node` is the exit node clients are routed through and it has stopped
   // handshaking without failover moving them off it. `connected` is false alongside.
   stalled: boolean
+  // Which family the active uplink is dialled over, and whether it reaches the IPv6
+  // internet for the cascade. The second is reported rather than acted on: clients
+  // are IPv4, so false here does not make the cascade unhealthy.
+  endpoint_family: number | null
+  healthy6: boolean
   mode: string
   nodes_total: number
   nodes_healthy: number
+  // How many exit nodes reach the IPv6 internet. Always 0 on a cascade whose bridge
+  // carries IPv4 only, which is the default.
+  nodes_healthy6: number
+  // The IPv6 half of the link to the exit nodes, or null when there is none, and
+  // which endpoint family the cascade prefers.
+  bridge_subnet6: string | null
+  bridge_family: 'auto' | '4' | '6'
   // What happens while no exit node can carry traffic, and whether it is happening.
   fallback: 'direct' | 'block'
   fallback_active: boolean
@@ -73,6 +85,24 @@ export interface ExitNode {
   priority: number
   endpoint: string | null
   exit_ip: string | null
+  // Both endpoints this node publishes, and which of the two `endpoint` above is.
+  // The cascade dials one and moves to the other when no handshake arrives over it,
+  // so `endpoint` is the one the tunnel exists over rather than the one listed
+  // first. `endpoint_family` is null from a node container that predates this.
+  endpoint4: string | null
+  endpoint6: string | null
+  endpoint_family: number | null
+  // What the list asked for, as opposed to what is in use. Null follows the
+  // cascade-wide preference.
+  family: 'auto' | '4' | '6' | null
+  // This uplink's address on the IPv6 half of the bridge, or null when the cascade
+  // has no IPv6 half or this node sits out of it.
+  address6: string | null
+  // Whether the exit node reaches the IPv6 internet through the bridge. Reported
+  // rather than acted on: clients are IPv4, so false does not make the node
+  // unhealthy and does not trigger failover.
+  healthy6: boolean
+  latency6_ms: number | null
   public_key: string
   peer_public_key: string | null
   paired: boolean
@@ -154,6 +184,19 @@ export interface NodeLogs {
   text: string
 }
 
+// The link between this entry node and its exit nodes. Distinct from the endpoints
+// the tunnels are dialled over: subnet/subnet6 are what travels inside them,
+// `family` is which address they are dialled on.
+export interface CascadeBridge {
+  subnet: string
+  // Null is a cascade that carries IPv4 only, which is the default. Clients are
+  // unaffected either way: this is the link between the servers.
+  subnet6: string | null
+  family: 'auto' | '4' | '6'
+  probe_target: string | null
+  probe_target6: string | null
+}
+
 export interface ExitNodeList {
   mode: string
   active: string | null
@@ -165,6 +208,7 @@ export interface ExitNodeList {
   updated_at: string | null
   config_error: string | null
   provisioning: boolean
+  bridge: CascadeBridge
   nodes: ExitNode[]
 }
 

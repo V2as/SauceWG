@@ -34,6 +34,38 @@ CASCADE_IFACE_PREFIX=${CASCADE_IFACE_PREFIX:-awg}
 CASCADE_IFACE_OFFSET=${CASCADE_IFACE_OFFSET:-1}
 CASCADE_NODES_FILE=${CASCADE_NODES_FILE:-/etc/amnezia/exit-nodes.json}
 CASCADE_UPLINK_SUBNET=${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
+
+# The IPv6 half of the bridge between this entry node and its exit nodes. Empty —
+# the default — leaves the cascade exactly as it was: one IPv4 address per uplink
+# and nothing else. Set it to a ULA such as fd00:77::/64 and every uplink gains an
+# address inside it, the peer's AllowedIPs grow to cover ::/0, and the exit node
+# forwards and NATs the family as well as the other one.
+#
+# This is the inner link, which is independent of the family the tunnel is dialled
+# over: an uplink can have an IPv6 bridge over an IPv4 endpoint and the other way
+# round. The two are separate because a censor sees only the endpoint and a
+# destination sees only the bridge.
+CASCADE_UPLINK_SUBNET6=${CASCADE_UPLINK_SUBNET6:-}
+
+# Which of an exit node's two endpoints to dial when it publishes both.
+#
+#   auto  IPv6 where both ends have it, IPv4 otherwise (the default)
+#   6     prefer IPv6
+#   4     prefer IPv4
+#
+# A named family is a preference and not a lock, the same way a pinned exit node
+# is: an uplink carrying traffic over the family nobody asked for is worth more
+# than one that is correct and down.
+CASCADE_ENDPOINT_FAMILY=${CASCADE_ENDPOINT_FAMILY:-auto}
+
+# Where to send the probe that proves the IPv6 half of the bridge reaches the
+# internet from the exit node. Only sent on an uplink that has an IPv6 address, and
+# never on its own a reason to fail one — see uplink_probe.
+CASCADE_PROBE_TARGET6=${CASCADE_PROBE_TARGET6:-2606:4700:4700::1111}
+
+# The port to assume for an endpoint written without one, which is how a node that
+# answers on the same port over both families names it once.
+CASCADE_PORT_DEFAULT=${CASCADE_PORT_DEFAULT:-51820}
 # The entrypoint sets these too; defaulting them here as well keeps this file
 # sourceable on its own, which is what the reload tests do.
 CASCADE_TABLE=${CASCADE_TABLE:-451}
@@ -79,6 +111,31 @@ UP_NAME=(); UP_IFACE=(); UP_ENDPOINT=(); UP_PEERKEY=(); UP_PSK=(); UP_ADDR=()
 UP_PRIO=(); UP_MTU=(); UP_KEEPALIVE=(); UP_PROTOCOL=()
 UP_PUBKEY=(); UP_HEALTHY=(); UP_FAILS=(); UP_OKS=(); UP_LATENCY=(); UP_HS=(); UP_RX=(); UP_TX=()
 UP_PID=()
+
+# The two endpoints a node may publish, as configured, and which of them
+# UP_ENDPOINT currently holds. UP_ENDPOINT is the one being dialled rather than the
+# one in the list, so everything downstream — the .conf, the signature, the logs,
+# the published state — talks about the tunnel that exists.
+UP_ENDPOINT4=(); UP_ENDPOINT6=(); UP_FAMILY=(); UP_EPFAM=()
+# How many times the container has moved this uplink off the endpoint the
+# preference chose for it. Non-zero means the family in use was found rather than
+# configured, which is what a reload has to avoid throwing away; it starts over at
+# zero whenever the list names a different pair of endpoints.
+UP_FLIPS=()
+# The uplink's address on the IPv6 half of the bridge, and what the probe over it
+# found. UP_HEALTHY6 never decides failover: client traffic is IPv4, so an exit
+# node whose IPv6 is broken is still carrying everything it is asked to.
+UP_ADDR6=(); UP_HEALTHY6=(); UP_LATENCY6=()
+# True when the tunnel itself is silent — no handshake, or one too old to belong to
+# a live one — as opposed to handshaking but unable to reach the probe target. The
+# two failures want opposite treatment: the first may be the path over this address
+# family, the second is the exit node's own internet.
+UP_SILENT=()
+
+# The family preference the running configuration was built with. Kept so that a
+# reload can tell an operator changing their mind from the container having found
+# something out on its own, and apply the first while preserving the second.
+UPLINK_FAMILY_PREF=""
 
 # Obfuscation is keyed "<slot>,<suffix>" rather than kept in an array per
 # parameter: an uplink carries up to sixteen of them, and which ones depend on the
@@ -139,6 +196,113 @@ uplink_index_of() {
 }
 
 # ---------------------------------------------------------------------------
+# Address families
+# ---------------------------------------------------------------------------
+
+# True when this cascade's bridge carries IPv6 as well as IPv4.
+bridge_has_v6() {
+    [ -n "${CASCADE_UPLINK_SUBNET6:-}" ]
+}
+
+# The configured preference, canonicalised. Anything unrecognised is `auto`
+# rather than fatal: a typo in one variable should not take a cascade down.
+cascade_family_preference() {
+    case $(printf '%s' "${CASCADE_ENDPOINT_FAMILY:-}" | tr '[:upper:]' '[:lower:]') in
+        6|v6|ipv6|inet6) printf '6' ;;
+        4|v4|ipv4|inet) printf '4' ;;
+        ''|auto|any) printf 'auto' ;;
+        *)
+            log "CASCADE_ENDPOINT_FAMILY=${CASCADE_ENDPOINT_FAMILY} is not one of auto|4|6; using auto"
+            printf 'auto'
+            ;;
+    esac
+}
+
+# Which endpoint of a node to dial: 4, 6, or empty when it has neither.
+#
+# `auto` prefers IPv6 when both ends can use it. That is the point of the
+# preference rather than a detail of it: an entry node's IPv4 is the address a
+# censor has a list of, and the same exit node answers on IPv6 through filters
+# that were never built to look there. It falls back the moment either end has no
+# IPv6, because dialling an IPv6 endpoint from a node with no IPv6 route is a
+# tunnel that cannot handshake however correct the list is.
+uplink_pick_family() {
+    local requested=$1 ep4=$2 ep6=$3 preference
+    [ -n "$ep6" ] || { [ -z "$ep4" ] || printf '4'; return 0; }
+    [ -n "$ep4" ] || { printf '6'; return 0; }
+
+    case $(printf '%s' "$requested" | tr '[:upper:]' '[:lower:]') in
+        6|v6|ipv6|inet6) printf '6'; return 0 ;;
+        4|v4|ipv4|inet) printf '4'; return 0 ;;
+    esac
+
+    preference=${UPLINK_FAMILY_PREF:-$(cascade_family_preference)}
+    case $preference in
+        6) printf '6' ;;
+        4) printf '4' ;;
+        *) if has_ipv6_egress; then printf '6'; else printf '4'; fi ;;
+    esac
+}
+
+# The family an uplink is not using, when it has somewhere else to go.
+#
+# A node the list pins to one family has nowhere else to go by definition, even
+# with both endpoints published: being told which address to dial is also being
+# told not to try the other one, and an operator who pinned it wants to see it
+# fail rather than quietly come up somewhere else.
+uplink_other_family() {
+    local i=$1
+    case $(printf '%s' "${UP_FAMILY[$i]:-}" | tr '[:upper:]' '[:lower:]') in
+        4|v4|ipv4|inet|6|v6|ipv6|inet6) return 0 ;;
+    esac
+    case ${UP_EPFAM[$i]:-} in
+        4) [ -n "${UP_ENDPOINT6[$i]:-}" ] && printf '6' ;;
+        6) [ -n "${UP_ENDPOINT4[$i]:-}" ] && printf '4' ;;
+    esac
+    return 0
+}
+
+# One uplink's address on the IPv6 half of the bridge, or empty when there is no
+# IPv6 half. An explicit `address6` in the list always wins; otherwise the nth
+# address of the subnet is used, mirroring how the IPv4 side numbers .2, .3, .4 …
+#
+# Auto-numbering needs the subnet written so a host number can be appended —
+# fd00:77::/64 rather than 2001:db8:0:0:1::/80 — because doing IPv6 arithmetic in
+# shell wrongly would hand two uplinks the same address and break both. The
+# awkward kind is reported once and served by naming `address6` per node.
+uplink_bridge_address6() {
+    local name=$1 requested=$2 n=$3 value
+    bridge_has_v6 || return 0
+    # An exit node that has not been given an IPv6 bridge of its own — one not
+    # rebuilt yet, or one on a VPS with no IPv6 — is named here rather than
+    # discovered by probing a half of the bridge that was never built.
+    case $(printf '%s' "$requested" | tr '[:upper:]' '[:lower:]') in
+        none|off|no|false|'-') return 0 ;;
+    esac
+    if [ -n "$requested" ]; then
+        case $requested in */*) printf '%s' "$requested" ;; *) printf '%s/128' "$requested" ;; esac
+        return 0
+    fi
+    if value=$(subnet6_host "$CASCADE_UPLINK_SUBNET6" "$n"); then
+        printf '%s' "$value"
+        return 0
+    fi
+    log "uplink ${name}: CASCADE_UPLINK_SUBNET6=${CASCADE_UPLINK_SUBNET6} cannot have host numbers appended to it; give this node an explicit address6 to put it on the IPv6 bridge"
+    return 0
+}
+
+# Points one slot at one of its endpoints. Everything that describes the tunnel
+# follows UP_ENDPOINT, so this is the only place the choice is recorded.
+uplink_set_family() {
+    local i=$1 family=$2
+    case $family in
+        6) UP_EPFAM[i]=6; UP_ENDPOINT[i]=${UP_ENDPOINT6[$i]:-} ;;
+        4) UP_EPFAM[i]=4; UP_ENDPOINT[i]=${UP_ENDPOINT4[$i]:-} ;;
+        *) UP_EPFAM[i]=""; UP_ENDPOINT[i]="" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -192,13 +356,17 @@ uplinks_source_json() {
             jq -n \
                 --arg name "${CASCADE_NAME:-exit-1}" \
                 --arg endpoint "${CASCADE_ENDPOINT:-}" \
+                --arg endpoint6 "${CASCADE_ENDPOINT6:-}" \
+                --arg family "${CASCADE_FAMILY:-}" \
                 --arg key "${CASCADE_PEER_PUBLIC_KEY:-}" \
                 --arg psk "${CASCADE_PEER_PSK:-}" \
                 --arg address "${CASCADE_ADDRESS:-}" \
+                --arg address6 "${CASCADE_ADDRESS6:-}" \
                 --arg protocol "${CASCADE_PROTOCOL:-}" \
                 "${args[@]}" \
-                '[{name: $name, endpoint: $endpoint, public_key: $key, preshared_key: $psk,
-                   address: $address, priority: 10, protocol: $protocol,
+                '[{name: $name, endpoint: $endpoint, endpoint6: $endpoint6, family: $family,
+                   public_key: $key, preshared_key: $psk,
+                   address: $address, address6: $address6, priority: 10, protocol: $protocol,
                    jc: $jc, jmin: $jmin, jmax: $jmax,
                    s1: $s1, s2: $s2, s3: $s3, s4: $s4,
                    h1: $h1, h2: $h2, h3: $h3, h4: $h4,
@@ -312,6 +480,7 @@ uplinks_parse() {
     local json idx=0 base
 
     FALLBACK_MODE=$(uplinks_resolve_fallback)
+    UPLINK_FAMILY_PREF=$(cascade_family_preference)
     CONFIG_SOURCE=$(uplinks_config_source)
     json=$(uplinks_source_json)
     if ! printf '%s' "$json" | jq -e 'type == "array"' >/dev/null 2>&1; then
@@ -324,6 +493,8 @@ uplinks_parse() {
     UP_PRIO=(); UP_MTU=(); UP_KEEPALIVE=(); UP_PROTOCOL=()
     UP_PUBKEY=(); UP_HEALTHY=(); UP_FAILS=(); UP_OKS=(); UP_LATENCY=(); UP_HS=()
     UP_RX=(); UP_TX=(); UP_PID=()
+    UP_ENDPOINT4=(); UP_ENDPOINT6=(); UP_FAMILY=(); UP_EPFAM=(); UP_FLIPS=()
+    UP_ADDR6=(); UP_HEALTHY6=(); UP_LATENCY6=(); UP_SILENT=()
     UP_OBF=()
 
     base=${CASCADE_UPLINK_SUBNET%%/*}
@@ -332,16 +503,36 @@ uplinks_parse() {
     # Fields are joined with US (0x1f) rather than tabs: `read` treats tab as IFS
     # whitespace and would collapse the runs of empty optional fields, shifting
     # every later column.
-    local name endpoint peerkey psk addr prio mtu keepalive protocol suffix
-    while IFS=$'\x1f' read -r name endpoint peerkey psk addr prio mtu keepalive protocol; do
+    local name endpoint endpoint6 family peerkey psk addr addr6 prio mtu keepalive protocol suffix
+    local port4 port6
+    while IFS=$'\x1f' read -r name endpoint endpoint6 family peerkey psk addr addr6 prio mtu keepalive protocol; do
         [ -n "$name" ] || name="exit-$((idx + 1))"
 
+        # An IPv6 literal written in the `endpoint` column is an IPv6 endpoint, not
+        # a malformed IPv4 one. Accepting it there is what lets an exit node be
+        # reached over IPv6 without the list growing a field the operator has to
+        # know about first.
+        if [ "$(endpoint_family "$endpoint")" = 6 ] && [ -z "$endpoint6" ]; then
+            endpoint6=$endpoint
+            endpoint=""
+        fi
+        # A bare address in either column takes the other one's port, so a node that
+        # answers on the same port over both families needs to name it once.
+        port4=$(endpoint_port "$endpoint")
+        port6=$(endpoint_port "$endpoint6")
+        UP_ENDPOINT4[idx]=$(endpoint_normalise "$endpoint" "${port6:-${CASCADE_PORT_DEFAULT:-51820}}")
+        UP_ENDPOINT6[idx]=$(endpoint_normalise "$endpoint6" "${port4:-${CASCADE_PORT_DEFAULT:-51820}}")
+
         UP_NAME[idx]=$name
-        UP_ENDPOINT[idx]=$endpoint
+        UP_FAMILY[idx]=$family
         UP_PEERKEY[idx]=$peerkey
         UP_PSK[idx]=$psk
         # Each uplink terminates on its own address inside the shared uplink subnet.
         UP_ADDR[idx]=${addr:-${base}.$((idx + 2))/32}
+        # Numbered off the IPv4 address in use rather than the slot, so the two
+        # halves stay in step — 10.77.0.5/32 beside fd00:77::5/128 — when the list
+        # pins addresses, which it does as soon as a node has ever been removed.
+        UP_ADDR6[idx]=$(uplink_bridge_address6 "$name" "$addr6" "$(addr_host4 "${UP_ADDR[$idx]}" "$((idx + 2))")")
         UP_PRIO[idx]=${prio:-$((idx + 1))}
         UP_MTU[idx]=${mtu:-${CASCADE_MTU:-1380}}
         UP_KEEPALIVE[idx]=${keepalive:-${CASCADE_KEEPALIVE:-25}}
@@ -349,6 +540,9 @@ uplinks_parse() {
         for suffix in $AWG_OBF_SUFFIXES; do
             UP_OBF[$idx,$suffix]=""
         done
+
+        uplink_set_family "$idx" \
+            "$(uplink_pick_family "${UP_FAMILY[$idx]}" "${UP_ENDPOINT4[$idx]}" "${UP_ENDPOINT6[$idx]}")"
 
         UP_IFACE[idx]=""
         UP_PUBKEY[idx]=""
@@ -360,16 +554,23 @@ uplinks_parse() {
         UP_RX[idx]=0
         UP_TX[idx]=0
         UP_PID[idx]=0
+        UP_FLIPS[idx]=0
+        UP_HEALTHY6[idx]=false
+        UP_LATENCY6[idx]=""
+        UP_SILENT[idx]=true
 
         idx=$((idx + 1))
     done < <(printf '%s' "$json" | jq -r '
         def s: if . == null then "" else tostring end;
         map(with_entries(.key |= ascii_downcase))[] | [
             (.name | s),
-            (.endpoint | s),
+            ((.endpoint // .endpoint4) | s),
+            ((.endpoint6 // .endpoint_v6) | s),
+            ((.family // .endpoint_family) | s),
             ((.public_key // .peer_public_key) | s),
             ((.preshared_key // .psk) | s),
             (.address | s),
+            ((.address6 // .address_v6) | s),
             (.priority | s),
             (.mtu | s),
             (.keepalive | s),
@@ -399,9 +600,14 @@ uplinks_parse() {
         log "no exit node is configured; starting a single unpaired uplink"
         UP_NAME[0]="exit-1"
         UP_ENDPOINT[0]=""
+        UP_ENDPOINT4[0]=""
+        UP_ENDPOINT6[0]=""
+        UP_FAMILY[0]=""
+        UP_EPFAM[0]=""
         UP_PEERKEY[0]=""
         UP_PSK[0]=""
         UP_ADDR[0]="${base}.2/32"
+        UP_ADDR6[0]=$(uplink_bridge_address6 "exit-1" "" 2)
         UP_PRIO[0]=1
         UP_MTU[0]=${CASCADE_MTU:-1380}
         UP_KEEPALIVE[0]=${CASCADE_KEEPALIVE:-25}
@@ -419,6 +625,10 @@ uplinks_parse() {
         UP_RX[0]=0
         UP_TX[0]=0
         UP_PID[0]=0
+        UP_FLIPS[0]=0
+        UP_HEALTHY6[0]=false
+        UP_LATENCY6[0]=""
+        UP_SILENT[0]=true
     fi
 
     uplinks_allocate_ifaces
@@ -428,11 +638,16 @@ uplinks_parse() {
 # Everything that, when it changes, means the interface has to be rebuilt. Priority
 # is deliberately absent: reordering the cascade is a routing decision, not a
 # reason to drop a working tunnel.
+#
+# UP_ENDPOINT is the endpoint being dialled rather than the pair in the list, so a
+# node that gained a second endpoint it is not using does not have its tunnel
+# rebuilt — and one that was moved to the other family does.
 uplink_signature() {
     local i=$1 suffix
-    printf '%s|%s|%s|%s|%s|%s|%s|%s' \
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' \
         "${UP_IFACE[$i]}" "${UP_ENDPOINT[$i]}" "${UP_PEERKEY[$i]}" "${UP_PSK[$i]}" \
-        "${UP_ADDR[$i]}" "${UP_MTU[$i]}" "${UP_KEEPALIVE[$i]}" "${UP_PROTOCOL[$i]}"
+        "${UP_ADDR[$i]}" "${UP_ADDR6[$i]:-}" "${UP_MTU[$i]}" "${UP_KEEPALIVE[$i]}" \
+        "${UP_PROTOCOL[$i]}"
     for suffix in $AWG_OBF_SUFFIXES; do
         printf '|%s' "${UP_OBF[$i,$suffix]:-}"
     done
@@ -1119,6 +1334,11 @@ uplink_setup() {
     UP_PUBKEY[i]=$(awg_pubkey "$priv")
 
     conf="${AWG_CONFIG_DIR}/${iface}.conf"
+    local allowed=0.0.0.0/0
+    # ::/0 is only added where the bridge actually has an IPv6 half. Widening
+    # AllowedIPs on a cascade that carries no IPv6 would change every uplink's
+    # configuration — and so rebuild every tunnel — for nothing.
+    [ -z "${UP_ADDR6[$i]:-}" ] || allowed="0.0.0.0/0, ::/0"
     {
         echo "[Interface]"
         echo "PrivateKey = ${priv}"
@@ -1128,7 +1348,7 @@ uplink_setup() {
             echo "[Peer]"
             echo "PublicKey = ${UP_PEERKEY[$i]}"
             [ -n "${UP_PSK[$i]}" ] && echo "PresharedKey = ${UP_PSK[$i]}"
-            echo "AllowedIPs = 0.0.0.0/0"
+            echo "AllowedIPs = ${allowed}"
             echo "Endpoint = ${UP_ENDPOINT[$i]}"
             echo "PersistentKeepalive = ${UP_KEEPALIVE[$i]}"
         else
@@ -1151,8 +1371,8 @@ uplink_setup() {
         uplink_stop "$i"
         return 1
     fi
-    if ! iface_up "$iface" "${UP_ADDR[$i]}" "${UP_MTU[$i]}"; then
-        log "uplink ${name}: could not bring ${iface} up on ${UP_ADDR[$i]}"
+    if ! iface_up "$iface" "${UP_ADDR[$i]}" "${UP_MTU[$i]}" "${UP_ADDR6[$i]:-}"; then
+        log "uplink ${name}: could not bring ${iface} up on ${UP_ADDR[$i]}${UP_ADDR6[$i]:+ and ${UP_ADDR6[$i]}}"
         uplink_stop "$i"
         return 1
     fi
@@ -1164,11 +1384,16 @@ uplink_setup() {
         UPLINK_PUBLIC_KEY=${UP_PUBKEY[$i]}
         UPLINK_PEER_PUBLIC_KEY=${UP_PEERKEY[$i]}
         UPLINK_ENDPOINT=${UP_ENDPOINT[$i]}
+        UPLINK_ENDPOINT4=${UP_ENDPOINT4[$i]:-}
+        UPLINK_ENDPOINT6=${UP_ENDPOINT6[$i]:-}
+        UPLINK_ENDPOINT_FAMILY=${UP_EPFAM[$i]:-}
         UPLINK_ADDRESS=${UP_ADDR[$i]}
+        UPLINK_ADDRESS6=${UP_ADDR6[$i]:-}
         UPLINK_PROTOCOL=$protocol
     }
     local stored=(UPLINK_NAME UPLINK_IFACE UPLINK_PUBLIC_KEY UPLINK_PEER_PUBLIC_KEY
-                  UPLINK_ENDPOINT UPLINK_ADDRESS UPLINK_PROTOCOL)
+                  UPLINK_ENDPOINT UPLINK_ENDPOINT4 UPLINK_ENDPOINT6 UPLINK_ENDPOINT_FAMILY
+                  UPLINK_ADDRESS UPLINK_ADDRESS6 UPLINK_PROTOCOL)
     local source_name
     for suffix in $AWG_OBF_SUFFIXES; do
         source_name="NODE_${suffix}"
@@ -1177,7 +1402,7 @@ uplink_setup() {
     done
     params_store "$parfile" "${stored[@]}"
 
-    log "uplink ${name} up on ${iface} (${UP_ADDR[$i]}) speaking AmneziaWG ${protocol} towards ${UP_ENDPOINT[$i]:-<unpaired>} (pub ${UP_PUBKEY[$i]})"
+    log "uplink ${name} up on ${iface} (${UP_ADDR[$i]}${UP_ADDR6[$i]:+, ${UP_ADDR6[$i]}}) speaking AmneziaWG ${protocol} towards ${UP_ENDPOINT[$i]:-<unpaired>}${UP_EPFAM[$i]:+ over IPv${UP_EPFAM[$i]}} (pub ${UP_PUBKEY[$i]})"
     return 0
 }
 
@@ -1212,6 +1437,7 @@ uplinks_teardown() {
     ip rule del from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
     ip route flush table "$CASCADE_TABLE" 2>/dev/null || true
     ip route flush table "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
+    ip -6 route flush table "$CASCADE_TABLE" 2>/dev/null || true
     [ -z "$DIRECT_RULES_IFACE" ] || path_rules_del "$DIRECT_RULES_IFACE"
     DIRECT_RULES_IFACE=""
     bypass_rules_del
@@ -1245,6 +1471,28 @@ path_rules_del() {
     iptables -t nat -D POSTROUTING -s "$AWG_SUBNET" -o "$iface" -j MASQUERADE 2>/dev/null || true
     iptables -D FORWARD -i "$AWG_IFACE" -o "$iface" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i "$iface" -o "$AWG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+}
+
+# The IPv6 half of the cascade table, moved in step with the IPv4 default route so
+# the bridge fails over as one thing. Takes an interface name, `unreachable`, or
+# `none`.
+#
+# Nothing looks the table up yet. The entry node's client interface is IPv4-only,
+# so there is no `ip -6 rule` sending client traffic here — the table is maintained
+# because a failover path that is only built when it is first needed is a failover
+# path nobody has ever seen work, and because turning client IPv6 on later is then
+# one rule rather than a second copy of all of this.
+uplinks_route6_set() {
+    local target=$1
+    bridge_has_v6 || return 0
+    case $target in
+        none) ip -6 route del default table "$CASCADE_TABLE" 2>/dev/null || true ;;
+        unreachable)
+            ip -6 route replace unreachable default table "$CASCADE_TABLE" 2>/dev/null \
+                || ip -6 route del default table "$CASCADE_TABLE" 2>/dev/null || true
+            ;;
+        *) ip -6 route replace default dev "$target" table "$CASCADE_TABLE" 2>/dev/null || true ;;
+    esac
 }
 
 # Rules that apply to every uplink. Only the default route inside CASCADE_TABLE
@@ -1294,6 +1542,13 @@ uplink_activate() {
     [ "$i" -ne "$previous" ] || [ "$force" = "force" ] || [ "$was_fallback" = "true" ] || return 0
 
     ip route replace default dev "${UP_IFACE[$i]}" table "$CASCADE_TABLE"
+    # An uplink with no IPv6 address cannot carry the family, so the IPv6 half of
+    # the table is emptied rather than pointed at a tunnel that would black-hole it.
+    if [ -n "${UP_ADDR6[$i]:-}" ]; then
+        uplinks_route6_set "${UP_IFACE[$i]}"
+    else
+        uplinks_route6_set none
+    fi
     ACTIVE_INDEX=$i
     FALLBACK_ACTIVE=false
     # Traffic that was leaving through the entry node no longer needs its NAT, unless
@@ -1335,6 +1590,7 @@ uplinks_fallback() {
         # An empty cascade table means the lookup carries on to the main table, which
         # is the entry node's own route to the internet.
         ip route del default table "$CASCADE_TABLE" 2>/dev/null || true
+        uplinks_route6_set none
         log "every exit node is down; client traffic is leaving through this entry node until one recovers"
     else
         # An unreachable route rather than an empty table: without it the lookup would
@@ -1342,6 +1598,7 @@ uplinks_fallback() {
         # the one thing this mode exists to prevent.
         ip route replace unreachable default table "$CASCADE_TABLE" 2>/dev/null \
             || ip route del default table "$CASCADE_TABLE" 2>/dev/null || true
+        uplinks_route6_set unreachable
         log "every exit node is down; blocking client traffic (CASCADE_FALLBACK=block)"
     fi
 
@@ -1358,6 +1615,33 @@ uplinks_fallback() {
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
+
+# Sends the probe that says whether the IPv6 half of the bridge reaches the
+# internet from the exit node, and records what came back.
+#
+# Deliberately separate from the verdict uplink_probe returns. Client traffic is
+# IPv4, so an exit node whose IPv6 is broken is still carrying everything it has
+# been asked to carry, and failing it over would cost clients a working tunnel to
+# fix a family none of them is using. What this is for is telling an operator that
+# the IPv6 bridge they configured is or is not working — before anything depends
+# on it. When client IPv6 arrives, this becomes a second gate rather than a report.
+uplink_probe6() {
+    local i=$1
+    local iface=${UP_IFACE[$i]} out rtt
+
+    UP_HEALTHY6[i]=false
+    UP_LATENCY6[i]=""
+    [ -n "${UP_ADDR6[$i]:-}" ] || return 0
+    [ "$CASCADE_PROBE_ENABLED" = "true" ] || return 0
+    [ -n "$CASCADE_PROBE_TARGET6" ] || return 0
+
+    if out=$(ping -6 -I "$iface" -c 1 -W "$CASCADE_PROBE_TIMEOUT" -q "$CASCADE_PROBE_TARGET6" 2>/dev/null); then
+        rtt=$(printf '%s' "$out" | awk -F'/' '/min\/avg/ {print $5; exit}' 2>/dev/null) || rtt=""
+        UP_LATENCY6[i]=$rtt
+        UP_HEALTHY6[i]=true
+    fi
+    return 0
+}
 
 # Succeeds when the uplink looks usable right now.
 uplink_probe() {
@@ -1377,23 +1661,39 @@ uplink_probe() {
     UP_RX[i]=${rx:-0}
     UP_TX[i]=${tx:-0}
 
+    UP_SILENT[i]=true
+
     # An unpaired uplink can never carry traffic.
     if [ -z "${UP_PEERKEY[$i]}" ] || [ -z "${UP_ENDPOINT[$i]}" ]; then
         UP_LATENCY[i]=""
+        UP_HEALTHY6[i]=false
+        UP_LATENCY6[i]=""
         return 1
     fi
 
     # No handshake at all, or one too old to still be live.
     if [ "$hs" -eq 0 ]; then
         UP_LATENCY[i]=""
+        UP_HEALTHY6[i]=false
+        UP_LATENCY6[i]=""
         return 1
     fi
     now=$(date +%s)
     age=$((now - hs))
     if [ "$age" -gt "$CASCADE_HANDSHAKE_TIMEOUT" ]; then
         UP_LATENCY[i]=""
+        UP_HEALTHY6[i]=false
+        UP_LATENCY6[i]=""
         return 1
     fi
+
+    # Packets are arriving over this endpoint, so whatever fails below is not the
+    # path to it.
+    UP_SILENT[i]=false
+
+    # The tunnel is alive, so whatever the IPv6 half of the bridge reports is about
+    # the exit node's IPv6 rather than about the tunnel being down.
+    uplink_probe6 "$i"
 
     # The tunnel is alive; check that the far side still reaches the internet.
     if [ "$CASCADE_PROBE_ENABLED" = "true" ]; then
@@ -1406,6 +1706,38 @@ uplink_probe() {
         fi
     fi
     return 0
+}
+
+# Moves one uplink to the exit node's other endpoint and rebuilds just that
+# interface. Returns non-zero when there is nowhere else to go.
+#
+# This is the only way to find out which family actually works. A handshake that
+# never arrives looks identical whether the exit node is down, the port is closed
+# or the path over this family is filtered — and the third is the case the cascade
+# can do something about on its own, so it tries. The budget is the same hysteresis
+# failover uses, so a family gets CASCADE_FAIL_THRESHOLD probes to produce a
+# handshake before the other one is tried.
+uplink_flip_family() {
+    local i=$1 other
+    other=$(uplink_other_family "$i")
+    [ -n "$other" ] || return 1
+    [ -n "${UP_PEERKEY[$i]}" ] || return 1
+
+    log "uplink ${UP_NAME[$i]}: no handshake over IPv${UP_EPFAM[$i]} (${UP_ENDPOINT[$i]}); trying IPv${other}"
+    uplink_set_family "$i" "$other"
+    UP_FLIPS[i]=$(( ${UP_FLIPS[$i]:-0} + 1 ))
+    # A rebuilt tunnel has proven nothing, so it starts over on the recovery
+    # threshold rather than inheriting credit from the family that just failed.
+    UP_OKS[i]=0
+
+    if uplink_setup "$i"; then
+        path_rules_add "${UP_IFACE[$i]}"
+        # The route still names this interface if it was the active one, and the
+        # interface was just deleted and recreated — so it has to be rewritten.
+        [ "$i" -ne "$ACTIVE_INDEX" ] || uplink_activate "$i" force
+        return 0
+    fi
+    return 1
 }
 
 # Consecutive-sample hysteresis keeps a flapping link from flapping the route.
@@ -1436,6 +1768,15 @@ uplinks_refresh_health() {
             if [ "${UP_HEALTHY[$i]}" != "false" ] && [ "${UP_FAILS[$i]}" -ge "$CASCADE_FAIL_THRESHOLD" ]; then
                 UP_HEALTHY[i]=false
                 log "uplink ${UP_NAME[$i]} failed ${UP_FAILS[$i]} checks in a row"
+            fi
+            # Only once a whole threshold has gone by with nothing to show for it,
+            # and only when the tunnel is silent rather than merely unable to reach
+            # the probe target: an uplink that is still handshaking has found the
+            # right server over this family, and rebuilding it would throw that
+            # away to fix something that is not the path.
+            if [ "$(( UP_FAILS[i] % CASCADE_FAIL_THRESHOLD ))" -eq 0 ] \
+                && [ "${UP_SILENT[$i]:-true}" = "true" ]; then
+                uplink_flip_family "$i" || true
             fi
         fi
     done
@@ -1498,12 +1839,15 @@ uplinks_write_state() {
 
     if for i in "${!UP_NAME[@]}"; do
         if [ "$i" -eq "$ACTIVE_INDEX" ]; then is_active=true; else is_active=false; fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "${UP_NAME[$i]}" "${UP_IFACE[$i]}" "${UP_ENDPOINT[$i]}" "${UP_ADDR[$i]}" \
             "${UP_PRIO[$i]}" "${UP_PUBKEY[$i]}" "${UP_PEERKEY[$i]}" \
             "${UP_HEALTHY[$i]}" "$is_active" \
             "${UP_HS[$i]}" "${UP_LATENCY[$i]}" "${UP_RX[$i]}" "${UP_TX[$i]}" \
-            "${UP_PROTOCOL[$i]}"
+            "${UP_PROTOCOL[$i]}" \
+            "${UP_ENDPOINT4[$i]:-}" "${UP_ENDPOINT6[$i]:-}" "${UP_EPFAM[$i]:-}" \
+            "${UP_ADDR6[$i]:-}" "${UP_HEALTHY6[$i]:-false}" "${UP_LATENCY6[$i]:-}" \
+            "${UP_FAMILY[$i]:-}"
     done | jq -R -s \
         --arg mode "$UPLINK_MODE" \
         --arg pin "$UPLINK_PIN" \
@@ -1526,6 +1870,11 @@ uplinks_write_state() {
         --argjson bypass_active "$([ "$BYPASS_ACTIVE" = "true" ] && echo true || echo false)" \
         --argjson bypass_runtime "$bypass_runtime" \
         --argjson fallback_active "$([ "$FALLBACK_ACTIVE" = "true" ] && echo true || echo false)" \
+        --arg bridge_subnet "$CASCADE_UPLINK_SUBNET" \
+        --arg bridge_subnet6 "${CASCADE_UPLINK_SUBNET6:-}" \
+        --arg bridge_family "${UPLINK_FAMILY_PREF:-auto}" \
+        --arg probe_target "$CASCADE_PROBE_TARGET" \
+        --arg probe_target6 "$([ -n "${CASCADE_UPLINK_SUBNET6:-}" ] && printf '%s' "$CASCADE_PROBE_TARGET6")" \
         --argjson handshake_timeout "$CASCADE_HANDSHAKE_TIMEOUT" \
         --argjson failover_seconds "$CASCADE_FAILOVER_SECONDS" \
         --argjson now "$(date -u +%s)" '
@@ -1548,6 +1897,16 @@ uplinks_write_state() {
             # age it cannot judge.
             handshake_timeout: $handshake_timeout,
             failover_seconds: $failover_seconds,
+            # The link between this entry node and its exit nodes, as distinct from
+            # the endpoints the tunnels are dialled over. `subnet6` null is a cascade
+            # with no IPv6 half, which is the default and not a fault.
+            bridge: {
+                subnet: $bridge_subnet,
+                subnet6: (if $bridge_subnet6 == "" then null else $bridge_subnet6 end),
+                family: $bridge_family,
+                probe_target: $probe_target,
+                probe_target6: (if $probe_target6 == "" then null else $probe_target6 end)
+            },
             direct: {
                 source: $direct_source,
                 routes: $direct_routes,
@@ -1574,8 +1933,24 @@ uplinks_write_state() {
                 | {
                     name: .[0],
                     iface: .[1],
+                    # The endpoint being dialled right now, which is the one the
+                    # tunnel exists over rather than the one listed first.
                     endpoint: (if .[2] == "" then null else .[2] end),
+                    endpoint4: (if (.[14] // "") == "" then null else .[14] end),
+                    endpoint6: (if (.[15] // "") == "" then null else .[15] end),
+                    endpoint_family: (if (.[16] // "") == "" then null else (.[16] | tonumber) end),
+                    # What the list asked for, as opposed to what is in use: null
+                    # means the node follows the cascade-wide preference.
+                    family: (if (.[20] // "") == "" then null else .[20] end),
                     address: .[3],
+                    # This uplink on the IPv6 half of the bridge, or null when the
+                    # cascade has no IPv6 half.
+                    address6: (if (.[17] // "") == "" then null else .[17] end),
+                    # Whether the exit node reaches the IPv6 internet through this
+                    # bridge. Reported rather than acted on: client traffic is IPv4,
+                    # so this being false is not a reason to fail the node over.
+                    healthy6: ((.[18] // "") == "true"),
+                    latency6_ms: (if (.[19] // "") == "" then null else (.[19] | tonumber) end),
                     priority: (.[4] | tonumber),
                     public_key: .[5],
                     peer_public_key: (if .[6] == "" then null else .[6] end),
@@ -1633,8 +2008,11 @@ direct_config_mtime() {
 # exit node does not interrupt the one carrying client traffic.
 uplinks_reload() {
     local i name previous_active="" rebuilt=0 removed=0 added=0
+    local old_pref=$UPLINK_FAMILY_PREF
     local -A old_iface=() old_pid=() old_sig=() old_pub=() old_protocol=()
     local -A old_healthy=() old_fails=() old_oks=() old_hs=() old_rx=() old_tx=() old_lat=()
+    local -A old_ep4=() old_ep6=() old_epfam=() old_flips=() old_healthy6=() old_lat6=()
+    local -A old_silent=() old_family=()
 
     [ "$ACTIVE_INDEX" -lt 0 ] || previous_active=${UP_NAME[$ACTIVE_INDEX]}
 
@@ -1652,12 +2030,43 @@ uplinks_reload() {
         old_rx[$name]=${UP_RX[$i]}
         old_tx[$name]=${UP_TX[$i]}
         old_lat[$name]=${UP_LATENCY[$i]}
+        old_ep4[$name]=${UP_ENDPOINT4[$i]:-}
+        old_ep6[$name]=${UP_ENDPOINT6[$i]:-}
+        old_epfam[$name]=${UP_EPFAM[$i]:-}
+        old_family[$name]=${UP_FAMILY[$i]:-}
+        old_flips[$name]=${UP_FLIPS[$i]:-0}
+        old_healthy6[$name]=${UP_HEALTHY6[$i]:-false}
+        old_lat6[$name]=${UP_LATENCY6[$i]:-}
+        old_silent[$name]=${UP_SILENT[$i]:-true}
     done
 
     if ! uplinks_parse; then
         log "the exit node list is unusable (${CONFIG_ERROR}); keeping the running cascade"
         return 1
     fi
+
+    # A reload re-reads the family preference along with everything else, which
+    # would undo a flip that had just found the family this exit node is actually
+    # reachable over — and rebuild the working tunnel to do it. So an uplink that
+    # was moved by a flip keeps the endpoint it is dialling, as long as nothing the
+    # operator said about which endpoint to use has changed.
+    #
+    # Only a flip is preserved, and only against an unchanged preference. An uplink
+    # sitting on the family the preference chose has discovered nothing worth
+    # keeping; and an operator who changes the preference has said something newer
+    # than the flip did — they may have just given this host the IPv6 it lacked.
+    for i in "${!UP_NAME[@]}"; do
+        name=${UP_NAME[$i]}
+        [ -n "${old_epfam[$name]:-}" ] || continue
+        [ "${old_flips[$name]:-0}" -gt 0 ] 2>/dev/null || continue
+        [ "$old_pref" = "$UPLINK_FAMILY_PREF" ] || continue
+        [ "${old_family[$name]:-}" = "${UP_FAMILY[$i]:-}" ] || continue
+        [ "${old_ep4[$name]}" = "${UP_ENDPOINT4[$i]:-}" ] || continue
+        [ "${old_ep6[$name]}" = "${UP_ENDPOINT6[$i]:-}" ] || continue
+        [ "${old_epfam[$name]}" != "${UP_EPFAM[$i]:-}" ] || continue
+        uplink_set_family "$i" "${old_epfam[$name]}"
+        UP_FLIPS[i]=${old_flips[$name]:-0}
+    done
 
     # Interface numbers are recycled, so departed nodes must release theirs before
     # a new node can claim the same one.
@@ -1688,6 +2097,9 @@ uplinks_reload() {
             UP_RX[i]=${old_rx[$name]}
             UP_TX[i]=${old_tx[$name]}
             UP_LATENCY[i]=${old_lat[$name]}
+            UP_HEALTHY6[i]=${old_healthy6[$name]}
+            UP_LATENCY6[i]=${old_lat6[$name]}
+            UP_SILENT[i]=${old_silent[$name]}
             [ "$name" != "$previous_active" ] || ACTIVE_INDEX=$i
             continue
         fi

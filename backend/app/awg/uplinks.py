@@ -31,6 +31,41 @@ FALLBACK_BLOCK = "block"
 _stalled: set[str] = set()
 
 
+def endpoint_host(endpoint: str | None) -> str | None:
+    """The host out of ``host:port``, brackets removed, or None.
+
+    IPv6 has to be special-cased rather than split on the last colon: an endpoint is
+    written ``[2001:db8::20]:51820``, and a bare ``2001:db8::20`` has no port at all
+    even though it is full of colons.
+    """
+    if not endpoint:
+        return None
+    value = endpoint.strip()
+    if value.startswith("["):
+        host, _, _ = value[1:].partition("]")
+        return host or None
+    if value.count(":") > 1:
+        return value
+    host = value.rsplit(":", 1)[0] if ":" in value else value
+    return host or None
+
+
+def format_endpoint(host: str | None, port: int | str | None) -> str | None:
+    """``host:port`` the way amneziawg-tools wants it, IPv6 in brackets.
+
+    An endpoint that reaches a .conf unbracketed is read as a truncated address with
+    the last group taken for the port, and the tunnel never handshakes.
+    """
+    if not host:
+        return None
+    host = host.strip().strip("[]")
+    if ":" in host:
+        host = f"[{host}]"
+    if port in (None, ""):
+        return host
+    return f"{host}:{port}"
+
+
 @dataclass
 class ExitNodeState:
     name: str
@@ -49,6 +84,22 @@ class ExitNodeState:
     #: The AmneziaWG generation this uplink speaks. None from a node container that
     #: predates generation selection, which is serving 1.0 either way.
     protocol: str | None = None
+    #: The two endpoints this node publishes, and which family ``endpoint`` above is
+    #: one of. The cascade dials one and moves to the other when no handshake comes
+    #: over the first, so ``endpoint`` is what exists and these are what was offered.
+    endpoint4: str | None = None
+    endpoint6: str | None = None
+    endpoint_family: int | None = None
+    #: What the list asked for: "auto", "4", "6", or None to follow the cascade.
+    family: str | None = None
+    #: This uplink's address on the IPv6 half of the bridge, or None when the cascade
+    #: has no IPv6 half or this node sits out of it.
+    address6: str | None = None
+    #: Whether the exit node reaches the IPv6 internet through the bridge. Reported
+    #: rather than acted on: clients are IPv4, so this being false is not a reason to
+    #: fail the node over.
+    healthy6: bool = False
+    latency6_ms: float | None = None
     #: True when the cascade is still treating this uplink as usable — offering it as
     #: a failover target, or routing clients through it — while its last handshake is
     #: too old for anything to be coming out of it. See :func:`load_uplink_state`.
@@ -61,7 +112,7 @@ class ExitNodeState:
 
     @property
     def exit_ip(self) -> str | None:
-        return self.endpoint.rsplit(":", 1)[0] if self.endpoint else None
+        return endpoint_host(self.endpoint)
 
     @property
     def handshake_age(self) -> float | None:
@@ -69,6 +120,26 @@ class ExitNodeState:
         if self.last_handshake is None:
             return None
         return (datetime.now(timezone.utc) - self.last_handshake).total_seconds()
+
+
+@dataclass
+class BridgeState:
+    """The link between this entry node and its exit nodes.
+
+    Distinct from the endpoints the tunnels are dialled over: ``subnet``/``subnet6``
+    are what travels inside them, ``family`` is which address they are dialled on.
+    ``subnet6`` None is a cascade with no IPv6 half, which is the default.
+    """
+
+    subnet: str = ""
+    subnet6: str | None = None
+    family: str = AUTO
+    probe_target: str | None = None
+    probe_target6: str | None = None
+
+    @property
+    def dual_stack(self) -> bool:
+        return bool(self.subnet6)
 
 
 @dataclass
@@ -90,6 +161,8 @@ class UplinkState:
     #: them.
     handshake_timeout: int = 0
     failover_seconds: int = 0
+    #: Which families the link to the exit nodes carries, and how they are dialled.
+    bridge: BridgeState = field(default_factory=BridgeState)
     nodes: list[ExitNodeState] = field(default_factory=list)
 
     @property
@@ -148,6 +221,37 @@ def _seconds(value: object, fallback: int) -> int:
     return fallback
 
 
+def _family(value: object) -> int | None:
+    """4 or 6 out of the state file, or None for anything else.
+
+    None rather than a default of 4: a node container that predates dual-stack
+    endpoints publishes nothing here, and claiming it dialled IPv4 would be stating
+    as fact something it never said.
+    """
+    if value in (4, 6, "4", "6"):
+        return int(value)  # type: ignore[arg-type]
+    return None
+
+
+def _bridge(raw: object) -> BridgeState:
+    """The bridge section, or a plausible IPv4-only one from an older container."""
+    if not isinstance(raw, dict):
+        return BridgeState(
+            subnet=settings.cascade_uplink_subnet,
+            family=settings.cascade_endpoint_family,
+        )
+    family = str(raw.get("family") or AUTO)
+    if family not in (AUTO, "4", "6"):
+        family = AUTO
+    return BridgeState(
+        subnet=str(raw.get("subnet") or settings.cascade_uplink_subnet),
+        subnet6=raw.get("subnet6") or None,
+        family=family,
+        probe_target=raw.get("probe_target") or None,
+        probe_target6=raw.get("probe_target6") or None,
+    )
+
+
 def load_uplink_state() -> UplinkState:
     """Never raises: a missing or half-written file just reads as 'nothing known'.
 
@@ -187,6 +291,13 @@ def load_uplink_state() -> UplinkState:
                     rx_bytes=int(item.get("rx_bytes", 0)),
                     tx_bytes=int(item.get("tx_bytes", 0)),
                     protocol=item.get("protocol") or None,
+                    endpoint4=item.get("endpoint4"),
+                    endpoint6=item.get("endpoint6"),
+                    endpoint_family=_family(item.get("endpoint_family")),
+                    family=item.get("family") or None,
+                    address6=item.get("address6") or None,
+                    healthy6=bool(item.get("healthy6")),
+                    latency6_ms=item.get("latency6_ms"),
                 )
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -217,6 +328,7 @@ def load_uplink_state() -> UplinkState:
         failover_seconds=_seconds(
             raw.get("failover_seconds"), settings.cascade_failover_seconds
         ),
+        bridge=_bridge(raw.get("bridge")),
         nodes=nodes,
     )
 

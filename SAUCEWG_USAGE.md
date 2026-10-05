@@ -43,7 +43,9 @@ AmneziaWG port.
 
 **Requirements for either role:** a 64-bit Linux server with systemd and root access.
 Docker is installed by the script if it is missing. Debian, Ubuntu, Fedora, CentOS,
-Rocky, Alma, openSUSE, Arch and Alpine are all handled.
+Rocky, Alma, openSUSE, Arch and Alpine are all handled. An exit node needs no IPv4 at
+all if the entry node has IPv6 ([§4.10](#410-ipv6)); an entry node needs IPv4, since
+that is what clients dial.
 
 ---
 
@@ -94,7 +96,7 @@ bash /tmp/saucewg.sh --json --yes install \
   "admin_username": "admin",
   "admin_password": "a-strong-one",
   "endpoint": "203.0.113.7:443",
-  "version": "1.3.0"
+  "version": "1.4.0"
 }
 ```
 
@@ -112,6 +114,8 @@ Global flags may appear before or after the subcommand, with one exception:
 | `--port N` | `443` | UDP port clients dial |
 | `--subnet CIDR` | `10.8.0.0/24` | Address pool for clients |
 | `--uplink-subnet CIDR` | `10.77.0.0/24` | Address pool for cascade uplinks |
+| `--uplink-subnet6 CIDR` | none | IPv6 half of the cascade bridge, e.g. `fd00:77::/64`. Omitted is an IPv4-only cascade; see [§4.10](#410-ipv6) |
+| `--endpoint-family F` | `auto` | Which family exit nodes publishing both are dialled over: `auto`, `4` or `6` |
 | `--endpoint-host HOST` | detected | Public address written into client configs. Set it on a NATed server |
 | `--protocol V` | `2.0` | AmneziaWG generation clients connect with — `1.0` (alias `legacy`), `1.5` or `2.0` |
 | `--signature NAME` | `quic` | The `I1` disguise on 1.5 and 2.0: `quic`, `dns`, `random`, `short`, `none`, or a literal spec |
@@ -132,9 +136,11 @@ profile up when they re-download it.
 | `--name NAME` | hostname | Identity of this node in the cascade |
 | `--port N` | `51820` | UDP port the entry node dials |
 | `--subnet CIDR` | `10.77.0.0/24` | Uplink subnet; must match the entry node's `--uplink-subnet` |
+| `--subnet6 CIDR` | none | IPv6 uplink subnet; must match the entry node's `--uplink-subnet6`. Omitted and this node carries IPv4 only |
 | `--peer-key KEY` | — | The entry node's uplink key, if you already have it |
 | `--psk KEY` / `--psk-stdin` | — | Optional pre-shared key. `--psk-stdin` reads it from stdin so it never appears in `ps` |
-| `--endpoint-host HOST` | detected | Address the entry node should dial |
+| `--endpoint-host HOST` | detected | IPv4 address the entry node should dial |
+| `--endpoint-host6 HOST` | detected | IPv6 address the entry node should dial. Both are detected and reported; an IPv6-only server reports only this one |
 | `--protocol V` | `2.0` | AmneziaWG generation this uplink speaks — `1.0` (alias `legacy`), `1.5` or `2.0` |
 | `--signature NAME` | `quic` | The `I1` disguise on 1.5 and 2.0 |
 | `--no-start` | — | Configure without starting |
@@ -151,6 +157,7 @@ On success it prints the object the entry node needs:
 {
   "name": "eu-nl",
   "endpoint": "198.51.100.20:51820",
+  "endpoint6": "[2001:db8::20]:51820",
   "public_key": "kQ3…=",
   "port": 51820,
   "protocol": "2.0",
@@ -161,9 +168,11 @@ On success it prints the object the entry node needs:
 ```
 
 `s3`, `s4` and `i1` are absent on a 1.0 node and `s3`/`s4` on a 1.5 one, since carrying
-a parameter is what defines the generation. Pass the whole object to `add-node` rather
-than picking fields out of it and the entry node ends up on the same generation by
-construction.
+a parameter is what defines the generation. `endpoint6` is absent on a server with no
+IPv6 and `endpoint` on one with no IPv4, so each object names exactly the addresses
+that server can actually be dialled at. `subnet6` appears when the node was installed
+with one. Pass the whole object to `add-node` rather than picking fields out of it and
+the entry node ends up on the same generation, and the same families, by construction.
 
 ### 2.4 Pinning versions and mirrors
 
@@ -183,7 +192,7 @@ release:
 | `NO_COLOR` | — | Any value disables ANSI colour |
 
 ```bash
-SAUCEWG_TAG=1.3.0 bash /tmp/saucewg.sh --json --yes install --domain panel.example.com
+SAUCEWG_TAG=1.4.0 bash /tmp/saucewg.sh --json --yes install --domain panel.example.com
 ```
 
 `--dir` also means several deployments can share one server for testing; each is a
@@ -235,7 +244,7 @@ rather than stopping.
 
 ```json
 {
-  "cli_version": "1.3.0",
+  "cli_version": "1.4.0",
   "role": "entry",
   "dir": "/opt/saucewg",
   "endpoint": "203.0.113.7:443",
@@ -682,6 +691,93 @@ an operator asking has usually just fixed the reason. So does restarting the pan
 `unreachable` node a fresh run of attempts. `NODE_RECOVERY_ENABLED=false` switches the
 automatic part off and leaves the manual one available.
 
+### 4.10 IPv6
+
+Two switches that have nothing to do with each other. Both default to off, and an
+installation updated into this version stays exactly as it was.
+
+**Dialling an exit node over IPv6** is about how the two servers reach each other.
+Give a node both endpoints, or only the one it has:
+
+```bash
+saucewg add-node --name eu-nl --public-key '…=' \
+  --endpoint 198.51.100.20:51820 --endpoint6 '[2001:db8::20]:51820'
+
+# an IPv6-only VPS: one endpoint, and it is the only one there is
+saucewg add-node --name fr-01 --public-key '…=' --endpoint6 '[2001:db8::9]:51820'
+
+saucewg update-node eu-nl --family 6          # pin it; auto by default
+saucewg update-node eu-nl --endpoint6 '[2001:db8::21]:51820'
+saucewg update-node eu-nl --endpoint6 none    # take it away again
+```
+
+An endpoint can be removed, not just replaced, because once a node has two an address
+that has stopped working is somewhere the uplink keeps being rebuilt onto. Removing the
+last one is refused.
+
+Brackets are required by `amneziawg-tools` and added for you if you leave them off —
+`2001:db8::20` becomes `[2001:db8::20]`. `install-node` reports both addresses, so
+`add-node --json` from its output needs none of these flags.
+
+Which one gets dialled is the node's `family` if set, then `CASCADE_ENDPOINT_FAMILY`,
+then whichever family this server can reach that host on. **A tunnel that goes a full
+`CASCADE_PROBE_INTERVAL × CASCADE_FAIL_THRESHOLD` window without a handshake is rebuilt
+on its other endpoint** — the address is treated as not working from here, which is
+usually what it means. A pinned node is never moved. The flip survives editing the node
+list; changing `CASCADE_ENDPOINT_FAMILY` overrules it.
+
+**Carrying IPv6 through the cascade** is about what travels inside the tunnels. It is
+one command on the entry node and one on each exit node, and the two prefixes must
+match:
+
+```bash
+saucewg bridge                      # what the bridge is now, and what each uplink is doing
+saucewg bridge on                   # fd00:77::/64
+saucewg bridge fd00:aa::/64         # or your own prefix
+saucewg bridge 6                    # also prefer IPv6 endpoints
+saucewg bridge off                  # back to IPv4 only
+```
+
+```bash
+# on each exit node, with the same prefix
+saucewg install-node --subnet6 fd00:77::/64 --reinstall
+```
+
+```
+$ saucewg bridge
+subnet    10.77.0.0/24
+subnet6   fd00:77::/64
+family    auto      IPv6 where both ends have it, IPv4 otherwise
+
+NAME   VIA   ENDPOINT              IPV6
+eu-nl  IPv6  [2001:db8::20]:51820  fd00:77::2/128 up
+eu-de  IPv4  203.0.113.31:51820    fd00:77::3/128 down
+pl-01  IPv4  192.0.2.9:51820       -
+```
+
+Each uplink is numbered to match its IPv4 address — `10.77.0.5/32` pairs with
+`fd00:77::5/128` — and that is only done for a prefix ending in `::`; anything else and
+you are asked for an explicit `--address6` rather than having host bits guessed at. A
+node on a VPS with no IPv6 sits the bridge out with `--address6 none` while the rest of
+the cascade carries both. An exit node that has no IPv6 route of its own says so in its
+log and stays IPv4 rather than NATing into a black hole.
+
+`--subnet6` on the entry node also needs `--address6` nowhere: `add-node` allocates one
+for every node added afterwards, and `saucewg bridge on` prints the one command to run
+for nodes that already exist.
+
+**Neither switch reaches clients.** `awg0` has no IPv6 address, client profiles carry
+`AllowedIPs = 0.0.0.0/0`, and the entry node installs no `ip -6 rule` for client
+traffic — so nothing a phone sends can enter the bridge. `healthy6` is published for
+each node and for the cascade but never causes a failover: an exit node with broken
+IPv6 is still carrying IPv4 clients perfectly, and moving them would be the worse
+outcome.
+
+An IPv6-only exit server can also be installed from the panel — `POST /api/nodes` with
+an IPv6 `host`, or **Exit nodes → Add exit node** with an IPv6 address in the field.
+The panel needs IPv6 of its own to reach it, which is the one prerequisite nothing here
+can work around.
+
 ---
 
 ## 5. Driving it from a bot
@@ -780,14 +876,17 @@ POST /api/nodes
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `name` | required | `^[A-Za-z0-9][A-Za-z0-9._-]*$`, unique, and permanent — renaming later regenerates keys |
-| `host` | required | IP or hostname of the server to install on |
+| `host` | required | IP or hostname of the server to install on. An IPv6 address works, so an IPv6-only VPS installs normally — the panel needs IPv6 of its own to reach it ([§4.10](#410-ipv6)) |
 | `ssh_password` | — | Root password. Omit it, with `ssh_private_key`, on a server that already carries the panel's key ([§5.1](#51-the-panels-ssh-key)) |
 | `ssh_private_key` | — | OpenSSH private key as text; use instead of a password |
 | `ssh_port` / `ssh_user` | `22` / `root` | A non-root user needs passwordless sudo |
 | `port` | `51820` | UDP port the exit node listens on |
 | `subnet` | `10.77.0.0/24` | Uplink subnet on the exit node |
+| `subnet6` | from `CASCADE_UPLINK_SUBNET6` | IPv6 uplink subnet on the exit node. Omitted on an IPv4-only cascade, which is the default |
 | `priority` | appended last | Lower wins |
 | `address` | allocated | Uplink address on the entry side |
+| `address6` | allocated | The same on the IPv6 half of the bridge. `"none"` keeps this node off it while the rest of the cascade uses it |
+| `family` | `auto` | Which endpoint family to dial this node over once it reports both: `auto`, `4`, `6` |
 | `preshared_key` | — | Extra symmetric key on this uplink |
 | `protocol` | `2.0` | AmneziaWG generation for this uplink — `1.0` (alias `legacy`), `1.5` or `2.0` |
 | `signature` | `quic` | The `I1` disguise on 1.5 and 2.0 |
@@ -857,7 +956,7 @@ mid-install.
 | --- | --- | --- |
 | `GET /api/nodes` | — | The cascade. `provisioning: false` means this panel cannot edit it |
 | `POST /api/nodes/adopt` | the object from `saucewg install-node --json` | `201` — registers a node installed by hand, no SSH |
-| `PUT /api/nodes/{name}` | `{"priority": 5}`, `{"endpoint": "…"}`, `{"note": "…"}`, `{"protocol": "1.0"}` | Applied immediately; a priority change is only a routing decision |
+| `PUT /api/nodes/{name}` | `{"priority": 5}`, `{"endpoint": "…"}`, `{"endpoint6": "[2001:db8::9]:51820"}`, `{"family": "6"}`, `{"address6": "none"}`, `{"note": "…"}`, `{"protocol": "1.0"}` | Applied immediately; a priority change is only a routing decision, the rest rebuild the uplink |
 | `DELETE /api/nodes/{name}` | `{}` or `{"uninstall": true}` | `202` + task. Without `uninstall` the server is left running and simply detached |
 | `POST /api/nodes/{name}/repair` | `{}` | `202` + task. Reinstalls the uplink key on a node that shows as unpaired |
 | `POST /api/nodes/{name}/protocol` | `{"protocol": "2.0", "signature": "quic"}` | `202` + task. Reconfigures both ends of the uplink |
@@ -923,7 +1022,7 @@ none of them need credentials once it carries the panel's key.
 ```json
 {
   "name": "eu-fr", "reachable": true, "error": null, "ssh_host": "203.0.113.9",
-  "role": "exit", "cli_version": "1.3.0", "dir": "/opt/saucewg",
+  "role": "exit", "cli_version": "1.4.0", "dir": "/opt/saucewg",
   "os": "Debian GNU/Linux 12 (bookworm)", "kernel": "Linux 6.1.0-18-amd64",
   "arch": "x86_64", "cpus": 2, "memory_mb": 1966, "disk_free_mb": 17980,
   "uptime_seconds": 934221, "docker": true, "saucewg": true,
@@ -1101,6 +1200,10 @@ Settings that matter for node management specifically:
 | `ROUTES_REGISTRY_FILE` | `/etc/saucewg/host/direct-routes.json` | The same for the direct route list |
 | `BYPASS_REGISTRY_FILE` | `/etc/saucewg/host/bypass.json` | The same for the reopened destinations of §4.7 |
 | `CASCADE_FALLBACK` | `direct` | What happens while every exit node is down — see §4.6 |
+| `CASCADE_UPLINK_SUBNET6` | | The IPv6 half of the bridge to the exit nodes (§4.10). Empty is an IPv4-only cascade; `saucewg bridge` sets it |
+| `CASCADE_ENDPOINT_FAMILY` | `auto` | Which family a node publishing both endpoints is dialled over: `auto`, `4`, `6` |
+| `CASCADE_PROBE_TARGET6` | `2606:4700:4700::1111` | What `healthy6` is measured against, through the tunnel |
+| `AWG_SUBNET6` | | **Exit node only.** The IPv6 uplink subnet it serves and NATs; must equal the entry node's `CASCADE_UPLINK_SUBNET6` |
 | `CASCADE_DIRECT_FILE` | `/etc/amnezia/host/direct-routes.json` | Where the *node container* reads the direct route list |
 | `CASCADE_DIRECT_ROUTES` | | The same list inline, overriding the file |
 | `BYPASS_MODE` | `auto` | When the destinations of §4.7 are reopened: `auto`, `always`, `off` |
@@ -1166,7 +1269,19 @@ Settings that matter for node management specifically:
   so they declare the generation the node is actually on. `set-protocol` confirms before
   touching an entry node either way, and does not bother on an exit node.
 * **The uplink address must be inside the exit node's `--subnet`.** The defaults
-  (`10.77.0.0/24` everywhere, `.2`, `.3`, `.4`… on the entry side) satisfy this.
+  (`10.77.0.0/24` everywhere, `.2`, `.3`, `.4`… on the entry side) satisfy this, and the
+  same holds for `--address6` and the exit node's `--subnet6`.
+* **An IPv6 endpoint has to be bracketed,** because `amneziawg-tools` reads the last
+  `:` group of an endpoint as the port. Everything here brackets a bare address for
+  you; a `.conf` edited by hand will not.
+* **An uplink can end up on an endpoint you did not choose.** A tunnel that goes a
+  whole failure window without a handshake is rebuilt on the node's other endpoint if
+  it has one. `saucewg nodes` shows which family is in use under `VIA`; `--family` pins
+  it if you would rather it stayed put and failed.
+* **Both ends have to agree about `subnet6`.** The entry node's
+  `CASCADE_UPLINK_SUBNET6` and each exit node's `AWG_SUBNET6` are the same prefix seen
+  from two sides, and an exit node that has not been told carries IPv4 only — its
+  `AllowedIPs` is also its inbound filter, so it drops what it was not told to expect.
 * **A priority pin is a preference, not a lock.** The cascade still fails over away
   from a pinned node that dies, and returns when it recovers.
 * **Removing a node does not touch the server** unless you ask for `uninstall`. This is

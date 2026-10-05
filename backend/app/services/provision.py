@@ -326,6 +326,10 @@ class InstallRequest:
     credentials: Credentials
     port: int = 51820
     subnet: str = "10.77.0.0/24"
+    # This node's side of the IPv6 half of the bridge, which has to be the prefix the
+    # entry node carries. Empty installs an IPv4-only exit node, which is the default
+    # and what every node installed before this existed is.
+    subnet6: str = ""
     preshared_key: str | None = field(default=None, repr=False)
     # Which AmneziaWG generation the exit node should serve. None leaves the choice
     # to the remote installer's own default.
@@ -364,8 +368,14 @@ async def install_exit_node(task: Task, request: InstallRequest) -> dict[str, An
             f" --name {shlex.quote(request.name)}"
             f" --port {int(request.port)}"
             f" --subnet {shlex.quote(request.subnet)}"
-            f" --host {shlex.quote(creds.host)}"
         )
+        # The address the panel reached this server on, told to the installer as the
+        # endpoint to publish. Whichever family it is: an IPv6-only VPS is reached
+        # over IPv6 and joins the cascade on its IPv6 endpoint, and `--endpoint-host`
+        # recognises a literal of either family.
+        command += f" --endpoint-host {shlex.quote(creds.host)}"
+        if request.subnet6:
+            command += f" --subnet6 {shlex.quote(request.subnet6)}"
         if request.protocol:
             command += f" --protocol {shlex.quote(request.protocol)}"
         if request.signature:
@@ -376,11 +386,20 @@ async def install_exit_node(task: Task, request: InstallRequest) -> dict[str, An
         _, output = await server.run(command, stdin=request.preshared_key or None)
         node = _parse_json_output(output, "install-node")
 
-        for required in ("name", "endpoint", "public_key"):
+        for required in ("name", "public_key"):
             if not node.get(required):
                 raise ProvisionError(f"the remote installer did not report {required}")
+        # One endpoint of either family is enough, and an IPv6-only server reports
+        # only the one it has.
+        if not node.get("endpoint") and not node.get("endpoint6"):
+            raise ProvisionError("the remote installer did not report an endpoint")
 
-        task.emit(f"exit node {node['name']} is listening on {node['endpoint']}")
+        listening = node.get("endpoint") or node.get("endpoint6")
+        if node.get("endpoint") and node.get("endpoint6"):
+            listening = f"{node['endpoint']} and {node['endpoint6']}"
+        task.emit(f"exit node {node['name']} is listening on {listening}")
+        if node.get("subnet6"):
+            task.emit(f"it carries IPv6 for the cascade on {node['subnet6']}")
         node["ssh_host_key"] = server.host_key
         return node
 

@@ -162,7 +162,24 @@ onUnmounted(() => window.clearInterval(timer))
         <dt>Uplink interface</dt>
         <dd class="mono">{{ stats.cascade.iface }}</dd>
         <dt>Exit endpoint</dt>
-        <dd class="mono">{{ stats.cascade.endpoint ?? '—' }}</dd>
+        <dd class="mono">
+          {{ stats.cascade.endpoint ?? '—' }}
+          <span v-if="stats.cascade.endpoint_family" style="color: var(--text-dim)">
+            (IPv{{ stats.cascade.endpoint_family }})
+          </span>
+        </dd>
+        <!-- Only once the link to the exit nodes carries IPv6; an IPv4-only cascade,
+             which is the default, has nothing to report here. -->
+        <dt v-if="stats.cascade.bridge_subnet6">IPv6 through the cascade</dt>
+        <dd v-if="stats.cascade.bridge_subnet6">
+          <span :style="stats.cascade.healthy6 ? '' : 'color: var(--warn)'">
+            {{ stats.cascade.healthy6 ? 'reachable' : 'not reachable' }}
+          </span>
+          <span style="color: var(--text-dim)">
+            · {{ stats.cascade.nodes_healthy6 }}/{{ stats.cascade.nodes_total }} nodes
+            · bridge <span class="mono">{{ stats.cascade.bridge_subnet6 }}</span>
+          </span>
+        </dd>
         <dt>Exit public key</dt>
         <dd class="mono">{{ stats.cascade.peer_public_key ?? '—' }}</dd>
         <dt>Last handshake</dt>

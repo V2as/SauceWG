@@ -5,7 +5,7 @@ name: ${COMPOSE_PROJECT_NAME:-saucewg-exit}
 
 services:
   awg:
-    image: ${IMAGE_AWG:-saucewg/awg:1.3.0}
+    image: ${IMAGE_AWG:-saucewg/awg:1.4.0}
     build:
       context: ./docker/awg
       args:
@@ -21,6 +21,12 @@ services:
       AWG_IFACE: ${AWG_IFACE:-awg0}
       AWG_PORT: ${AWG_PORT:-51820}
       AWG_SUBNET: ${AWG_SUBNET:-10.77.0.0/24}
+      # This node's side of the IPv6 half of the bridge: what the entry node
+      # reaches the IPv6 internet through. Empty carries IPv4 only, and the prefix
+      # has to be the one the entry node has in CASCADE_UPLINK_SUBNET6. A node with
+      # no IPv6 route of its own is not an error — the entry node reports its IPv6
+      # as down rather than failing it over, because clients are IPv4.
+      AWG_SUBNET6: ${AWG_SUBNET6:-}
       AWG_MTU: ${AWG_MTU:-1420}
       AWG_PRIVATE_KEY: ${AWG_PRIVATE_KEY:-}
       # 1.0, 1.5 or 2.0. The entry node has to be told which one this is, since both
@@ -47,6 +53,11 @@ services:
       AWG_PEER_PSK: ${AWG_PEER_PSK:-}
       # Each entry-node uplink terminates on its own address inside this subnet, so
       # accepting the whole range keeps one exit image usable for any slot.
+      #
+      # AllowedIPs is the inbound filter as well as the route, so AWG_SUBNET6 is
+      # appended to whatever is set here when the bridge carries IPv6 — otherwise
+      # a node whose .env predates IPv6 would come up with an address on the bridge
+      # and drop every packet carrying it.
       AWG_PEER_ALLOWED_IPS: ${AWG_PEER_ALLOWED_IPS:-10.77.0.0/24}
       WAN_IFACE: ${WAN_IFACE:-}
       # BitTorrent, blocked in the traffic this node forwards. This is the server

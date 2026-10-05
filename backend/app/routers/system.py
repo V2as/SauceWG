@@ -15,7 +15,7 @@ from ..awg import bypass as bypass_registry
 from ..awg import routes as route_registry
 from ..awg.node import load_cascade_params, load_server_params
 from ..awg.uapi import UAPIError
-from ..awg.uplinks import load_uplink_state
+from ..awg.uplinks import endpoint_host, load_uplink_state
 from ..config import settings
 from ..deps import AdminDep, SessionDep
 from ..models import Client, ClientStatus, NodeUsage
@@ -48,6 +48,11 @@ async def build_cascade_status() -> CascadeStatus:
         direct_routes=len(route_registry.state()["applied"]),
         bypass_active=bool(bypass["active"]),
         bypass_routes=len(bypass["applied"]),
+        # Which families the link to the exit nodes carries. Null subnet6 is a
+        # cascade that carries IPv4 only, which is the default.
+        bridge_subnet6=state.bridge.subnet6,
+        bridge_family=state.bridge.family,
+        nodes_healthy6=sum(1 for node in state.nodes if node.healthy6),
     )
     if not settings.cascade_enabled:
         return status
@@ -66,6 +71,11 @@ async def build_cascade_status() -> CascadeStatus:
     status.iface = active.iface
     status.endpoint = active.endpoint
     status.exit_ip = active.exit_ip
+    # Which family this tunnel is dialled over, and whether it carries IPv6 for the
+    # clients behind it. The second is reported rather than acted on: clients are
+    # IPv4, so it being false does not make the cascade unhealthy.
+    status.endpoint_family = active.endpoint_family
+    status.healthy6 = active.healthy6
     status.peer_public_key = active.peer_public_key
     status.last_handshake_at = active.last_handshake
     status.rx_bytes = active.rx_bytes
@@ -84,7 +94,7 @@ async def _legacy_cascade_status(status: CascadeStatus) -> CascadeStatus:
     params = load_cascade_params()
     endpoint = params.get("UPLINK_ENDPOINT")
     status.endpoint = endpoint
-    status.exit_ip = endpoint.rsplit(":", 1)[0] if endpoint else None
+    status.exit_ip = endpoint_host(endpoint)
 
     try:
         device = await device_for(settings.cascade_iface).get()
@@ -98,7 +108,7 @@ async def _legacy_cascade_status(status: CascadeStatus) -> CascadeStatus:
         status.tx_bytes = peer.tx_bytes
         if peer.endpoint:
             status.endpoint = peer.endpoint
-            status.exit_ip = peer.endpoint.rsplit(":", 1)[0]
+            status.exit_ip = endpoint_host(peer.endpoint)
         if peer.last_handshake:
             age = datetime.now(timezone.utc) - peer.last_handshake
             status.connected = age.total_seconds() < settings.online_timeout_seconds

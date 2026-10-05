@@ -15,6 +15,11 @@ rather than cutting clients off, and picks the cascade back up as soon as an exi
 recovers. Failing over is not the same as fixing: the panel also tries to put a failed
 exit node back, over SSH, on its own timer.
 
+An exit node can be reached over IPv6 — including one on a VPS with no IPv4 at all —
+and the link between the servers can carry IPv6 as well as IPv4, so a destination
+abroad sees the exit node's IPv6. Both are opt-in and independent of each other;
+clients stay IPv4 either way. See [IPv6](#ipv6).
+
 Chosen destinations can be sent past the cascade on purpose: a range listed in
 `config/direct-routes.json` leaves through the entry node's own address while everything
 else still goes abroad, which is how a service that has to see a local IP keeps working.
@@ -189,8 +194,12 @@ saucewg node-pair --peer-key '<that key>'
 
 Adding or removing a node takes effect within a second and restarts nothing.
 
+An exit node on an IPv6-only VPS works the same way in both directions: give the panel
+its IPv6 address as the host, or by hand pass `--endpoint-host6` to `install-node` — it
+detects the server's own addresses either way and reports both. See [IPv6](#ipv6).
+
 Optionally add a pre-shared key to an uplink for post-quantum resistance: generate one
-with `docker run --rm --entrypoint awg saucewg/awg:1.3.0 genpsk` and pass it as
+with `docker run --rm --entrypoint awg saucewg/awg:1.4.0 genpsk` and pass it as
 `--psk` to `install-node` and `preshared_key` in the object above.
 
 Private keys are generated inside the node container on first start and persisted in the
@@ -272,7 +281,7 @@ curl -H "Authorization: Bearer $TOKEN" http://<host>/api/clients
 | `GET` | `/api/nodes/ssh-key` | the panel's public SSH key, to preload onto a new server |
 | `POST` | `/api/nodes/check` | pre-flight a server: reachable, root, what it is, what is on it |
 | `POST` | `/api/nodes/adopt` | register an exit node installed by hand |
-| `PUT/DELETE` | `/api/nodes/{name}` | change priority, endpoint or note / remove it |
+| `PUT/DELETE` | `/api/nodes/{name}` | change priority, either endpoint, family or note / remove it |
 | `POST` | `/api/nodes/{name}/repair` | reinstall the uplink key on an unpaired node |
 | `POST` | `/api/nodes/{name}/protocol` | move a node to another AmneziaWG generation over SSH |
 | `GET` | `/api/nodes/{name}/status` | the exit server as it describes itself: containers, version, host |
@@ -322,6 +331,10 @@ An entry with no `protocol` is read as 1.0 if it carries no `s3`/`s4`/`i1`, and 
 as whichever generation its parameters describe — so a list written before this existed
 keeps working untouched.
 
+An entry can also carry `endpoint6`, `family` and `address6`, which are what
+[IPv6](#ipv6) is configured with. All three are optional and absent means IPv4 as
+before.
+
 **Lower `priority` wins.** Every 10 seconds each uplink is checked: a handshake older
 than `CASCADE_HANDSHAKE_TIMEOUT` fails it outright, otherwise an ICMP probe is sent
 through the tunnel to `CASCADE_PROBE_TARGET` — which is what catches an exit node that
@@ -364,7 +377,8 @@ Three invariants when adding nodes by hand:
   parameters, and an exit node on 1.0 does not read `s3`, `s4` or `i1` at all.
 - an uplink's `address` must be inside that exit node's `AWG_SUBNET`, since the exit
   node's NAT rule is scoped to it. The defaults (`10.77.0.0/24` everywhere, `.2`, `.3`,
-  `.4` … on the entry node) satisfy this.
+  `.4` … on the entry node) satisfy this. The same holds for `address6` and the exit
+  node's `AWG_SUBNET6` on a cascade that carries IPv6.
 
 `saucewg add-node --json` from the exit node's own `install-node` output satisfies all
 three, and `saucewg update-node <name> --protocol …` moves an existing uplink.
@@ -440,6 +454,127 @@ same code. Asking for it by hand also clears whatever the automatic attempts had
 up on, since an operator asking has usually just fixed the reason — as does restarting the
 panel, the count being held in memory, so an update starts a node over. Set
 `NODE_RECOVERY_ENABLED=false` to leave failed nodes alone entirely.
+
+## IPv6
+
+Two different questions, and answering one does not answer the other:
+
+- **Which address is the uplink dialled on?** This is what a censor between the two
+  servers sees, and what the exit node's VPS has to have. An exit node on an IPv6-only
+  VPS can only be reached this way.
+- **Which families travel inside the uplink?** This is what a destination sees. An
+  uplink dialled over IPv4 can carry IPv6 to the exit node and out of it, and an uplink
+  dialled over IPv6 can carry nothing but IPv4.
+
+Both are off on a new installation and both stay off through an update, because turning
+either on changes what the two servers must agree about. Clients are IPv4 in both cases:
+nothing here is visible from a phone.
+
+```
+            dialled over 4 or 6                    inside: 4, or 4 and 6
+ entry node ──────────────────────▶ exit node ───────────────────────────▶ internet
+   awg1       198.51.100.20:51820     10.77.0.1      NAT 10.77.0.0/24
+   10.77.0.2  [2001:db8::20]:51820    fd00:77::1     NAT fd00:77::/64
+   fd00:77::2
+```
+
+### Dialling an exit node over IPv6
+
+Give the node both endpoints and it works out which one to use:
+
+```bash
+saucewg add-node --name eu-nl --public-key '…=' \
+  --endpoint 198.51.100.20:51820 \
+  --endpoint6 '[2001:db8::20]:51820'
+```
+
+`saucewg install-node` on the exit server prints both, so
+`saucewg add-node --json` from its output needs no flags. An IPv6 endpoint must be
+bracketed — `[2001:db8::20]:51820` — since `amneziawg-tools` reads the last `:` group
+as the port; the CLI, the API and the panel all bracket a bare address for you, and
+reject one they cannot parse rather than writing a config that never handshakes.
+
+Which of the two gets dialled follows, in order: the node's own `family` if it has one,
+then `CASCADE_ENDPOINT_FAMILY`, then whichever family the entry node can actually reach
+the exit node's host on. A node with one endpoint has no decision to make.
+
+**An uplink that never handshakes is moved to its other endpoint.** The same
+`CASCADE_FAIL_THRESHOLD` window that fails a node over also counts as evidence that the
+address it is being dialled on does not work from here — a route that disappeared, a
+provider that started dropping one family, an address that was wrong when it was typed.
+The uplink is rebuilt on the other endpoint and the next window judges that one. A node
+pinned to a family with `--family 4` or `--family 6` is never moved: it was told, not
+asked. The flip survives a reload of the node list, so editing an unrelated node does
+not throw away what the container found out, but changing `CASCADE_ENDPOINT_FAMILY`
+overrules it — the operator said something newer.
+
+`saucewg nodes` grows a `VIA` column — and an `IPV6` one — once the cascade has an
+IPv6 half, and lists exactly as it always did while it does not:
+
+```
+PRIO  NAME   IFACE  STATUS   HANDSHAKE  VIA    IPV6  ENDPOINT
+10    eu-nl  awg1   active   4s ago     IPv6   up    [2001:db8::20]:51820
+20    eu-de  awg2   standby  7s ago     IPv4   down  203.0.113.31:51820
+30    pl-01  awg3   standby  6s ago     IPv4   -     192.0.2.9:51820
+```
+
+`saucewg bridge` prints the same thing with the configured prefixes above it.
+
+### Carrying IPv6 through the cascade
+
+The bridge is the link between the entry node and its exit nodes — `10.77.0.0/24` by
+default. Adding `CASCADE_UPLINK_SUBNET6` gives it a second half, and every uplink a
+second address on it:
+
+```bash
+saucewg bridge on                       # fd00:77::/64, the default
+saucewg bridge fd00:aa::/64             # or your own prefix
+saucewg bridge                          # what it is now
+saucewg bridge off                      # back to IPv4 only
+```
+
+A ULA by default, because the bridge is not meant to be reachable from outside; what
+makes it useful is the exit node's own IPv6, which it NATs onto. `saucewg bridge on`
+prints what to run on each exit server, which is the half that cannot be done from
+here:
+
+```bash
+# on each exit node
+saucewg install-node --subnet6 fd00:77::/64 --reinstall
+```
+
+The exit node then brings its interface up on both families, masquerades
+`fd00:77::/64` out of its WAN, clamps MSS for both, and — only then — enables IPv6
+forwarding. An exit server with no IPv6 route of its own says so in its log and stays
+IPv4: NAT66 with nowhere to go would be a black hole rather than an error.
+
+Uplink addresses are numbered to match their IPv4 ones, so `10.77.0.5/32` pairs with
+`fd00:77::5/128` and one uplink reads as one link. That arithmetic is only done for a
+prefix ending in `::`; anything else and the container asks for an explicit `address6`
+rather than guessing where the host bits start. A node on a VPS with no IPv6 can sit
+the bridge out with `--address6 none` while the rest of the cascade carries both.
+
+**IPv6 health is reported, never acted on.** Each uplink with an address on the bridge
+is probed at `CASCADE_PROBE_TARGET6` alongside the IPv4 probe, and the result is
+published as `healthy6` and `latency6_ms` — on the Exit nodes page, in `saucewg nodes`,
+in `GET /api/nodes`. It does not fail a node over. Clients are IPv4, so moving them off
+a node that carries their traffic perfectly well, to fix a family none of them use,
+would be a net loss. When clients get IPv6 this becomes a failover input; until then it
+is a signal that an exit node's provider has broken something.
+
+### Installing an exit node on an IPv6-only VPS
+
+`POST /api/nodes` and `saucewg install-node` both take an IPv6 `host`, so a VPS with no
+IPv4 at all can be provisioned normally — SSH, install, pair, join. The panel needs
+IPv6 of its own to reach it, which is the one prerequisite that cannot be worked around
+from this side: without it the install fails at the first SSH connection and says so.
+
+### What stays IPv4
+
+Clients. `awg0` has no IPv6 address, the entry node installs no `ip -6 rule` for client
+traffic, and client profiles carry an IPv4 `Address` and `AllowedIPs = 0.0.0.0/0`. The
+bridge is deliberately built first and separately: it is the part that needs both ends
+of a tunnel to agree, and getting it wrong breaks an uplink rather than a phone.
 
 ## Routing past the cascade
 
@@ -754,9 +889,9 @@ It needs no secrets.
 ### From your machine
 
 ```bash
-export IMAGE_AWG=yourname/saucewg-awg:1.3.0
-export IMAGE_PANEL=yourname/saucewg-panel:1.3.0
-export IMAGE_WEB=yourname/saucewg-web:1.3.0
+export IMAGE_AWG=yourname/saucewg-awg:1.4.0
+export IMAGE_PANEL=yourname/saucewg-panel:1.4.0
+export IMAGE_WEB=yourname/saucewg-web:1.4.0
 
 make build
 make push
@@ -790,8 +925,10 @@ workflow does.
   position 1 whenever a path appears, so a rule placed there would be jumped over the
   moment an exit node was added. `mangle/FORWARD` is traversed before `filter` in its
   entirety, which makes the ordering a property of the kernel rather than of who wrote
-  a rule last. It is IPv4-only because only IPv4 is carried: the tunnel interfaces come
-  up with `ip -4 address` and have no IPv6 address to forward from.
+  a rule last. It is IPv4-only because client traffic is: the entry node installs no
+  `ip -6 rule` for `awg0`, so no packet a client sends can reach the IPv6 bridge even
+  when the cascade has one. Giving clients IPv6 means giving the guard an `ip6tables`
+  half in the same change.
 - **Performance.** Both hops run the userspace `amneziawg-go`, which is CPU-bound. On a
   2-core VPS expect tens of Mbit/s per node. Installing the AmneziaWG kernel module on the
   host and pointing `WG_QUICK_USERSPACE_IMPLEMENTATION` at it is the usual next step if you
@@ -799,6 +936,10 @@ workflow does.
 - **Ports.** The entry node defaults to UDP/443, which blends in with QUIC and survives
   networks that only allow well-known ports. The exit node uses UDP/51820 since only the
   entry node dials it.
+- **IPv6.** Off until asked for, and two independent switches when asked: an exit node
+  can be *dialled* over IPv6 without the cascade carrying IPv6, and the cascade can
+  carry IPv6 over uplinks dialled on IPv4. Neither reaches clients, who stay IPv4.
+  See [IPv6](#ipv6).
 
 ## Layout
 

@@ -313,14 +313,28 @@ GET /api/nodes
   "updated_at": "2026-08-14T14:31:02Z",
   "config_error": null,
   "provisioning": true,
+  "bridge": {
+    "subnet": "10.77.0.0/24",
+    "subnet6": null,
+    "family": "auto",
+    "probe_target": "1.1.1.1",
+    "probe_target6": "2606:4700:4700::1111"
+  },
   "nodes": [
     {
       "name": "eu-primary",
       "iface": "awg1",
       "address": "10.77.0.2/32",
+      "address6": null,
       "priority": 10,
       "endpoint": "72.56.92.184:51820",
+      "endpoint4": "72.56.92.184:51820",
+      "endpoint6": null,
+      "endpoint_family": 4,
+      "family": null,
       "exit_ip": "72.56.92.184",
+      "healthy6": false,
+      "latency6_ms": null,
       "public_key": "Lkug…=",
       "peer_public_key": "ASPc…=",
       "paired": true,
@@ -357,6 +371,14 @@ GET /api/nodes
 | `public_key` | the **entry node's** key for this uplink — this is what you install on the exit node |
 | `peer_public_key` | the exit node's key |
 | `latency_ms` | round trip through the tunnel to `CASCADE_PROBE_TARGET` |
+| `endpoint` | the address the tunnel to this node is **actually** open on, whichever family that is |
+| `endpoint4` / `endpoint6` | both addresses this node is known at. One of them equals `endpoint`; the other is what the container moves to if this one stops answering |
+| `endpoint_family` | `4` or `6` — which of the two `endpoint` is. `null` from a node container older than this field, which means 4 |
+| `family` | what the *list* asked for: `"4"` or `"6"` pins this node to one endpoint, `null` lets the cascade decide |
+| `address6` | this uplink's address on the IPv6 half of the bridge. `null` when the cascade has no IPv6 half, or `"none"` in the list when this node sits it out |
+| `healthy6` | the exit node reaches the IPv6 internet through the bridge. **Reported, not acted on** — see [§6 IPv6](#ipv6-through-the-cascade) |
+| `latency6_ms` | round trip to `CASCADE_PROBE_TARGET6`, or `null` |
+| `bridge` | the link between the entry node and its exit nodes, not the endpoints it is dialled over. `subnet6: null` is an IPv4-only cascade, which is the default |
 | `fallback` | what happens if every uplink dies: `direct` carries client traffic through the entry node, `block` drops it |
 | `fallback_active` | **check this too.** `true` means that is happening now: with `direct`, users are online but leaving from the entry node's address; with `block`, they are cut off |
 | `killswitch` | the same thing for clients written before there were two modes; exactly `fallback == "block"` |
@@ -622,6 +644,9 @@ the panel writing to it too. The file is a JSON array; each object accepts:
   "public_key": "…=",           // the exit node's public key
   "preshared_key": "…=",        // optional
   "address": "10.77.0.4/32",    // must be inside the exit node's AWG_SUBNET
+  "endpoint6": "[2001:db8::9]:51820",  // optional; bracketed
+  "family": "6",                // optional; pins which endpoint is dialled
+  "address6": "fd00:77::4/128", // optional; inside the exit node's AWG_SUBNET6
   "priority": 30,               // lower wins
   "mtu": 1380,
   "keepalive": 25,
@@ -645,6 +670,82 @@ variable, which takes precedence over the file.
   (`10.77.0.0/24`) so it works in any slot.
 * Names are the identity for key storage. Renaming a node in the list generates a new
   key pair and breaks its pairing until you reinstall the key.
+
+### Exit nodes over IPv6
+
+An exit node can be given two endpoints, and one of them can be the only one it has:
+
+```http
+POST /api/nodes/adopt
+{
+  "name": "eu-fr",
+  "endpoint": "203.0.113.9:51820",
+  "endpoint6": "[2001:db8::9]:51820",
+  "public_key": "…="
+}
+```
+
+Either endpoint alone is enough; a body with neither is a `422`. An IPv6 address is
+accepted bracketed or bare and is stored bracketed, because `amneziawg-tools` reads
+the last `:` group of an unbracketed endpoint as the port. Typing an IPv6 address into
+the plain `endpoint` field works too — it is recognised and moved to `endpoint6`
+rather than silently written into a config that could never handshake. The same three
+fields are accepted by `PUT /api/nodes/{name}`, and `family` by both:
+
+| `family` | Effect |
+| --- | --- |
+| absent / `"auto"` | the cascade decides, and may move the uplink between the two endpoints |
+| `"4"` / `"6"` | pinned: this node is only ever dialled over that family |
+
+**The cascade may move an uplink to its other endpoint.** When a tunnel goes a whole
+`CASCADE_FAIL_THRESHOLD` window without a handshake, the address it is being dialled
+on is treated as not working from here and the uplink is rebuilt on the other one.
+This is why `endpoint` is documented as "the address it is actually open on": read
+`endpoint_family` if you need to know which, rather than assuming the first one you
+sent. A node with `family` set is never moved, and neither is one with a single
+endpoint.
+
+Which is also why an endpoint can be taken away — `{"endpoint6": "none"}` — rather than
+only replaced. An address that has stopped working is somewhere the uplink will keep
+being rebuilt onto; removing it is how that stops. Removing the last one is a `422`,
+since a node with no address is one the cascade can only report as permanently down.
+
+`POST /api/nodes` — the SSH install — takes an IPv6 address as `host`, so an
+IPv6-only VPS is provisioned exactly like any other. The panel needs IPv6 of its own
+to reach it; without that the task fails at the first SSH connection and says so in
+its log.
+
+### IPv6 through the cascade
+
+Separately from how a tunnel is dialled, the bridge inside it can carry IPv6:
+
+```json
+"bridge": {
+  "subnet": "10.77.0.0/24",
+  "subnet6": "fd00:77::/64",
+  "family": "auto",
+  "probe_target": "1.1.1.1",
+  "probe_target6": "2606:4700:4700::1111"
+}
+```
+
+`subnet6` is `null` on a default installation and on every installation updated into
+this version; it is turned on with `CASCADE_UPLINK_SUBNET6` on the entry node and
+`AWG_SUBNET6` on each exit node, which must agree. From a shell that is
+`saucewg bridge on` and `saucewg install-node --subnet6 … --reinstall`. Each uplink
+then gets an `address6` on it and the exit node NATs that prefix out of its own IPv6.
+
+The reason to care, as an integrator: **`healthy6` is reported and never acted on.**
+An exit node whose IPv6 has broken keeps `healthy: true`, stays active and carries
+client traffic. Clients are IPv4, so failing them over would cost them a working
+tunnel to fix a family none of them use. If you are monitoring a fleet, `healthy6`
+false with `healthy` true is a real problem at that node's provider that nothing in
+SauceWG will resolve on its own — and it is deliberately not an outage.
+
+Clients are unaffected by any of this. `awg0` has no IPv6 address, profiles carry
+`AllowedIPs = 0.0.0.0/0`, and no packet a client sends can reach the IPv6 bridge.
+A node container older than this version publishes no `bridge` key at all, which reads
+as an IPv4-only cascade rather than an error.
 
 ---
 
@@ -975,7 +1076,7 @@ Host metrics, client totals, live throughput, and the cascade summary:
 
 ```json
 {
-  "panel_title": "SauceWG", "version": "1.3.0",
+  "panel_title": "SauceWG", "version": "1.4.0",
   "cpu_percent": 3.4, "cpu_cores": 2,
   "mem_total": 2084986880, "mem_used": 903168000,
   "disk_total": 41660260352, "disk_used": 9331159040,
@@ -993,6 +1094,8 @@ Host metrics, client totals, live throughput, and the cascade summary:
     "rx_bytes": 3092, "tx_bytes": 87289,
     "node": "eu-primary", "stalled": false, "mode": "auto",
     "nodes_total": 2, "nodes_healthy": 2,
+    "endpoint_family": 4, "healthy6": false, "nodes_healthy6": 0,
+    "bridge_subnet6": null, "bridge_family": "auto",
     "fallback": "direct", "fallback_active": false,
     "direct_routes": 3,
     "bypass_active": false, "bypass_routes": 0
@@ -1008,6 +1111,12 @@ without failover moving anyone off it. `direct_routes` counts the prefixes of §
 actually installed as routes. `bypass_active` and `bypass_routes` are the same for §8 —
 both zero on a healthy cascade in the default mode, which is the intended state rather
 than a fault.
+
+`endpoint_family` is which family the active uplink is dialled over, `4` or `6`.
+`bridge_subnet6` is `null` unless the cascade carries IPv6 to its exit nodes, and
+`healthy6`/`nodes_healthy6` are then whether it reaches the IPv6 internet and how many
+nodes do. None of the three affects `connected`: an exit node with broken IPv6 is still
+carrying clients, who are IPv4 — see [§6](#ipv6-through-the-cascade).
 
 `node_ready` is `false` while the node container is still starting; config rendering
 fails with `503` until it flips. `total_up`/`total_down` are lifetime sums across all
@@ -1157,6 +1266,9 @@ Values the central system may need to know about, set in the entry node's `.env`
 | `CASCADE_FALLBACK` | `direct` | during a total uplink outage: `direct` carries users through the entry node, `block` cuts them off |
 | `CASCADE_KILLSWITCH` | — | the previous name for the same choice; read only when `CASCADE_FALLBACK` is unset, where `true` means `block` |
 | `CASCADE_DIRECT_ROUTES` | — | a JSON array of prefixes to route past the cascade, overriding the file and making §7 read-only |
+| `CASCADE_UPLINK_SUBNET6` | — | the IPv6 half of the bridge to the exit nodes, e.g. `fd00:77::/64`. Empty is an IPv4-only cascade, and each exit node's `AWG_SUBNET6` must match |
+| `CASCADE_ENDPOINT_FAMILY` | `auto` | which family exit nodes are dialled over when they publish both: `auto`, `4` or `6`. A node's own `family` overrides it |
+| `CASCADE_PROBE_TARGET6` | `2606:4700:4700::1111` | what `healthy6` is measured against, through the tunnel |
 | `BYPASS_MODE` | `auto` | when the reopened destinations of §8 are actually reopened: `auto`, `always`, `off` |
 | `BYPASS_GROUPS` | `telegram` | built-in destination tables in force; empty ships none |
 | `BYPASS_ROUTES` | — | prefixes to reopen, overriding the file and making §8 read-only |
@@ -1189,6 +1301,15 @@ Values the central system may need to know about, set in the entry node's `.env`
   address until an exit node recovers. Read `fallback_active`, not just `active`.
 * **A direct route is a destination, not a client setting.** It applies to every client
   on the node, needs nothing on their side, and is invisible in their profile.
+* **`endpoint` is not necessarily the endpoint you sent.** A node with both an IPv4 and
+  an IPv6 endpoint is dialled on one of them, and is moved to the other if that one
+  stops handshaking. Read `endpoint_family` rather than inferring it.
+* **`healthy6: false` is not an outage.** An exit node that cannot reach the IPv6
+  internet keeps carrying clients, who are IPv4. It is worth an alert to you and
+  deliberately not a failover to SauceWG.
+* **IPv6 is two switches, not one.** Dialling an exit node over IPv6 and carrying IPv6
+  through the cascade are independent: either without the other is a valid, working
+  configuration.
 * **A reopened destination reading `active: false` is usually correct.** In the default
   `auto` mode the redirect exists only while clients are leaving through the entry node.
   Alert on `config_error`, never on `active`.

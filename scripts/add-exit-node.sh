@@ -16,19 +16,27 @@ cd "$(dirname "$0")/.."
 
 LIST_FILE=${LIST_FILE:-config/exit-nodes.json}
 UPLINK_SUBNET=${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
+# Empty when the bridge carries IPv4 only, which is the default.
+UPLINK_SUBNET6=${CASCADE_UPLINK_SUBNET6:-}
 RELOAD=true
 ACTION=add
-NAME="" ENDPOINT="" PUBLIC_KEY="" PSK="" PRIORITY="" ADDRESS="" JSON=""
+NAME="" ENDPOINT="" ENDPOINT6="" FAMILY="" PUBLIC_KEY="" PSK="" PRIORITY=""
+ADDRESS="" ADDRESS6="" JSON=""
 S1="" S2="" H1="" H2="" H3="" H4="" JC="" JMIN="" JMAX=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --name) NAME=$2; shift 2 ;;
         --endpoint) ENDPOINT=$2; shift 2 ;;
+        # The same node's IPv6 endpoint, bracketed: [2001:db8::20]:51820. The entry
+        # node decides which of the two to dial and moves between them on its own.
+        --endpoint6) ENDPOINT6=$2; shift 2 ;;
+        --family) FAMILY=$2; shift 2 ;;
         --public-key) PUBLIC_KEY=$2; shift 2 ;;
         --psk) PSK=$2; shift 2 ;;
         --priority) PRIORITY=$2; shift 2 ;;
         --address) ADDRESS=$2; shift 2 ;;
+        --address6) ADDRESS6=$2; shift 2 ;;
         --s1) S1=$2; shift 2 ;;
         --s2) S2=$2; shift 2 ;;
         --h1) H1=$2; shift 2 ;;
@@ -56,8 +64,8 @@ jq -e 'type == "array"' "$LIST_FILE" >/dev/null 2>&1 \
     || { echo "$LIST_FILE is not a JSON array" >&2; exit 1; }
 
 if [ "$ACTION" = "list" ]; then
-    jq -r '.[] | "\(.priority // 100)\t\(.name)\t\(.endpoint // "-")"' "$LIST_FILE" \
-        | sort -n | awk 'BEGIN { print "PRIO\tNAME\tENDPOINT" } { print }'
+    jq -r '.[] | "\(.priority // 100)\t\(.name)\t\(.endpoint // "-")\t\(.endpoint6 // "-")"' "$LIST_FILE" \
+        | sort -n | awk 'BEGIN { print "PRIO\tNAME\tENDPOINT\tENDPOINT6" } { print }'
     exit 0
 fi
 
@@ -96,14 +104,19 @@ if [ -n "$JSON" ]; then
     NAME=$(printf '%s' "$NODE" | jq -r '.name // ""')
 else
     [ -n "$NAME" ] || { echo "--name is required" >&2; exit 1; }
-    [ -n "$ENDPOINT" ] || { echo "--endpoint is required (host:port)" >&2; exit 1; }
+    [ -n "$ENDPOINT" ] || [ -n "$ENDPOINT6" ] \
+        || { echo "--endpoint or --endpoint6 is required (host:port)" >&2; exit 1; }
     [ -n "$PUBLIC_KEY" ] || { echo "--public-key is required" >&2; exit 1; }
     NODE=$(jq -n \
-        --arg name "$NAME" --arg endpoint "$ENDPOINT" --arg key "$PUBLIC_KEY" --arg psk "$PSK" \
+        --arg name "$NAME" --arg endpoint "$ENDPOINT" --arg endpoint6 "$ENDPOINT6" \
+        --arg family "$FAMILY" --arg key "$PUBLIC_KEY" --arg psk "$PSK" \
         --arg s1 "$S1" --arg s2 "$S2" --arg h1 "$H1" --arg h2 "$H2" --arg h3 "$H3" --arg h4 "$H4" \
         --arg jc "$JC" --arg jmin "$JMIN" --arg jmax "$JMAX" '
         def num: if . == "" then null else tonumber end;
-        {name: $name, endpoint: $endpoint, public_key: $key}
+        {name: $name, public_key: $key}
+        + (if $endpoint  == "" then {} else {endpoint: $endpoint} end)
+        + (if $endpoint6 == "" then {} else {endpoint6: $endpoint6} end)
+        + (if $family    == "" then {} else {family: $family} end)
         + (if $psk  == "" then {} else {preshared_key: $psk} end)
         + (if $s1   == "" then {} else {s1: ($s1 | num)} end)
         + (if $s2   == "" then {} else {s2: ($s2 | num)} end)
@@ -135,6 +148,28 @@ if [ -z "$ADDRESS" ] && ! printf '%s' "$NODE" | jq -e 'has("address")' >/dev/nul
     [ -n "$ADDRESS" ] || { echo "no free address left in $UPLINK_SUBNET" >&2; exit 1; }
 fi
 
+# The same for the IPv6 half, numbered in step with the IPv4 one so that one uplink
+# reads as one link: 10.77.0.4/32 beside fd00:77::4/128. Only when the prefix is
+# written so a host number can be appended to it — getting IPv6 arithmetic wrong in
+# shell would hand two uplinks one address.
+if [ -n "$UPLINK_SUBNET6" ] && [ -z "$ADDRESS6" ] \
+    && ! printf '%s' "$NODE" | jq -e 'has("address6")' >/dev/null; then
+    case ${UPLINK_SUBNET6%%/*} in
+        *::)
+            N=${ADDRESS%%/*}
+            N=${N##*.}
+            case $N in
+                ''|*[!0-9]*) ;;
+                *) ADDRESS6=$(printf '%s%x/128' "${UPLINK_SUBNET6%%/*}" "$N") ;;
+            esac
+            ;;
+        *)
+            echo "CASCADE_UPLINK_SUBNET6=$UPLINK_SUBNET6 cannot have host numbers appended to it;" >&2
+            echo "pass --address6 to put $NAME on the IPv6 bridge" >&2
+            ;;
+    esac
+fi
+
 if [ -z "$PRIORITY" ] && ! printf '%s' "$NODE" | jq -e 'has("priority")' >/dev/null; then
     # Append below every existing node so the current exit keeps carrying traffic.
     PRIORITY=$(jq '[.[] | .priority // 100] | (max // 0) + 10' "$LIST_FILE")
@@ -142,14 +177,21 @@ fi
 
 jq --argjson node "$NODE" \
    --arg address "$ADDRESS" \
+   --arg address6 "$ADDRESS6" \
    --arg priority "$PRIORITY" '
     . + [$node
          + (if $address  == "" then {} else {address: $address} end)
+         + (if $address6 == "" then {} else {address6: $address6} end)
          + (if $priority == "" then {} else {priority: ($priority | tonumber)} end)]
     ' "$LIST_FILE" > "${LIST_FILE}.tmp"
 mv "${LIST_FILE}.tmp" "$LIST_FILE"
 chmod 600 "$LIST_FILE"
 
 echo "added $NAME to $LIST_FILE"
-jq -r --arg n "$NAME" '.[] | select(.name == $n) | "  address  \(.address)\n  priority \(.priority)\n  endpoint \(.endpoint)"' "$LIST_FILE"
+jq -r --arg n "$NAME" '.[] | select(.name == $n)
+    | "  address   \(.address)",
+      (if .address6 then "  address6  \(.address6)" else empty end),
+      "  priority  \(.priority)",
+      "  endpoint  \(.endpoint // "-")",
+      (if .endpoint6 then "  endpoint6 \(.endpoint6)" else empty end)' "$LIST_FILE"
 reload

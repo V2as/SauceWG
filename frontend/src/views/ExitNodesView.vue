@@ -36,6 +36,28 @@ const logs = ref('')
 const healthy = computed(() => state.value?.nodes.filter((n) => n.healthy).length ?? 0)
 const taskRunning = computed(() => task.value !== null && !['succeeded', 'failed'].includes(task.value.status))
 
+// Whether the link to the exit nodes carries IPv6 as well as IPv4. Everything about
+// IPv6 stays out of the UI until it does, because on an IPv4-only cascade — which is
+// the default — there is nothing to say about it.
+const bridgeV6 = computed(() => state.value?.bridge?.subnet6 ?? null)
+// How many exit nodes reach the IPv6 internet, out of the ones meant to.
+const onBridgeV6 = computed(
+  () => state.value?.nodes.filter((n) => n.address6 !== null).length ?? 0,
+)
+const healthyV6 = computed(() => state.value?.nodes.filter((n) => n.healthy6).length ?? 0)
+
+/** "IPv4" or "IPv6", or a dash from a node container that does not report it. */
+function familyLabel(node: ExitNode): string {
+  return node.endpoint_family ? `IPv${node.endpoint_family}` : '—'
+}
+
+/** What this node's IPv6 half of the bridge is doing, in a few words. */
+function bridgeState(node: ExitNode): string {
+  if (!node.address6) return 'IPv4 only'
+  if (!node.healthy6) return 'IPv6 down'
+  return node.latency6_ms ? `IPv6 ${Math.round(node.latency6_ms)} ms` : 'IPv6 up'
+}
+
 // The generations an exit node can serve, newest first. 2.0 is the default for a new
 // install; 1.0 is what an older Keenetic on the client side needs.
 const PROTOCOLS = ['2.0', '1.5', '1.0']
@@ -52,12 +74,16 @@ const blank = {
   preshared_key: '',
   protocol: '2.0',
   signature: 'quic',
+  // Whether this node carries IPv6 for the cascade. Follows the entry node's own
+  // bridge by default, which is what the two ends have to agree on; unchecking it
+  // installs an IPv4-only node into a cascade that otherwise carries both.
+  bridge6: true,
   note: '',
 }
 const form = ref({ ...blank })
 const removeForm = ref({ uninstall: false, ssh_password: '' })
 const repairForm = ref({ ssh_password: '' })
-const editForm = ref({ priority: 0, note: '' })
+const editForm = ref({ priority: 0, note: '', endpoint: '', endpoint6: '', family: 'auto' })
 const protocolForm = ref({ protocol: '2.0', signature: 'quic', ssh_password: '' })
 
 async function refresh() {
@@ -167,6 +193,9 @@ async function submitAdd() {
       // I1 exists on 1.5 and 2.0 only; sending it for 1.0 would be ignored anyway,
       // but leaving it out keeps the request honest about what was asked for.
       signature: form.value.protocol === '1.0' ? null : form.value.signature,
+      // 'none' keeps this node off an IPv6 bridge the rest of the cascade has. On an
+      // IPv4-only cascade the field means nothing either way, so it is not sent.
+      address6: bridgeV6.value && !form.value.bridge6 ? 'none' : null,
       note: form.value.note || null,
     })
     // The password only ever existed in this form; drop it as soon as it is sent.
@@ -237,17 +266,37 @@ async function submitRepair() {
 }
 
 function openEdit(node: ExitNode) {
-  editForm.value = { priority: node.priority, note: '' }
+  editForm.value = {
+    priority: node.priority,
+    note: '',
+    endpoint: node.endpoint4 ?? '',
+    endpoint6: node.endpoint6 ?? '',
+    family: node.family ?? 'auto',
+  }
   editing.value = node
 }
 
 async function submitEdit() {
   if (!editing.value) return
   const name = editing.value.name
+  const before = editing.value
   try {
     state.value = await api.updateNode(name, {
       priority: editForm.value.priority,
       note: editForm.value.note || null,
+      // Only sent when actually changed: each of these rebuilds the uplink, so a
+      // priority edit must not interrupt a tunnel by resending the endpoint it
+      // already has. An emptied field is 'none', which removes it — the panel
+      // refuses to remove the last one.
+      ...(editForm.value.endpoint !== (before.endpoint4 ?? '')
+        ? { endpoint: editForm.value.endpoint.trim() || 'none' }
+        : {}),
+      ...(editForm.value.endpoint6 !== (before.endpoint6 ?? '')
+        ? { endpoint6: editForm.value.endpoint6.trim() || 'none' }
+        : {}),
+      ...(editForm.value.family !== (before.family ?? 'auto')
+        ? { family: editForm.value.family }
+        : {}),
     })
     notify(`${name} updated`, 'success')
     editing.value = null
@@ -552,6 +601,9 @@ onUnmounted(() => {
           <div class="stat-label">Healthy nodes</div>
           <div class="stat-value">{{ healthy }} / {{ state.nodes.length }}</div>
           <div class="stat-sub">failover targets available</div>
+          <div v-if="bridgeV6" class="stat-sub" :title="bridgeV6">
+            {{ healthyV6 }} / {{ onBridgeV6 }} also reach IPv6
+          </div>
         </div>
 
         <div class="card">
@@ -589,6 +641,7 @@ onUnmounted(() => {
               <th class="plain">Protocol</th>
               <th class="plain">Priority</th>
               <th class="plain">Exit endpoint</th>
+              <th v-if="bridgeV6" class="plain">IPv6 bridge</th>
               <th class="plain">Interface</th>
               <th class="plain">Latency</th>
               <th class="plain">Handshake</th>
@@ -621,7 +674,19 @@ onUnmounted(() => {
               </td>
               <td class="mono">{{ node.protocol ?? '1.0' }}</td>
               <td class="mono">{{ node.priority }}</td>
-              <td class="mono">{{ node.endpoint ?? '—' }}</td>
+              <td class="mono">
+                {{ node.endpoint ?? '—' }}
+                <!-- Which of the node's two endpoints this is, shown only once there
+                     is another one it could have been. -->
+                <div v-if="node.endpoint4 && node.endpoint6" class="stat-sub">
+                  over {{ familyLabel(node) }}
+                </div>
+              </td>
+              <td v-if="bridgeV6" class="mono"
+                  :style="node.address6 && !node.healthy6 ? 'color: var(--danger)' : ''"
+                  :title="node.address6 ?? 'not on the IPv6 bridge'">
+                {{ bridgeState(node) }}
+              </td>
               <td class="mono">{{ node.iface }}</td>
               <td class="mono">{{ node.latency_ms != null ? `${node.latency_ms.toFixed(1)} ms` : '—' }}</td>
               <td :title="dateTime(node.last_handshake_at)"
@@ -756,7 +821,11 @@ onUnmounted(() => {
         <div class="field">
           <label>Server address</label>
           <input v-model="form.host" type="text" placeholder="198.51.100.20" />
-          <span class="hint">IP or hostname of the exit server</span>
+          <span class="hint">
+            IP or hostname of the exit server. An IPv6 address works here too, and an
+            IPv6-only VPS is installed over IPv6 — this panel needs IPv6 of its own to
+            reach it.
+          </span>
         </div>
       </div>
 
@@ -857,6 +926,20 @@ onUnmounted(() => {
         <span class="hint">
           Adds post-quantum resistance to this uplink. Generate one with
           <span class="mono">docker run --rm --entrypoint awg saucewg/awg genpsk</span>
+        </span>
+      </div>
+
+      <div v-if="bridgeV6" class="field">
+        <label class="switch">
+          <input v-model="form.bridge6" type="checkbox" />
+          <span>Carry IPv6 over this uplink</span>
+        </label>
+        <span class="hint">
+          This cascade's link to its exit nodes carries IPv6 as well as IPv4
+          (<span class="mono">{{ bridgeV6 }}</span>), so this node is given an address
+          on it and will NAT IPv6 out of the exit server. Uncheck it for a VPS with no
+          IPv6 of its own — the node then carries IPv4 only and the cascade is
+          unaffected.
         </span>
       </div>
 
@@ -1183,6 +1266,30 @@ onUnmounted(() => {
       <input v-model.number="editForm.priority" type="number" min="0" />
       <span class="hint">
         Lower wins. Changing it only moves the route — the tunnel is never rebuilt.
+      </span>
+    </div>
+    <div class="grid grid-2">
+      <div class="field">
+        <label>IPv4 endpoint</label>
+        <input v-model="editForm.endpoint" type="text" placeholder="198.51.100.20:51820" />
+      </div>
+      <div class="field">
+        <label>IPv6 endpoint</label>
+        <input v-model="editForm.endpoint6" type="text" placeholder="[2001:db8::20]:51820" />
+      </div>
+    </div>
+    <div class="field">
+      <label>Dial over</label>
+      <select v-model="editForm.family">
+        <option value="auto">Whichever answers</option>
+        <option value="4">IPv4 only</option>
+        <option value="6">IPv6 only</option>
+      </select>
+      <span class="hint">
+        Which address the tunnel to this node is opened on — not what travels inside
+        it. On <span class="mono">auto</span> the node container tries the cascade's
+        preferred family and moves to the other one if no handshake arrives. Changing
+        any of the three rebuilds the tunnel, so leave them alone to edit a priority.
       </span>
     </div>
     <div class="field">

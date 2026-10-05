@@ -735,6 +735,15 @@ this version; it is turned on with `CASCADE_UPLINK_SUBNET6` on the entry node an
 `saucewg bridge on` and `saucewg install-node --subnet6 … --reinstall`. Each uplink
 then gets an `address6` on it and the exit node NATs that prefix out of its own IPv6.
 
+`healthy6` is measured per uplink by sending to `probe_target6` from that uplink's own
+bridge address, so every exit node is asked about its own IPv6 rather than only the
+active one. That needs a route out of each uplink, which the entry node keeps in a
+table of its own that nothing but the bridge's prefix is routed to. IPv4 needs no
+equivalent — the kernel lets a device-bound send leave a point-to-point interface with
+no route at all, and IPv6 refuses it, which is why a bridge configured correctly at both
+ends can still report every node `healthy6: false` on an entry node that has not been
+updated to a version with that route.
+
 The reason to care, as an integrator: **`healthy6` is reported and never acted on.**
 An exit node whose IPv6 has broken keeps `healthy: true`, stays active and carries
 client traffic. Clients are IPv4, so failing them over would cost them a working

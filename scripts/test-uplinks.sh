@@ -72,7 +72,7 @@ FAKE_DEFAULT6=""
 FAKE_GLOBAL6="2001:db8:ffff::1/128"
 
 ip() {
-    local args=() x table=main i family=4
+    local args=() x table=main i family=4 metric=""
     for x in "$@"; do
         case $x in
             -4) family=4 ;;
@@ -82,6 +82,9 @@ ip() {
     done
     for ((i = 0; i < ${#args[@]}; i++)); do
         [ "${args[$i]}" = table ] && table=${args[$((i + 1))]}
+        # Two routes to the same destination coexist when their metrics differ,
+        # which is how every uplink holds a way out of the bridge at once.
+        [ "${args[$i]}" = metric ] && metric=${args[$((i + 1))]}
     done
 
     case "${args[0]:-}" in
@@ -103,13 +106,16 @@ ip() {
                 replace|add)
                     # "unreachable default" names the type before the destination.
                     [ "$dest" != unreachable ] || dest=${args[3]:-}
-                    display=$(printf '%s' "${args[*]:2}" | sed 's/ table [0-9]*$//')
-                    ip "-${family}" route del "$dest" table "$table" >/dev/null 2>&1
-                    printf '%s\t%s\t%s\t%s\n' "$family" "$table" "$dest" "$display" >> "$ROUTES"
+                    display=$(printf '%s' "${args[*]:2}" | sed 's/ table [0-9]*//')
+                    ip "-${family}" route del "$dest" table "$table" metric "$metric" >/dev/null 2>&1
+                    printf '%s\t%s\t%s\t%s\t%s\n' "$family" "$table" "$dest" "$display" "$metric" >> "$ROUTES"
                     ;;
                 del)
-                    awk -F'\t' -v f="$family" -v t="$table" -v d="$dest" \
-                        '!($1 == f && $2 == t && $3 == d)' "$ROUTES" > "$ROUTES.tmp" || true
+                    # Without a metric this takes every route to the destination,
+                    # which is what the callers that drop a default route mean.
+                    awk -F'\t' -v f="$family" -v t="$table" -v d="$dest" -v m="$metric" \
+                        '!($1 == f && $2 == t && $3 == d && (m == "" || $5 == m))' \
+                        "$ROUTES" > "$ROUTES.tmp" || true
                     mv "$ROUTES.tmp" "$ROUTES"
                     ;;
                 flush)
@@ -132,8 +138,14 @@ ip() {
             case "${args[1]:-}" in
                 add) printf '%s\t%s\n' "$family" "${args[*]:2}" >> "$RULES" ;;
                 del)
-                    awk -F'\t' -v f="$family" -v s="$selector" \
-                        '!($1 == f && index($2, s) == 1)' "$RULES" > "$RULES.tmp" || true
+                    # `del lookup <table>` names no source and takes whatever rule
+                    # points at that table, which is how a rule is removed without
+                    # having to know the prefix it was added for.
+                    local anchored=1
+                    case $selector in "lookup "*) anchored=0 ;; esac
+                    awk -F'\t' -v f="$family" -v s="$selector" -v a="$anchored" \
+                        '!($1 == f && (a ? index($2, s) == 1 : index($2, s) > 0))' \
+                        "$RULES" > "$RULES.tmp" || true
                     mv "$RULES.tmp" "$RULES"
                     ;;
             esac
@@ -510,6 +522,21 @@ direct_table() {
 
 direct_route_of() {
     awk -F'\t' -v t="$CASCADE_DIRECT_TABLE" -v d="$1" '$1 == 4 && $2 == t && $3 == d {print $4}' "$ROUTES"
+}
+
+# Which uplinks the bridge's own IPv6 can leave through, as interface names in
+# slot order. Every uplink with an IPv6 address should be here at once: the health
+# probe asks each exit node about its own IPv6, not just the active one.
+bridge6_exits() {
+    awk -F'\t' -v t="$CASCADE_BRIDGE6_TABLE" \
+        '$1 == 6 && $2 == t && $3 == "default" {print $4}' "$ROUTES" \
+        | sed -n 's/.*dev \([^ ]*\).*/\1/p' | sort | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Whether anything is routed to that table at all.
+bridge6_rule() {
+    awk -F'\t' -v t="$CASCADE_BRIDGE6_TABLE" \
+        '$1 == 6 && index($2, "lookup " t) > 0 {print $2}' "$RULES" | head -n1
 }
 
 # The routing tables client traffic is looked up in, in the order the kernel would
@@ -1527,7 +1554,32 @@ check "and so is the second" "fd00:77::9/128" "$(node_field nine address6)"
 check "which is also what the interface came up on" \
     "10.77.0.9/32 fd00:77::9/128" "$(iface_addrs nine)"
 
-echo "75. tearing the node down leaves no torrent rule behind"
+echo "75. the bridge's own IPv6 can leave through every uplink at once"
+# Asking an exit node whether its IPv6 works means sending from the bridge address
+# out of that particular uplink, so each one needs a way out of its own. IPv4 gets
+# this from the kernel — a device-bound send on a point-to-point interface needs no
+# route — and IPv6 refuses it, which is why the probe reported every node down on a
+# bridge that was configured correctly at both ends.
+nodes "[$(node_both one 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10),
+        $(node_both two 203.0.113.31:51820 '[2001:db8::31]:51820' 3 20),
+        {\"name\":\"v4\",\"endpoint\":\"203.0.113.40:51820\",\"address6\":\"none\",\"public_key\":\"KEY-v4\",\"address\":\"10.77.0.4/32\",\"priority\":30}]"
+uplinks_reload
+uplinks_routing_base
+check "each uplink on the bridge has a way out of its own" \
+    "$(iface_of one) $(iface_of two)" "$(bridge6_exits)"
+check "and only the bridge's own traffic is sent that way" \
+    "from fd00:77::/64 lookup $CASCADE_BRIDGE6_TABLE priority $CASCADE_BRIDGE6_RULE_PRIORITY" \
+    "$(bridge6_rule)"
+# Which uplink clients use is a separate decision, and this must not disturb it.
+uplink_activate 0 force
+check "the active uplink is still what carries clients" "$(iface_of one)" "$(cascade_default)"
+check "and both ways out are still there" \
+    "$(iface_of one) $(iface_of two)" "$(bridge6_exits)"
+uplinks_teardown
+check "tearing down takes them with it" "" "$(bridge6_exits)"
+check "and stops routing anything there" "" "$(bridge6_rule)"
+
+echo "76. tearing the node down leaves no torrent rule behind"
 torrent_switch '{"enabled": true, "mode": "strict"}'
 torrent_reload
 check "the guard is up" "-i awg0" "$(torrent_hook_of "$TORRENT_CHAIN")"

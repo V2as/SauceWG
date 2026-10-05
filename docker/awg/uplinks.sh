@@ -77,6 +77,18 @@ CASCADE_DIRECT_FILE=${CASCADE_DIRECT_FILE:-/etc/amnezia/host/direct-routes.json}
 CASCADE_DIRECT_TABLE=${CASCADE_DIRECT_TABLE:-450}
 CASCADE_DIRECT_RULE_PRIORITY=${CASCADE_DIRECT_RULE_PRIORITY:-450}
 
+# One route per uplink, so that anything sending from a bridge address can reach
+# the internet through that particular exit node. Separate from CASCADE_TABLE
+# because that table holds the one default the active uplink owns, and this holds
+# all of them at once: the health probe has to be able to ask each uplink about
+# its own IPv6 without disturbing which one clients are using.
+#
+# Only traffic sourced from the bridge prefix is sent here, which is the bridge's
+# own traffic and nothing else. IPv4 needs no equivalent: a device-bound send on a
+# point-to-point interface resolves without a route there, and IPv6 refuses it.
+CASCADE_BRIDGE6_TABLE=${CASCADE_BRIDGE6_TABLE:-452}
+CASCADE_BRIDGE6_RULE_PRIORITY=${CASCADE_BRIDGE6_RULE_PRIORITY:-452}
+
 CASCADE_PROBE_ENABLED=${CASCADE_PROBE_ENABLED:-true}
 CASCADE_PROBE_TARGET=${CASCADE_PROBE_TARGET:-1.1.1.1}
 CASCADE_PROBE_INTERVAL=${CASCADE_PROBE_INTERVAL:-10}
@@ -1438,6 +1450,8 @@ uplinks_teardown() {
     ip route flush table "$CASCADE_TABLE" 2>/dev/null || true
     ip route flush table "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
     ip -6 route flush table "$CASCADE_TABLE" 2>/dev/null || true
+    ip -6 rule del lookup "$CASCADE_BRIDGE6_TABLE" 2>/dev/null || true
+    ip -6 route flush table "$CASCADE_BRIDGE6_TABLE" 2>/dev/null || true
     [ -z "$DIRECT_RULES_IFACE" ] || path_rules_del "$DIRECT_RULES_IFACE"
     DIRECT_RULES_IFACE=""
     bypass_rules_del
@@ -1495,6 +1509,31 @@ uplinks_route6_set() {
     esac
 }
 
+# A way out through every uplink at once, which is what asking each exit node
+# about its own IPv6 needs. The metric only separates the routes so that one does
+# not replace another; a send bound to an interface picks the route on it whatever
+# the metric says, and an unbound one has no business here.
+uplinks_bridge6_routes() {
+    local i iface
+    bridge_has_v6 || return 0
+
+    # Removed by the table it points at rather than the prefix it was added for, so
+    # that editing CASCADE_UPLINK_SUBNET6 replaces the rule instead of stacking a
+    # second one beside it.
+    ip -6 rule del lookup "$CASCADE_BRIDGE6_TABLE" 2>/dev/null || true
+    ip -6 rule add from "$CASCADE_UPLINK_SUBNET6" lookup "$CASCADE_BRIDGE6_TABLE" \
+        priority "$CASCADE_BRIDGE6_RULE_PRIORITY" 2>/dev/null || true
+
+    ip -6 route flush table "$CASCADE_BRIDGE6_TABLE" 2>/dev/null || true
+    for i in "${!UP_NAME[@]}"; do
+        iface=${UP_IFACE[$i]}
+        [ -n "$iface" ] || continue
+        [ -n "${UP_ADDR6[$i]:-}" ] || continue
+        ip -6 route replace default dev "$iface" table "$CASCADE_BRIDGE6_TABLE" \
+            metric "$((1024 + i))" 2>/dev/null || true
+    done
+}
+
 # Rules that apply to every uplink. Only the default route inside CASCADE_TABLE
 # decides which one actually carries client traffic.
 uplinks_routing_base() {
@@ -1506,6 +1545,10 @@ uplinks_routing_base() {
     for i in "${!UP_NAME[@]}"; do
         path_rules_add "${UP_IFACE[$i]}"
     done
+
+    # A way out of each uplink for the bridge's own IPv6, which is what lets the
+    # health probe ask every exit node about its IPv6 rather than only the active one.
+    uplinks_bridge6_routes
 
     # Destinations that skip the cascade, plus the NAT the entry node needs to carry
     # traffic itself — for those destinations, or for all of them while

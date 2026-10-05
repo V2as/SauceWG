@@ -505,6 +505,12 @@ was relying on router advertisements for its address, since the kernel stops acc
 them once it is forwarding. If `saucewg bridge` reports IPv4 everywhere on a server you
 believe has IPv6, check `ip -6 addr show scope global` before anything else.
 
+A unique local address does not count, which matters most on an entry node whose bridge
+already carries IPv6: `fd00:77::2` has global scope as far as the kernel is concerned, so
+counting it would let the cascade read its own uplinks as proof it can reach the IPv6
+internet, and dial the next exit node over an address it could only reach through the
+uplink it is building.
+
 **An uplink that never handshakes is moved to its other endpoint.** The same
 `CASCADE_FAIL_THRESHOLD` window that fails a node over also counts as evidence that the
 address it is being dialled on does not work from here — a route that disappeared, a

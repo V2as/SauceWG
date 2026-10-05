@@ -1310,6 +1310,11 @@ Values the central system may need to know about, set in the entry node's `.env`
 * **IPv6 is two switches, not one.** Dialling an exit node over IPv6 and carrying IPv6
   through the cascade are independent: either without the other is a valid, working
   configuration.
+* **"The entry node has IPv6" means a routable address, not a route and not a ULA.**
+  A VPS whose provider advertises a router but allocates nothing has a default route and
+  nothing to send from, and the bridge's own `fd00:77::2` has global scope without being
+  reachable from anywhere. Neither counts, so `endpoint_family` can read `4` on a host
+  that looks IPv6-capable in `ip -6 route`.
 * **A reopened destination reading `active: false` is usually correct.** In the default
   `auto` mode the redirect exists only while clients are leaving through the entry node.
   Alert on `config_error`, never on `active`.

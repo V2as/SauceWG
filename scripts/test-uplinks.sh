@@ -1307,6 +1307,16 @@ uplinks_reload
 uplinks_write_state
 check "a default route with no address of its own is not IPv6 egress" \
     "4 198.51.100.20:51820" "$(dialling routeonly)"
+# The bridge's own address is a ULA, and it has global scope as far as the kernel
+# is concerned. Counting it would let the cascade read its own uplinks as proof it
+# can reach the IPv6 internet, and dial the next exit node over an address only
+# reachable through the uplink being built.
+FAKE_GLOBAL6="fd00:77::2/128"
+nodes "[$(node_both ula 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10)]"
+uplinks_reload
+uplinks_write_state
+check "the bridge's own ULA is not IPv6 egress either" \
+    "4 198.51.100.20:51820" "$(dialling ula)"
 FAKE_GLOBAL6="2001:db8:ffff::1/128"
 
 echo "64. the operator's preference overrides what the host can reach"

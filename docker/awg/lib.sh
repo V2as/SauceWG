@@ -157,9 +157,16 @@ wan_iface6() {
 # answers DHCPv6 with NoAddrsAvail does on its own — has a default route and
 # nothing to send from. Asking only about the route is how every uplink on such a
 # host gets dialled over a family it cannot speak.
+#
+# Unique local addresses do not count, and on an entry node that is the whole
+# point: the bridge's own fd00:77::2 has global scope as far as the kernel is
+# concerned, so counting it would mean the cascade reads its own uplinks as proof
+# that it can reach the IPv6 internet, and then dials the next exit node over an
+# address it can only reach through the uplink it is building.
 has_ipv6_egress() {
     [ -n "$(wan_iface6)" ] || return 1
-    [ -n "$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/ {print $2; exit}')" ]
+    [ -n "$(ip -6 addr show scope global 2>/dev/null |
+        awk '/inet6/ && tolower($2) !~ /^f[cd]/ {print $2; exit}')" ]
 }
 
 # The host's own way to the internet, as the tail of an `ip route` command:

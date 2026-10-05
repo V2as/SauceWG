@@ -498,6 +498,13 @@ Which of the two gets dialled follows, in order: the node's own `family` if it h
 then `CASCADE_ENDPOINT_FAMILY`, then whichever family the entry node can actually reach
 the exit node's host on. A node with one endpoint has no decision to make.
 
+"Can actually reach" means a global IPv6 address *and* a route, not either alone. A VPS
+whose provider advertises a router but allocates no address has a default route and
+nothing to send from — which is also what enabling IPv6 forwarding does to a host that
+was relying on router advertisements for its address, since the kernel stops accepting
+them once it is forwarding. If `saucewg bridge` reports IPv4 everywhere on a server you
+believe has IPv6, check `ip -6 addr show scope global` before anything else.
+
 **An uplink that never handshakes is moved to its other endpoint.** The same
 `CASCADE_FAIL_THRESHOLD` window that fails a node over also counts as evidence that the
 address it is being dialled on does not work from here — a route that disappeared, a

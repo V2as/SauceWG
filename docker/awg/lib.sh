@@ -150,8 +150,16 @@ wan_iface6() {
 # Whether this host can reach the IPv6 internet at all. Dialling an exit node's
 # IPv6 endpoint from a node that has no IPv6 route of its own is a tunnel that
 # can never handshake, so the automatic family choice asks this first.
+#
+# A route is not enough, and the difference is not academic: a VPS whose provider
+# advertises a router but allocates no address — which is what enabling IPv6
+# forwarding does to a host relying on autoconfiguration, and what a provider that
+# answers DHCPv6 with NoAddrsAvail does on its own — has a default route and
+# nothing to send from. Asking only about the route is how every uplink on such a
+# host gets dialled over a family it cannot speak.
 has_ipv6_egress() {
-    [ -n "$(wan_iface6)" ]
+    [ -n "$(wan_iface6)" ] || return 1
+    [ -n "$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/ {print $2; exit}')" ]
 }
 
 # The host's own way to the internet, as the tail of an `ip route` command:

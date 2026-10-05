@@ -65,6 +65,11 @@ mkdir -p "$SETS"
 # what decides the automatic endpoint family.
 FAKE_DEFAULT="default via 192.0.2.1 dev eth0"
 FAKE_DEFAULT6=""
+# This host's own global IPv6 address, separately from the route to use it with. A
+# VPS can have the second and not the first — a provider that advertises a router
+# but allocates no address — and that combination is not IPv6 egress however much
+# it looks like it.
+FAKE_GLOBAL6="2001:db8:ffff::1/128"
 
 ip() {
     local args=() x table=main i family=4
@@ -113,6 +118,13 @@ ip() {
                     mv "$ROUTES.tmp" "$ROUTES"
                     ;;
             esac
+            ;;
+        addr|address)
+            # Only `addr show scope global` is asked of this, to tell a host that
+            # can originate IPv6 from one that merely has a route to.
+            if [ "${args[1]:-}" = show ] && [ "$family" = 6 ]; then
+                [ -z "$FAKE_GLOBAL6" ] || printf '    inet6 %s scope global\n' "$FAKE_GLOBAL6"
+            fi
             ;;
         rule)
             local selector="${args[*]:2}"
@@ -1285,6 +1297,17 @@ uplinks_write_state
 check "an entry node with IPv6 prefers it" "6 [2001:db8::20]:51820" "$(dialling dual2)"
 check "and that is the endpoint in the tunnel's own config" \
     "[2001:db8::20]:51820" "$(conf_field dual2 Endpoint)"
+# A route with no address to send from is the shape a real VPS takes when its
+# provider advertises a router but allocates nothing — which is also what enabling
+# IPv6 forwarding does to a host that was relying on autoconfiguration. Reading
+# that as IPv6 egress dials every uplink over a family the host cannot speak.
+FAKE_GLOBAL6=""
+nodes "[$(node_both routeonly 198.51.100.20:51820 '[2001:db8::20]:51820' 2 10)]"
+uplinks_reload
+uplinks_write_state
+check "a default route with no address of its own is not IPv6 egress" \
+    "4 198.51.100.20:51820" "$(dialling routeonly)"
+FAKE_GLOBAL6="2001:db8:ffff::1/128"
 
 echo "64. the operator's preference overrides what the host can reach"
 export CASCADE_ENDPOINT_FAMILY=4

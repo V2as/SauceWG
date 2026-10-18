@@ -222,6 +222,7 @@ surface, available on both roles:
 | `saucewg fallback [direct\|block]` | *(entry node)* What happens while every exit node is down — see §4.6 |
 | `saucewg bypass` | *(entry node)* Destinations this node reopens for itself — see §4.7 |
 | `saucewg torrents [on\|strict\|off]` | Whether BitTorrent is blocked in what this node forwards — see §4.8 |
+| `saucewg speed-limit [RATE\|on\|off]` | *(entry node)* The most each client may move, in Mbit/s each way — see §4.12 |
 | `saucewg recover [NAME…]` | *(entry node)* Try to put failed exit nodes back — see §4.9 |
 | `saucewg protocol` | Which AmneziaWG generation this node serves, and what it is carrying |
 | `saucewg set-protocol V [--signature N]` | Move it to another generation and restart the node container |
@@ -278,9 +279,10 @@ account had issued.
 Exit nodes can be added and removed in three ways. They all end up writing the same
 file, so they can be mixed freely. Which destinations use the cascade at all (§4.5),
 what happens when none of it is available (§4.6), which destinations this node reopens
-for itself (§4.7) and what is done about a node that has failed (§4.9) are all set on
-the entry node. Whether BitTorrent is carried at all (§4.8) is set on every node
-separately, because either end can be the address a swarm sees.
+for itself (§4.7), what is done about a node that has failed (§4.9) and how fast each
+client may go (§4.12) are all set on the entry node. Whether BitTorrent is carried at
+all (§4.8) is set on every node separately, because either end can be the address a
+swarm sees.
 
 ### 4.1 From the panel (what an operator sees)
 
@@ -625,7 +627,7 @@ signatures catch what is on an allowed port. A client set to run uTP and DHT ove
 UDP/443 to hide inside QUIC gets past the ports and straight into the shape and bencode
 rules, which never look at a port.
 
-The switch lives in `config/torrent-block.json` next to the other three lists, so the
+The switch lives in `config/torrent-block.json` next to the other lists, so the
 panel, the CLI and the node container all see the same thing and a change applies within
 a second without disturbing a tunnel. Turning it on also drops the conntrack entries for
 client traffic, so a torrent running at that moment stops rather than finishing.
@@ -814,6 +816,57 @@ position, so the node on `10.77.0.4` keeps `51824` when you remove the node in f
 it. And this helps even where both directions work: an exit node sends to the port it
 last heard from, so an entry node whose port the kernel picked gets talked to at the
 wrong port for a keepalive interval after every restart.
+
+### 4.12 Limiting each client's speed
+
+One rate for every client on the entry node, held for each of them separately and for
+each direction separately: at 50, every client can download at up to 50 Mbit/s and
+upload at up to 50 Mbit/s, whatever the others are doing. It is a ceiling per client,
+not a share of the server. Nothing is limited until a rate is chosen.
+
+```bash
+saucewg speed-limit          # the rate, what the node is enforcing, what went over it
+saucewg speed-limit 50       # every client to 50 Mbit/s each way
+saucewg speed-limit 7.5      # fractions work, down to 0.1; 10000 is the ceiling
+saucewg speed-limit off      # lift it — the rate stays on file
+saucewg speed-limit on       # and put that rate back
+```
+
+```
+  speed limit  50 Mbit/s for each client, each way
+               6.25 MB/s down and the same up
+               in force on awg0 at 50 Mbit/s, with 2 rule(s)
+               1840 packet(s) dropped from clients, 52210 to them
+```
+
+The unit is **megabits** per second. A speed test or a browser reporting megabytes shows
+an eighth of it, so 50 MB/s is `saucewg speed-limit 400` — and `saucewg speed-limit 50MB`
+says exactly that instead of guessing. `100mbit`, `100Mbps` and `'100 Mbit/s'` are all
+read as 100.
+
+It is a policer built on the `hashlimit` match: one rule each way on the client
+interface keeps a token bucket per client address, and a packet that finds its bucket
+empty is dropped. TCP takes the drop as congestion and settles at the rate. The bucket
+holds a second's worth, so an idle client gets a short burst before the limit bites, and
+the tunnel itself is never throttled — a client at its limit stays connected. Because it
+is keyed on the address inside the tunnel, it follows a client out through the exit
+node, a direct route, the fallback and the bypass relay alike, and a client created a
+second ago is limited from its first packet.
+
+It is the entry node's alone: an exit node sees one address per entry node, so there is
+nothing per client to limit there, and the command refuses to run on one. The setting
+lives in `config/speed-limit.json`, which the panel's **Speed limit** page and
+`PUT /api/speed-limit` write too; the node container applies a change within a second
+without touching a tunnel. `SPEED_LIMIT=50` (or `off`) in `.env` pins it and takes it
+away from the panel and the CLI both, so `saucewg speed-limit` then refuses rather than
+writing a file that would be ignored. `saucewg update` adds the settings to an older
+installation without choosing a rate for it.
+
+* **The status line says when the kernel cannot do it.** A host without `xt_hashlimit`
+  limits nobody, and the reason is printed under the rate rather than left to be found
+  with a speed test.
+* **The counters start over whenever the rules are rebuilt** — a new rate, the limit
+  switched off and on, a restart of the node container.
 
 ---
 
@@ -1041,6 +1094,13 @@ Whether it is engaged at all is `BYPASS_MODE` on the entry node, not an API call
 the same reason as the fallback. Field semantics:
 [`AWG_USAGE.md` §8](AWG_USAGE.md#8-destinations-the-entry-node-reopens).
 
+The node-wide switches are one call each: `PUT /api/torrents` for the torrent guard of
+§4.8, and `PUT /api/speed-limit` with `{"enabled": true, "rate_mbit": 50}` for the speed
+limit of §4.12 — `rate_mbit` in megabits, `{"enabled": false}` to lift it and keep the
+rate. Both need a sudo token. Field semantics:
+[`AWG_USAGE.md` §9](AWG_USAGE.md#9-blocking-bittorrent) and
+[§10](AWG_USAGE.md#10-limiting-each-clients-speed).
+
 ### 5.6 Managing the servers themselves
 
 The calls above change the cascade. These change the exit server behind a node, and
@@ -1218,6 +1278,7 @@ images.
 | `/opt/saucewg/config/direct-routes.json` | Destinations that bypass the cascade, written the same way |
 | `/opt/saucewg/config/bypass.json` | Destinations this node reopens for itself (§4.7), written the same way |
 | `/opt/saucewg/config/torrent-block.json` | Whether BitTorrent is blocked here (§4.8), and how hard |
+| `/opt/saucewg/config/speed-limit.json` | *(entry node)* The rate every client is held to (§4.12), and whether it is on. Absent means no limit |
 | `/opt/saucewg/config/panel-ssh-key` | The panel's SSH identity, mode `0600`, with its `.pub` beside it |
 | `/opt/saucewg/.role` | `entry` or `exit` |
 | `/usr/local/bin/saucewg` | The CLI, which is a copy of the installer |
@@ -1255,6 +1316,9 @@ Settings that matter for node management specifically:
 | `TORRENT_BLOCK` | | `off`, `on` or `strict` pins the switch and takes it away from the panel and the CLI; empty leaves it to the file |
 | `TORRENT_BLOCK_FILE` | `/etc/amnezia/host/torrent-block.json` | Where the *node container* reads the switch |
 | `TORRENT_TCP_PORTS` / `TORRENT_UDP_PORTS` | see §4.8 | The ports `strict` leaves open. Adding 500, 4500 or 51820 lets a client run its own VPN out of the tunnel and torrent inside it |
+| `SPEED_LIMIT_REGISTRY_FILE` | `/etc/saucewg/host/speed-limit.json` | Where the panel sees the speed limit of §4.12 *inside its container* |
+| `SPEED_LIMIT` | | A rate in Mbit/s, or `off`, pins the speed limit and takes it away from the panel and the CLI; empty leaves it to the file |
+| `SPEED_LIMIT_FILE` | `/etc/amnezia/host/speed-limit.json` | Where the *node container* reads the speed limit |
 | `NODE_SSH_KEY_FILE` | `/etc/saucewg/host/panel-ssh-key` | The panel's own SSH key, generated on first use |
 | `NODE_SSH_KEY_ENABLED` | `true` | `false` stops the panel keeping a key, so every call carries credentials |
 | `NODE_SSH_TIMEOUT_SECONDS` | `900` | Ceiling for one remote command |
@@ -1361,6 +1425,12 @@ Settings that matter for node management specifically:
   than to the standard mode.
 * **The counters reset with the node container.** They are read off the iptables rules
   themselves, so a restart zeroes them. That is also why they cost nothing to keep.
+* **The speed limit is per client, not per server.** `saucewg speed-limit 50` gives
+  every client 50 Mbit/s each way; ten busy clients are 500 Mbit/s, and a server that
+  cannot carry that is still the ceiling above them.
+* **`saucewg speed-limit 50MB` is refused, not read.** The rate is in megabits, and
+  the CLI prints the conversion (`400`) rather than quietly giving every client an
+  eighth of what was meant.
 * **Failing over is not repairing.** The cascade moves clients off a dead exit node in
   about 30 seconds and leaves it dead. The panel is what tries to bring it back (§4.9),
   and a node it reports as `unreachable` is one no software on this side can fix — that

@@ -761,6 +761,61 @@ class TorrentUpdate(BaseModel):
     mode: Literal["on", "strict"] | None = None
 
 
+class SpeedLimitCapabilities(BaseModel):
+    """Which of the kernel matches the limit is built on this host has.
+
+    Without ``hashlimit`` nothing can be limited at all; without ``comment`` the
+    rules go in unlabelled and are counted all the same.
+    """
+
+    hashlimit: bool = False
+    comment: bool = False
+
+
+class SpeedLimitDrops(BaseModel):
+    """Packets dropped for being over the limit, since the rules were last built —
+    which a new rate and a restart of the node container both do."""
+
+    up: int = 0
+    down: int = 0
+    total: int = 0
+
+
+class SpeedLimitStatus(BaseModel):
+    """The most any one client may move through this node, and whether it holds."""
+
+    enabled: bool = False
+    # Mbit/s, for each client separately and each direction separately: 50 lets
+    # every client download at 50 and upload at 50 at the same time. Kept while the
+    # limit is off, so turning it back on returns to the same number. Divide by
+    # eight for MB/s.
+    rate_mbit: int | float | None = None
+    # What the node container says it is enforcing, which lags the two above by up
+    # to a second while a change is applied, and differs from them while
+    # SPEED_LIMIT overrides the file.
+    active: bool = False
+    active_rate_mbit: int | float | None = None
+    rules: int = 0
+    # None until the node container has asked its kernel, which it does when a rate
+    # is first set, and again whenever the limit is lifted and set again.
+    capabilities: SpeedLimitCapabilities | None = None
+    dropped: SpeedLimitDrops = SpeedLimitDrops()
+    # False when the node container is not publishing this: it is down, or older
+    # than the feature.
+    live: bool = False
+    # False when the panel cannot change the setting: NODE_PROVISION_ENABLED=false,
+    # or SPEED_LIMIT pinning it in the node container's environment.
+    editable: bool = True
+    # Why the setting on file is not the setting in force, if it is not.
+    config_error: str | None = None
+
+
+class SpeedLimitUpdate(BaseModel):
+    enabled: bool | None = None
+    # Mbit/s, from 0.1 to 10000, rounded to whole kbit/s.
+    rate_mbit: float | None = Field(default=None, ge=0.1, le=10000)
+
+
 class PanelSshKey(BaseModel):
     """The public half of the key the panel manages exit nodes with.
 

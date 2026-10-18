@@ -8,6 +8,7 @@ const routes = [
   { path: '/exit-nodes', name: 'exit-nodes', component: () => import('./views/ExitNodesView.vue') },
   { path: '/routing', name: 'routing', component: () => import('./views/RoutingView.vue') },
   { path: '/torrents', name: 'torrents', component: () => import('./views/TorrentsView.vue') },
+  { path: '/speed-limit', name: 'speed-limit', component: () => import('./views/SpeedLimitView.vue') },
   { path: '/admins', name: 'admins', component: () => import('./views/AdminsView.vue') },
   { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },
   { path: '/:pathMatch(.*)*', redirect: '/' },

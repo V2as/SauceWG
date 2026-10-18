@@ -38,6 +38,8 @@ SERVER_PID=0
 . /usr/local/lib/awg-uplinks.sh
 # shellcheck source=torrents.sh
 . /usr/local/lib/awg-torrents.sh
+# shellcheck source=speedlimit.sh
+. /usr/local/lib/awg-speedlimit.sh
 
 # ---------------------------------------------------------------------------
 # Server interface (clients on the entry node, the entry node on the exit node)
@@ -233,16 +235,18 @@ setup_exit_routing6() {
 
 # A node that is not running a cascade has no monitor to hang anything off, so it
 # gets a small one: enough to notice that the interface died, and to follow the
-# torrent setting when the panel — or an operator with an editor — changes it.
+# torrent setting — and on an entry node the speed limit — when the panel or an
+# operator with an editor changes it.
 #
-# Shaped like the cascade's monitor: the setting is checked every second so an edit
-# applies in about that long, while the rules are reasserted and the counters
+# Shaped like the cascade's monitor: the settings are checked every second so an
+# edit applies in about that long, while the rules are reasserted and the counters
 # republished on the slower tick. Reading the counters means an `iptables-save` and
 # a handful of `jq` runs, which is not something to do every second for a page
 # nobody may be looking at.
 node_watch() {
-    local seen now next_tick=0
+    local seen seen_speed now next_tick=0
     seen=$(torrent_config_mtime)
+    seen_speed=$(speed_config_mtime)
     while :; do
         kill -0 "$SERVER_PID" 2>/dev/null || return 0
         now=$(date -u +%s)
@@ -253,11 +257,20 @@ node_watch() {
             torrent_reload
             torrent_write_state
             next_tick=$((now + CASCADE_PROBE_INTERVAL))
+        elif [ "$AWG_ROLE" = "entry" ] && [ "$(speed_config_mtime)" != "$seen_speed" ]; then
+            seen_speed=$(speed_config_mtime)
+            log "the speed limit changed on disk"
+            speed_reload
+            speed_write_state
         elif [ "$now" -ge "$next_tick" ]; then
             # Reasserted rather than assumed: a rule this container did not install
             # can flush the table under it, and the guard has to survive that.
             torrent_apply
             torrent_write_state
+            if [ "$AWG_ROLE" = "entry" ]; then
+                speed_apply
+                speed_write_state
+            fi
             next_tick=$((now + CASCADE_PROBE_INTERVAL))
         fi
         sleep 1
@@ -274,6 +287,7 @@ teardown() {
         uplinks_teardown
     fi
     torrent_teardown
+    [ "$AWG_ROLE" != "entry" ] || speed_teardown
     ip link del "$AWG_IFACE" 2>/dev/null || true
     kill "${PIDS[@]}" 2>/dev/null || true
 }
@@ -300,6 +314,9 @@ do_run() {
         # place it exists before it leaves under this server's own address, which
         # is the address an abuse notice names.
         torrent_tick
+        # Per client, so only where the clients are: on an exit node everything on
+        # the interface comes from one address, the entry node's.
+        [ "$AWG_ROLE" != "entry" ] || speed_tick
         log "node ready (role=${AWG_ROLE})"
         node_watch
         log "an amneziawg-go process exited, stopping container"
@@ -312,6 +329,7 @@ do_run() {
     direct_parse || true
     bypass_parse || true
     torrent_parse || true
+    speed_parse || true
 
     uplinks_setup_all
     uplinks_routing_base
@@ -329,6 +347,7 @@ do_run() {
     fi
     uplinks_write_state
     torrent_write_state
+    speed_write_state
 
     log "node ready (role=entry, uplinks=$(uplink_count))"
     # The monitor stays in the foreground: it has to be the parent of every uplink

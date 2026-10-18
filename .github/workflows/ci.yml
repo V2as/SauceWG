@@ -371,6 +371,56 @@ jobs:
             || { echo "::error::the panel cannot write the switch"; exit 1; }
           echo "torrents keeps its switch and its mode consistent"
 
+      # One rate for every client, and none until an operator picks one: a limit
+      # nobody asked for reads as a broken node. The container reads the file, so
+      # what is asserted is the file.
+      - name: The CLI maintains the speed limit
+        run: |
+          sudo test ! -e /tmp/entry/config/speed-limit.json \
+            || { echo "::error::a fresh install limits its clients"; exit 1; }
+
+          sudo bash saucewg.sh --dir /tmp/entry --yes speed-limit 50
+          sudo jq -e '.enabled == true and .rate_mbit == 50' \
+            /tmp/entry/config/speed-limit.json >/dev/null
+          # The rate is kept while the limit is off, so putting it back does not
+          # need it asked for again.
+          sudo bash saucewg.sh --dir /tmp/entry --yes speed-limit off
+          sudo jq -e '.enabled == false and .rate_mbit == 50' \
+            /tmp/entry/config/speed-limit.json >/dev/null \
+            || { echo "::error::lifting the limit lost the chosen rate"; exit 1; }
+          sudo bash saucewg.sh --dir /tmp/entry --yes speed-limit on
+          sudo jq -e '.enabled == true and .rate_mbit == 50' \
+            /tmp/entry/config/speed-limit.json >/dev/null
+          sudo bash saucewg.sh --dir /tmp/entry --yes speed-limit 7.5mbit
+          sudo jq -e '.rate_mbit == 7.5' /tmp/entry/config/speed-limit.json >/dev/null
+
+          # Megabytes are the likeliest mistake, and eight times out is not one a
+          # client should be the first to notice.
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes speed-limit 50MB
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes speed-limit 0
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes speed-limit 20000
+          ! sudo bash saucewg.sh --dir /tmp/entry --yes speed-limit nonsense
+          sudo jq -e '.rate_mbit == 7.5' /tmp/entry/config/speed-limit.json >/dev/null \
+            || { echo "::error::a refused rate reached the file"; exit 1; }
+          # Clients connect to the entry node, so it is the only place a rate means anything.
+          ! sudo bash saucewg.sh --dir /tmp/exit --yes speed-limit 50
+
+          sudo sed -i 's/^SPEED_LIMIT=.*/SPEED_LIMIT=100/' /tmp/entry/.env
+          sudo bash saucewg.sh --dir /tmp/entry --yes speed-limit off \
+            > /tmp/speed.log 2>&1 \
+            && { echo "::error::the CLI wrote a limit the container would ignore"; exit 1; }
+          grep -q 'overrides this' /tmp/speed.log \
+            || { echo "::error::the CLI did not say why"; cat /tmp/speed.log; exit 1; }
+          sudo sed -i 's/^SPEED_LIMIT=.*/SPEED_LIMIT=/' /tmp/entry/.env
+
+          sudo docker compose --project-directory /tmp/entry \
+            -f /tmp/entry/docker-compose.yml --env-file /tmp/entry/.env config --format json \
+            | jq -e '.services.awg.environment.SPEED_LIMIT_FILE == "/etc/amnezia/host/speed-limit.json"
+                     and .services.panel.environment.SPEED_LIMIT_REGISTRY_FILE
+                         == "/etc/saucewg/host/speed-limit.json"' >/dev/null \
+            || { echo "::error::the container and the panel are not told where the limit is"; exit 1; }
+          echo "speed-limit keeps its switch and its rate consistent"
+
       # An installation made before the fallback had two modes must come out of an
       # update with the new default written down rather than assumed. Only the .env
       # migration is under test, so docker is stubbed out: pulling three images to
@@ -455,6 +505,28 @@ jobs:
           sudo grep -qx 'NODE_RECOVERY_ENABLED=false' /tmp/nobypass/.env \
             || { echo "::error::update overwrote a deliberate choice"; exit 1; }
           echo "node recovery arrives on update and survives being turned off"
+
+      # The speed limit arrives with its settings and without a rate: an update must
+      # not slow anyone down.
+      - name: Updating an older installation leaves clients unlimited
+        run: |
+          sudo sed -i '/^SPEED_LIMIT/d' /tmp/nobypass/.env
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/nobypass --yes update --no-restart
+          sudo grep -qx 'SPEED_LIMIT=' /tmp/nobypass/.env \
+            || { echo "::error::update left the speed limit's override unset"; exit 1; }
+          sudo grep -qx 'SPEED_LIMIT_REGISTRY_FILE=/etc/saucewg/host/speed-limit.json' \
+            /tmp/nobypass/.env \
+            || { echo "::error::update left the panel unable to write the limit"; exit 1; }
+          sudo test ! -e /tmp/nobypass/config/speed-limit.json \
+            || { echo "::error::update put a speed limit on"; exit 1; }
+          sudo docker compose --project-directory /tmp/nobypass \
+            -f /tmp/nobypass/docker-compose.yml --env-file /tmp/nobypass/.env config --format json \
+            | jq -e '(.services.awg.environment | has("SPEED_LIMIT") and (.SPEED_LIMIT // "") == ""
+                       and .SPEED_LIMIT_FILE == "/etc/amnezia/host/speed-limit.json")
+                     and .services.panel.environment.SPEED_LIMIT_REGISTRY_FILE
+                         == "/etc/saucewg/host/speed-limit.json"' >/dev/null \
+            || { echo "::error::the regenerated compose file does not pass the limit through"; exit 1; }
+          echo "an update brings the speed limit in without turning it on"
 
       # Recovering an exit node happens inside the panel container, so the CLI's own
       # job is to reach it and to say so plainly when it cannot — a silent failure

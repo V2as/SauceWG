@@ -84,7 +84,9 @@ settings.node_registry_file = os.path.join(workdir, "exit-nodes.json")
 settings.routes_registry_file = os.path.join(workdir, "direct-routes.json")
 settings.bypass_registry_file = os.path.join(workdir, "bypass.json")
 settings.torrent_registry_file = os.path.join(workdir, "torrent-block.json")
-# torrent_state_file follows awg_socket_dir, the same way uplink_state_file does.
+settings.speed_limit_registry_file = os.path.join(workdir, "speed-limit.json")
+# torrent_state_file and speed_limit_state_file follow awg_socket_dir, the same way
+# uplink_state_file does.
 settings.awg_socket_dir = workdir
 # Where the node container would persist the entry interface's profile.
 settings.awg_config_dir = workdir
@@ -976,6 +978,132 @@ async def main() -> None:
         caught(None)
         session_stub.rows = []
         os.unlink(settings.torrent_registry_file)
+
+        print("the speed limit")
+
+        def limiting(state: dict | None) -> None:
+            """Writes speed-limit.json the way the node container would, or removes it."""
+            if state is None:
+                if os.path.exists(settings.speed_limit_state_file):
+                    os.unlink(settings.speed_limit_state_file)
+                return
+            with open(settings.speed_limit_state_file, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "updated_at": time.time(), "rate_mbit": 50, "source": "file",
+                    "iface": "awg0", "active": True, "rules": 2,
+                    "capabilities": {"hashlimit": True, "comment": True},
+                    "dropped": {"up": 0, "down": 0, "total": 0}, "error": None,
+                } | state, handle)
+
+        def reload_id() -> str | None:
+            try:
+                with open(settings.uplink_reload_file, encoding="utf-8") as handle:
+                    return json.load(handle).get("id")
+            except (OSError, ValueError):
+                return None
+
+        limiting(None)
+        body = (await client.get("/api/speed-limit")).json()
+        check("a node that has never been asked limits nobody", body["enabled"] is False, body)
+        check("with no rate chosen yet", body["rate_mbit"] is None, body)
+        check("nothing is claimed about a container that is not answering",
+              body["live"] is False and body["active"] is False, body)
+        check("and that is not an error in itself", body["config_error"] is None, body)
+        check("the setting is the panel's to change", body["editable"] is True, body)
+
+        response = await client.put("/api/speed-limit", json={"enabled": True})
+        check("switching it on with no rate anywhere is refused", response.status_code == 422, response.text)
+        check("and nothing is written", not os.path.exists(settings.speed_limit_registry_file), response.text)
+
+        before = reload_id()
+        response = await client.put("/api/speed-limit", json={"enabled": True, "rate_mbit": 50})
+        check("one call sets the rate and turns it on", response.status_code == 200, response.text)
+        body = response.json()
+        check("and it comes back that way", body["enabled"] is True and body["rate_mbit"] == 50, body)
+        with open(settings.speed_limit_registry_file, encoding="utf-8") as handle:
+            written = json.load(handle)
+        check("the file is the shape the container parses", written == {"enabled": True, "rate_mbit": 50}, written)
+        check("a whole number of Mbit/s is written as one", isinstance(written["rate_mbit"], int), written)
+        # The file's mtime has a resolution of a second, so two edits inside one
+        # would look like one to a container that only watched the file.
+        check("and the container is asked to pick it up at once", reload_id() not in (None, before), reload_id())
+
+        response = await client.put("/api/speed-limit", json={"rate_mbit": 7.5})
+        check("the rate moves on its own", response.json()["rate_mbit"] == 7.5, response.text)
+        check("without touching the switch", response.json()["enabled"] is True, response.text)
+
+        response = await client.put("/api/speed-limit", json={"enabled": False})
+        check("switching off keeps the rate that was chosen", response.json()["rate_mbit"] == 7.5, response.text)
+        check("while nobody is limited", response.json()["enabled"] is False, response.text)
+        response = await client.put("/api/speed-limit", json={"enabled": True})
+        check("so switching back on needs no rate", response.json()["rate_mbit"] == 7.5, response.text)
+
+        for bad in (0, 0.05, -5, 10001, "fast"):
+            response = await client.put("/api/speed-limit", json={"rate_mbit": bad})
+            check(f"a rate of {bad!r} is refused", response.status_code == 422, response.text)
+        response = await client.put("/api/speed-limit", json={"rate_mbit": 33.33333})
+        check("a rate finer than a kbit/s is rounded to one", response.json()["rate_mbit"] == 33.333, response.text)
+
+        with open(settings.speed_limit_registry_file, "w", encoding="utf-8") as handle:
+            json.dump({"rate_mbit": 50}, handle)
+        body = (await client.get("/api/speed-limit")).json()
+        check("a hand-written rate with no switch is a limit that is on",
+              body["enabled"] is True and body["rate_mbit"] == 50, body)
+
+        settings.node_provision_enabled = False
+        response = await client.put("/api/speed-limit", json={"enabled": False})
+        check("a read-only panel refuses to change it", response.status_code == 409, response.text)
+        body = (await client.get("/api/speed-limit")).json()
+        check("and says so before anyone tries", body["editable"] is False, body)
+        settings.node_provision_enabled = True
+
+        print("what the limit is doing")
+        limiting({"rate_mbit": 33.333, "dropped": {"up": 120, "down": 4500, "total": 4620}})
+        body = (await client.get("/api/speed-limit")).json()
+        check("the container's own reading is published", body["live"] is True and body["active"] is True, body)
+        check("with the rate it is actually enforcing", body["active_rate_mbit"] == 33.333, body)
+        check("and how much it is dropping each way",
+              body["dropped"] == {"up": 120, "down": 4500, "total": 4620}, body)
+        check("from both of its rules", body["rules"] == 2, body)
+        check("nothing is wrong with any of it", body["config_error"] is None, body)
+        check("and the kernel is reported as the container found it",
+              body["capabilities"] == {"hashlimit": True, "comment": True}, body)
+
+        limiting({"rate_mbit": None, "active": False, "rules": 0, "capabilities": None})
+        body = (await client.get("/api/speed-limit")).json()
+        check("a container that has had no rate to install has not asked its kernel",
+              body["capabilities"] is None, body)
+
+        limiting({
+            "active": False, "rules": 0, "capabilities": {"hashlimit": False, "comment": True},
+            "error": "this kernel has no iptables hashlimit match (xt_hashlimit), so nothing is limited",
+        })
+        body = (await client.get("/api/speed-limit")).json()
+        check("a kernel that cannot limit is not left to be discovered",
+              "xt_hashlimit" in (body["config_error"] or ""), body)
+        check("and no rate is claimed to be in force", body["active_rate_mbit"] is None, body)
+
+        print("when the environment overrides the limit")
+        limiting({"source": "env", "rate_mbit": 20})
+        body = (await client.get("/api/speed-limit")).json()
+        check("the panel says which one is in charge", "SPEED_LIMIT" in (body["config_error"] or ""), body)
+        check("and what is really in force", body["active_rate_mbit"] == 20, body)
+        check("so the controls are offered as read-only", body["editable"] is False, body)
+        response = await client.put("/api/speed-limit", json={"rate_mbit": 100})
+        check("and refuses a write that would not take effect", response.status_code == 409, response.text)
+
+        print("when the file has been broken by hand")
+        limiting(None)
+        with open(settings.speed_limit_registry_file, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        response = await client.get("/api/speed-limit")
+        check("the panel says it cannot read it", response.status_code == 503, response.text)
+        response = await client.put("/api/speed-limit", json={"enabled": False})
+        check("a change with nothing to merge into is refused", response.status_code == 400, response.text)
+        response = await client.put("/api/speed-limit", json={"enabled": True, "rate_mbit": 50})
+        check("but naming both fields replaces the file", response.status_code == 200, response.text)
+
+        os.unlink(settings.speed_limit_registry_file)
 
         print("putting a failed exit node back")
 

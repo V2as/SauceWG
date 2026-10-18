@@ -45,6 +45,8 @@ ROUTES_FILE="${CONFIG_DIR}/direct-routes.json"
 BYPASS_LIST_FILE="${CONFIG_DIR}/bypass.json"
 # Same reasoning as above: TORRENT_BLOCK_FILE is the container's own setting.
 TORRENT_SWITCH_FILE="${CONFIG_DIR}/torrent-block.json"
+# And SPEED_LIMIT_FILE.
+SPEED_LIMIT_SWITCH_FILE="${CONFIG_DIR}/speed-limit.json"
 
 JSON_OUTPUT=false
 ASSUME_YES=false
@@ -719,6 +721,10 @@ services:
       TORRENT_BLOCK_FILE: ${TORRENT_BLOCK_FILE:-/etc/amnezia/host/torrent-block.json}
       TORRENT_TCP_PORTS: ${TORRENT_TCP_PORTS:-}
       TORRENT_UDP_PORTS: ${TORRENT_UDP_PORTS:-}
+      # The most any one client may move, in Mbit/s, each way. Empty leaves it to
+      # the file the panel writes.
+      SPEED_LIMIT: ${SPEED_LIMIT:-}
+      SPEED_LIMIT_FILE: ${SPEED_LIMIT_FILE:-/etc/amnezia/host/speed-limit.json}
       CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
       # The IPv6 half of the link to the exit nodes. Empty is a cascade that
       # carries IPv4 only, which is what every installation made before this
@@ -797,6 +803,7 @@ services:
       ROUTES_REGISTRY_FILE: ${ROUTES_REGISTRY_FILE:-/etc/saucewg/host/direct-routes.json}
       BYPASS_REGISTRY_FILE: ${BYPASS_REGISTRY_FILE:-/etc/saucewg/host/bypass.json}
       TORRENT_REGISTRY_FILE: ${TORRENT_REGISTRY_FILE:-/etc/saucewg/host/torrent-block.json}
+      SPEED_LIMIT_REGISTRY_FILE: ${SPEED_LIMIT_REGISTRY_FILE:-/etc/saucewg/host/speed-limit.json}
       NODE_PROVISION_ENABLED: ${NODE_PROVISION_ENABLED:-true}
       NODE_DEFAULT_PORT: ${NODE_DEFAULT_PORT:-51820}
       NODE_SSH_TIMEOUT_SECONDS: ${NODE_SSH_TIMEOUT_SECONDS:-900}
@@ -1106,13 +1113,21 @@ BYPASS_PARALLEL=6
 # of whichever server carries it out, and a datacentre answers a copyright notice
 # by suspending that server rather than by asking who was behind it. Leave this
 # empty and the switch lives in config/torrent-block.json, which is what the panel
-# and `saucewg torrents` write; off, on or strict here pins it and takes the switch
+# and \`saucewg torrents\` write; off, on or strict here pins it and takes the switch
 # out of the UI.
 TORRENT_BLOCK=
 TORRENT_BLOCK_FILE=/etc/amnezia/host/torrent-block.json
 # What strict mode still allows out. Empty means the built-in lists.
 TORRENT_TCP_PORTS=
 TORRENT_UDP_PORTS=
+
+# The most any one client may move through this node, in Mbit/s, for every client
+# separately and each direction separately: 50 is 6.25 MB/s down and the same up.
+# Leave this empty and the setting lives in config/speed-limit.json, which is what
+# the panel and \`saucewg speed-limit\` write; a rate or off here pins it and takes
+# it out of the UI.
+SPEED_LIMIT=
+SPEED_LIMIT_FILE=/etc/amnezia/host/speed-limit.json
 
 CASCADE_PROBE_ENABLED=true
 CASCADE_PROBE_TARGET=1.1.1.1
@@ -1146,6 +1161,7 @@ NODE_REGISTRY_FILE=/etc/saucewg/host/exit-nodes.json
 ROUTES_REGISTRY_FILE=/etc/saucewg/host/direct-routes.json
 BYPASS_REGISTRY_FILE=/etc/saucewg/host/bypass.json
 TORRENT_REGISTRY_FILE=/etc/saucewg/host/torrent-block.json
+SPEED_LIMIT_REGISTRY_FILE=/etc/saucewg/host/speed-limit.json
 NODE_PROVISION_ENABLED=true
 NODE_DEFAULT_PORT=51820
 NODE_SSH_TIMEOUT_SECONDS=900
@@ -2951,6 +2967,189 @@ torrent_set_mode() {
 }
 
 # ---------------------------------------------------------------------------
+# Speed limit (entry node)
+# ---------------------------------------------------------------------------
+#
+# One rate, held for every client separately and for each direction separately: at
+# 50 each client can download at up to 50 Mbit/s and upload at up to 50 whatever
+# the others are doing — it is not a total shared between them. It applies on the
+# entry node, which is where a client's own address is still visible.
+
+# The same reading the node container and the panel give the file: `enabled` left
+# out means on, and a rate it cannot use is no rate.
+speed_switch_read() {
+    [ -f "$SPEED_LIMIT_SWITCH_FILE" ] \
+        && jq -c '{
+            enabled: ((if has("enabled") then .enabled else true end) | . == true or . == "true"),
+            rate_mbit: (.rate_mbit | if type == "number" then .
+                                     elif type == "string" then (try tonumber catch null)
+                                     else null end)
+           }' "$SPEED_LIMIT_SWITCH_FILE" 2>/dev/null \
+        || printf '{"enabled":false,"rate_mbit":null}'
+}
+
+speed_switch_write() {
+    local enabled=$1 rate=$2
+    mkdir -p "$CONFIG_DIR"
+    jq -n --argjson enabled "$enabled" --argjson rate "$rate" \
+        '{enabled: $enabled, rate_mbit: $rate}' > "${SPEED_LIMIT_SWITCH_FILE}.tmp"
+    mv "${SPEED_LIMIT_SWITCH_FILE}.tmp" "$SPEED_LIMIT_SWITCH_FILE"
+    chmod 600 "$SPEED_LIMIT_SWITCH_FILE"
+}
+
+# A rate in Mbit/s as the node container accepts it, written the way the panel
+# writes it: rounded to whole kbit/s, and 50 rather than 50.0. Fails on anything
+# outside 0.1 to 10000, and on MBps, which is megabytes.
+speed_rate_arg() {
+    local value
+    value=$(printf '%s' "$1" | tr -d '[:space:]')
+    case "$value" in *B[pP][sS]) return 1 ;; esac
+    value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+    case "$value" in
+        *mbit/s) value=${value%mbit/s} ;;
+        *mbit)   value=${value%mbit} ;;
+        *mbps)   value=${value%mbps} ;;
+    esac
+    awk -v v="$value" 'BEGIN {
+        if (v !~ /^[0-9]+([.][0-9]+)?$/) exit 1
+        kbit = int(v * 1000 + 0.5)
+        if (kbit < 100 || kbit > 10000000) exit 1
+        if (kbit % 1000 == 0) { printf "%d", kbit / 1000; exit 0 }
+        frac = sprintf("%03d", kbit % 1000)
+        sub(/0+$/, "", frac)
+        printf "%d.%s", int(kbit / 1000), frac
+    }'
+}
+
+speed_state() {
+    compose exec -T awg cat /var/run/amneziawg/speed-limit.json 2>/dev/null || true
+}
+
+cmd_speed_limit() {
+    require_entry
+    local action="${1:-}"
+    case "$action" in
+        "") ;;
+        on|off) shift; speed_set "$action" "$@"; return ;;
+        -*) die "unknown option for speed-limit: $action" ;;
+        *) shift; speed_set_rate "$action" "$@"; return ;;
+    esac
+
+    local configured pinned state live=false
+    configured=$(speed_switch_read)
+    pinned=$(env_get "$ENV_FILE" SPEED_LIMIT || true)
+    state=$(speed_state)
+    printf '%s' "$state" | jq -e 'has("active")' >/dev/null 2>&1 && live=true
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        [ "$live" = true ] || state=null
+        printf '%s' "$configured" | jq --argjson live "$live" --arg pinned "$pinned" \
+            --argjson state "$(printf '%s' "$state" | jq -c '.')" '
+            . + {live: $live, node: $state,
+                 pinned: (if $pinned == "" then null else $pinned end)}'
+        return
+    fi
+
+    if [ -n "$pinned" ]; then
+        note "speed limit  ${pinned}"
+        warn "SPEED_LIMIT=${pinned} is set in .env, so the panel's setting is ignored"
+    else
+        printf '%s' "$configured" | jq -r '
+            if .enabled and .rate_mbit != null then
+                "speed limit  \(.rate_mbit) Mbit/s for each client, each way",
+                "             \(.rate_mbit / 8) MB/s down and the same up"
+            else
+                "speed limit  off",
+                (if .rate_mbit != null then "             \(.rate_mbit) Mbit/s is kept for when it is turned on"
+                 else "             clients are not limited" end)
+            end' | while IFS= read -r line; do note "$line"; done
+    fi
+
+    if [ "$live" = false ]; then
+        warn "the node container did not answer, so nothing above is confirmed"
+        return
+    fi
+
+    printf '%s' "$state" | jq -r '
+        if .active then
+            "             in force on \(.iface) at \(.rate_mbit) Mbit/s, with \(.rules) rule(s)"
+        elif .rate_mbit != null then
+            "             not installed on the node right now"
+        else empty end,
+        (if (.dropped.total // 0) > 0
+         then "             \(.dropped.up // 0) packet(s) dropped from clients, \(.dropped.down // 0) to them"
+         else empty end)' | while IFS= read -r line; do note "$line"; done
+
+    printf '%s' "$state" | jq -r '.error // ""' | grep . | while read -r line; do
+        warn "$line"
+    done
+}
+
+speed_require_editable() {
+    local pinned
+    pinned=$(env_get "$ENV_FILE" SPEED_LIMIT || true)
+    [ -z "$pinned" ] \
+        || die "SPEED_LIMIT=${pinned} is set in .env and overrides this. Clear it first."
+}
+
+speed_set_rate() {
+    local value=$1 rate compact megabytes
+    shift
+    [ $# -eq 0 ] || die "unknown option for speed-limit ${value}: $1"
+    if ! rate=$(speed_rate_arg "$value"); then
+        # Megabytes are what a speed test shows, and eight times out is not a
+        # mistake anyone should have to notice in their clients' speeds.
+        compact=$(printf '%s' "$value" | tr -d '[:space:]')
+        case "$compact" in
+            [0-9]*[mM]B|[0-9]*[mM]B/[sS]|[0-9]*[mM]B[pP][sS])
+                megabytes=${compact%%[mM]*}
+                rate=$(awk -v v="$megabytes" 'BEGIN { printf "%g", v * 8 }')
+                die "the rate is in megabits: ${megabytes} MB/s is ${rate} Mbit/s, so run: saucewg speed-limit ${rate}" ;;
+            *)  die "speed-limit takes on, off or a rate between 0.1 and 10000 Mbit/s, not '${value}'" ;;
+        esac
+    fi
+    need_root "speed-limit ${value}"
+    speed_require_editable
+
+    speed_switch_write true "$rate"
+    log "every client is now held to ${rate} Mbit/s each way"
+    speed_set_done true "$rate"
+}
+
+speed_set() {
+    local action=$1 rate
+    shift
+    [ $# -eq 0 ] || die "unknown option for speed-limit ${action}: $1"
+    need_root "speed-limit ${action}"
+    speed_require_editable
+
+    # The rate is kept while the limit is off, so turning it back on returns to the
+    # rate that was chosen rather than asking for it again.
+    rate=$(speed_switch_read | jq -r '.rate_mbit // empty')
+    case "$action" in
+        on)
+            [ -n "$rate" ] || die "there is no rate to put back yet; name one: saucewg speed-limit 50"
+            speed_switch_write true "$rate"
+            log "every client is now held to ${rate} Mbit/s each way"
+            speed_set_done true "$rate"
+            ;;
+        off)
+            speed_switch_write false "${rate:-null}"
+            log "the speed limit is lifted"
+            speed_set_done false "${rate:-null}"
+            ;;
+    esac
+}
+
+speed_set_done() {
+    # The node container watches the file and swaps the rules within a second; a
+    # tunnel is not touched, so a client at the limit stays connected throughout.
+    note "the node applies it within a second"
+    [ "$JSON_OUTPUT" = false ] \
+        || jq -n --argjson enabled "$1" --argjson rate "$2" '{ok: true, enabled: $enabled, rate_mbit: $rate}'
+}
+
+# ---------------------------------------------------------------------------
 # AmneziaWG generation
 # ---------------------------------------------------------------------------
 
@@ -3251,6 +3450,14 @@ cmd_update() {
         grep -q '^TORRENT_REGISTRY_FILE=' "$ENV_FILE" \
             || env_set "$ENV_FILE" TORRENT_REGISTRY_FILE /etc/saucewg/host/torrent-block.json
 
+        # The speed limit arrives with no file, which is no limit: an update must not
+        # slow anyone down, and which rate suits a node is the operator's call.
+        grep -q '^SPEED_LIMIT_REGISTRY_FILE=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" SPEED_LIMIT_REGISTRY_FILE /etc/saucewg/host/speed-limit.json
+        grep -q '^SPEED_LIMIT_FILE=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" SPEED_LIMIT_FILE /etc/amnezia/host/speed-limit.json
+        grep -q '^SPEED_LIMIT=' "$ENV_FILE" || env_set "$ENV_FILE" SPEED_LIMIT ""
+
         # The IPv6 half of the link to the exit nodes, and which endpoint to dial
         # them over. Both arrive switched off rather than on: an update must leave a
         # running cascade doing exactly what it did, and an IPv6 bridge needs the
@@ -3540,6 +3747,12 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
     torrents strict          The same, plus outbound only to ports a service answers on
     torrents off             Forward it like anything else
 
+  Speed limit (entry node)
+    speed-limit              The most each client may move, and what went over
+    speed-limit RATE         Hold every client to RATE Mbit/s each way (0.1 to 10000;
+                             divide by 8 for MB/s, so 50 MB/s is 400)
+    speed-limit on | off     Put the last rate back, or lift the limit
+
   Exit node
     node-info                Print this node's pairing object
     node-pair --peer-key K   Install the entry node's uplink key here
@@ -3624,6 +3837,7 @@ main() {
     ROUTES_FILE="${CONFIG_DIR}/direct-routes.json"
     BYPASS_LIST_FILE="${CONFIG_DIR}/bypass.json"
     TORRENT_SWITCH_FILE="${CONFIG_DIR}/torrent-block.json"
+    SPEED_LIMIT_SWITCH_FILE="${CONFIG_DIR}/speed-limit.json"
 
     set -- ${args[@]+"${args[@]}"}
 
@@ -3655,6 +3869,7 @@ main() {
         dial-in|dialin)   cmd_dial_in "$@" ;;
         bypass)           cmd_bypass "$@" ;;
         torrents|torrent) cmd_torrents "$@" ;;
+        speed-limit|speed) cmd_speed_limit "$@" ;;
         node-info)        cmd_node_info "$@" ;;
         node-pair)        cmd_node_pair "$@" ;;
         protocol)         cmd_protocol "$@" ;;

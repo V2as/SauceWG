@@ -56,6 +56,7 @@ onUnmounted(() => window.removeEventListener('saucewg:unauthorized', onUnauthori
         <RouterLink to="/exit-nodes">Exit nodes</RouterLink>
         <RouterLink to="/routing">Routing</RouterLink>
         <RouterLink to="/torrents">Torrents</RouterLink>
+        <RouterLink to="/speed-limit">Speed limit</RouterLink>
         <RouterLink to="/settings">Node</RouterLink>
         <RouterLink v-if="store.admin?.is_sudo" to="/admins">Admins</RouterLink>
       </nav>

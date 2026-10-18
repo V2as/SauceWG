@@ -1504,6 +1504,7 @@ uplinks_teardown() {
     bypass_stop
     BYPASS_ACTIVE=false
     torrent_teardown
+    speed_teardown
     for i in "${!UP_NAME[@]}"; do
         ip link del "${UP_IFACE[$i]}" 2>/dev/null || true
     done
@@ -1631,6 +1632,9 @@ uplinks_routing_base() {
     # function that puts the forwarding rules back after a reload has churned
     # them, and the guard has to survive that too.
     torrent_apply
+    # How fast each client may go, whichever path carries it. Cheap when nothing
+    # changed, so a reload that was about something else costs nobody their bucket.
+    speed_apply
 }
 
 # Points the client policy-routing table at one uplink. Pass "force" after a
@@ -2246,6 +2250,7 @@ uplinks_reload() {
     direct_parse || true
     bypass_parse || true
     torrent_parse || true
+    speed_parse || true
     uplinks_routing_base
 
     uplinks_refresh_health
@@ -2271,14 +2276,15 @@ uplinks_reload() {
 # what keeps a long-lived reload cycle from filling the container with zombies.
 uplinks_monitor() {
     local want now next_health=0
-    local seen_request seen_mtime seen_direct seen_bypass seen_torrent
-    local requested mtime direct_mtime bypass_mtime torrent_mtime
+    local seen_request seen_mtime seen_direct seen_bypass seen_torrent seen_speed
+    local requested mtime direct_mtime bypass_mtime torrent_mtime speed_mtime
 
     seen_request=$(uplinks_reload_request_id)
     seen_mtime=$(uplinks_config_mtime)
     seen_direct=$(direct_config_mtime)
     seen_bypass=$(bypass_config_mtime)
     seen_torrent=$(torrent_config_mtime)
+    seen_speed=$(speed_config_mtime)
     RELOAD_ID=$seen_request
 
     while :; do
@@ -2293,6 +2299,7 @@ uplinks_monitor() {
         direct_mtime=$(direct_config_mtime)
         bypass_mtime=$(bypass_config_mtime)
         torrent_mtime=$(torrent_config_mtime)
+        speed_mtime=$(speed_config_mtime)
 
         if [ "$requested" != "$seen_request" ] || [ "$mtime" != "$seen_mtime" ]; then
             if [ "$requested" != "$seen_request" ]; then
@@ -2302,15 +2309,17 @@ uplinks_monitor() {
             fi
             seen_request=$requested
             seen_mtime=$mtime
-            # The reload re-reads every destination list and the torrent setting
-            # too, so those edits are already applied.
+            # The reload re-reads every destination list, the torrent setting and
+            # the speed limit too, so those edits are already applied.
             seen_direct=$direct_mtime
             seen_bypass=$bypass_mtime
             seen_torrent=$torrent_mtime
+            seen_speed=$speed_mtime
             uplinks_reload || true
             RELOAD_ID=$requested
             uplinks_write_state
             torrent_write_state
+            speed_write_state
             next_health=$((now + CASCADE_PROBE_INTERVAL))
         elif [ "$direct_mtime" != "$seen_direct" ]; then
             # Only the direct list changed: the cascade itself does not need touching.
@@ -2328,6 +2337,11 @@ uplinks_monitor() {
             seen_torrent=$torrent_mtime
             torrent_reload
             torrent_write_state
+        elif [ "$speed_mtime" != "$seen_speed" ]; then
+            log "the speed limit changed on disk"
+            seen_speed=$speed_mtime
+            speed_reload
+            speed_write_state
         fi
 
         if [ "$now" -ge "$next_health" ]; then
@@ -2355,6 +2369,8 @@ uplinks_monitor() {
             # the last time somebody read them off the rules.
             torrent_apply
             torrent_write_state
+            speed_apply
+            speed_write_state
 
             uplinks_write_state
             next_health=$((now + CASCADE_PROBE_INTERVAL))

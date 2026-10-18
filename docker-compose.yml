@@ -110,6 +110,11 @@ services:
       # is what closes encrypted peer traffic on a port nothing else uses.
       TORRENT_TCP_PORTS: ${TORRENT_TCP_PORTS:-}
       TORRENT_UDP_PORTS: ${TORRENT_UDP_PORTS:-}
+      # The most any one client may move, in Mbit/s, each way. Empty leaves it to
+      # the file the panel writes; a rate or `off` here overrides it and takes the
+      # setting out of the UI.
+      SPEED_LIMIT: ${SPEED_LIMIT:-}
+      SPEED_LIMIT_FILE: ${SPEED_LIMIT_FILE:-/etc/amnezia/host/speed-limit.json}
       CASCADE_UPLINK_SUBNET: ${CASCADE_UPLINK_SUBNET:-10.77.0.0/24}
       # The IPv6 half of the link to the exit nodes, which is what lets an exit
       # node reach the IPv6 internet on behalf of this one. Empty carries IPv4
@@ -237,6 +242,8 @@ services:
       BYPASS_REGISTRY_FILE: ${BYPASS_REGISTRY_FILE:-/etc/saucewg/host/bypass.json}
       # The torrent switch, on the panel's side of the same bind mount.
       TORRENT_REGISTRY_FILE: ${TORRENT_REGISTRY_FILE:-/etc/saucewg/host/torrent-block.json}
+      # And the speed limit, the same way.
+      SPEED_LIMIT_REGISTRY_FILE: ${SPEED_LIMIT_REGISTRY_FILE:-/etc/saucewg/host/speed-limit.json}
       NODE_PROVISION_ENABLED: ${NODE_PROVISION_ENABLED:-true}
       NODE_DEFAULT_PORT: ${NODE_DEFAULT_PORT:-51820}
       NODE_SSH_TIMEOUT_SECONDS: ${NODE_SSH_TIMEOUT_SECONDS:-900}

@@ -20,6 +20,7 @@ from .routers import (
     clients,
     nodes,
     routes,
+    speedlimit,
     subscription,
     system,
     torrents,
@@ -148,6 +149,7 @@ app.include_router(nodes.router, prefix="/api")
 app.include_router(routes.router, prefix="/api")
 app.include_router(bypass.router, prefix="/api")
 app.include_router(torrents.router, prefix="/api")
+app.include_router(speedlimit.router, prefix="/api")
 app.include_router(system.router, prefix="/api")
 app.include_router(subscription.router)
 

@@ -311,6 +311,37 @@ export interface TorrentStatus {
   config_error: string | null
 }
 
+// Which of the kernel matches the limit is built on this host has. Without
+// `hashlimit` nothing can be limited at all.
+export interface SpeedLimitCapabilities {
+  hashlimit: boolean
+  comment: boolean
+}
+
+// Packets dropped for being over the limit since the rules were last built.
+export interface SpeedLimitDrops {
+  up: number
+  down: number
+  total: number
+}
+
+export interface SpeedLimitStatus {
+  enabled: boolean
+  // Mbit/s, for each client separately and each direction separately. Kept while
+  // the limit is off, so switching it back on returns to the same number.
+  rate_mbit: number | null
+  // What the node container says it is enforcing, which lags the two above by up
+  // to a second while a change is applied.
+  active: boolean
+  active_rate_mbit: number | null
+  rules: number
+  capabilities: SpeedLimitCapabilities | null
+  dropped: SpeedLimitDrops
+  live: boolean
+  editable: boolean
+  config_error: string | null
+}
+
 export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed'
 
 export interface NodeTask {
@@ -545,6 +576,12 @@ export const api = {
   torrents: () => request<TorrentStatus>('/torrents'),
   setTorrents: (payload: { enabled?: boolean; mode?: 'on' | 'strict' }) =>
     request<TorrentStatus>('/torrents', { method: 'PUT', body: JSON.stringify(payload) }),
+
+  // One rate every client is held to, each way. The switch and the rate are both
+  // optional, so the rate survives the limit being turned off and on again.
+  speedLimit: () => request<SpeedLimitStatus>('/speed-limit'),
+  setSpeedLimit: (payload: { enabled?: boolean; rate_mbit?: number }) =>
+    request<SpeedLimitStatus>('/speed-limit', { method: 'PUT', body: JSON.stringify(payload) }),
 
   clients: (params: Record<string, string | number | undefined>) => {
     const query = new URLSearchParams()

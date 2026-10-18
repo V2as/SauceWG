@@ -33,6 +33,8 @@ export BYPASS_MODE=off
 export BYPASS_GROUPS=telegram
 export TORRENT_BLOCK_FILE="$WORK/torrent-block.json"
 export TORRENT_STATE_FILE="$WORK/run/torrents.json"
+export SPEED_LIMIT_FILE="$WORK/speed-limit.json"
+export SPEED_LIMIT_STATE_FILE="$WORK/run/speed-limit.json"
 mkdir -p "$AWG_CONFIG_DIR" "$AWG_SOCKET_DIR"
 
 # shellcheck source=../docker/awg/lib.sh
@@ -161,7 +163,7 @@ ip() {
 # tests have to be able to take one away and see what is left — and put it back
 # through FAKE_MATCHES_ALL, because a match quietly missing afterwards fails the
 # rules of whatever runs next instead of the test that removed it.
-FAKE_MATCHES_ALL="conntrack string comment connbytes set length multiport"
+FAKE_MATCHES_ALL="conntrack string comment connbytes set length multiport hashlimit"
 FAKE_MATCHES=$FAKE_MATCHES_ALL
 
 fake_has() {
@@ -393,6 +395,8 @@ awg-bypass() {
 
 # shellcheck source=../docker/awg/torrents.sh
 . "$ROOT/docker/awg/torrents.sh"
+# shellcheck source=../docker/awg/speedlimit.sh
+. "$ROOT/docker/awg/speedlimit.sh"
 # shellcheck source=../docker/awg/uplinks.sh
 . "$ROOT/docker/awg/uplinks.sh"
 
@@ -676,6 +680,29 @@ hit_rule() {
 
 # A client the guard caught, as the ipset would be holding it.
 caught() { ipset add "$TORRENT_CLIENT_SET" "$1" "$2" "${3:-86000}"; }
+
+# --- speed limit accessors -------------------------------------------------
+
+speed_switch() { printf '%s\n' "$1" > "$SPEED_LIMIT_FILE"; }
+
+# Where one built-in chain hands traffic to a limit chain, or "none".
+speed_hook_of() {
+    sed -n "s/^mangle|$1|\(.*\) -j $2\$/\1/p" "$IPT" | head -n1 | grep . || printf 'none'
+}
+
+# Both hooks at once, upload first, which is the question most tests ask.
+speed_hooks() {
+    printf '%s / %s' "$(speed_hook_of PREROUTING "$SPEED_UP_CHAIN")" \
+        "$(speed_hook_of POSTROUTING "$SPEED_DOWN_CHAIN")"
+}
+
+speed_chains() {
+    sed -n 's/^mangle|//p' "$IPT_CHAINS" | grep '^SAUCEWG_LIMIT' | sort | tr '\n' ' ' | sed 's/ $//'
+}
+
+speed_rule_count() { mangle_chain "$1" | grep -c . | tr -d ' '; }
+
+speed_state() { jq -r "$1" "$SPEED_LIMIT_STATE_FILE"; }
 
 # Every stub tunnel, including the ones a re-parse dropped from the arrays: `wait`
 # would otherwise block on a process nothing is left holding a pid for.
@@ -1673,6 +1700,189 @@ uplinks_teardown
 check "the chains are gone" "" "$(torrent_chains)"
 check "and so is every rule they held" "" "$(grep -c 'saucewg:torrent' "$IPT" | grep -v '^0$' || true)"
 check "and no IPv6 route of the cascade's" "none" "$(cascade_default6)"
+
+echo "79. with nothing set anywhere, nobody is limited"
+speed_reload
+check "no rate is in force" "0" "$SPEED_KBIT"
+check "and it says nobody asked" "none" "$SPEED_SOURCE"
+check "no chain was created" "" "$(speed_chains)"
+check "and neither direction is hooked" "none / none" "$(speed_hooks)"
+speed_write_state
+check "the kernel is not claimed to lack what it was never asked for" "null" \
+    "$(speed_state .capabilities)"
+
+echo "80. one rate from the panel's file limits every client, each way"
+# Something else's rule already in the chain: the limit has to be met before it.
+iptables -t mangle -A PREROUTING -i eth0 -j ACCEPT
+speed_switch '{"enabled": true, "rate_mbit": 50}'
+speed_reload
+check "the rate is read from the file" "50000" "$SPEED_KBIT"
+check "what clients send is limited on the way in, and what they get on the way out" \
+    "-i awg0 -s 10.8.0.0/24 / -o awg0 -d 10.8.0.0/24" "$(speed_hooks)"
+check "the limit is the first thing a client's packet meets" \
+    "-i awg0 -s 10.8.0.0/24 -j $SPEED_UP_CHAIN" "$(mangle_chain PREROUTING | head -n1)"
+iptables -t mangle -D PREROUTING -i eth0 -j ACCEPT
+# 50 Mbit/s is 6.25 MB/s. One bucket per source address on the way in and per
+# destination on the way out is what makes it "each client" rather than "everyone".
+check "uploads get a bucket per client address" \
+    "-m hashlimit --hashlimit-above 6250000b/s --hashlimit-mode srcip --hashlimit-name sw-up-50000 --hashlimit-htable-max 256 -m comment --comment saucewg:limit:up -j DROP" \
+    "$(mangle_chain "$SPEED_UP_CHAIN")"
+check "and so do downloads, keyed by destination" \
+    "-m hashlimit --hashlimit-above 6250000b/s --hashlimit-mode dstip --hashlimit-name sw-dn-50000 --hashlimit-htable-max 256 -m comment --comment saucewg:limit:down -j DROP" \
+    "$(mangle_chain "$SPEED_DOWN_CHAIN")"
+check "the probe chain was cleaned up after itself" "SAUCEWG_LIMIT_DOWN SAUCEWG_LIMIT_UP" "$(speed_chains)"
+# A full table drops a newcomer's packets outright, so it has to hold the subnet.
+check "a bigger subnet gets a table with room for all of it" "65536 1048576 256" \
+    "$(AWG_SUBNET=10.8.0.0/16 speed_table_max) $(AWG_SUBNET=10.0.0.0/8 speed_table_max) $(AWG_SUBNET=10.8.0.0/28 speed_table_max)"
+
+echo "81. a tick that changes nothing leaves every client's bucket alone"
+iptables -t mangle -A "$SPEED_UP_CHAIN" -j RETURN
+speed_apply
+check "the rules are left exactly as they were" "2" "$(speed_rule_count "$SPEED_UP_CHAIN")"
+speed_parse
+uplinks_routing_base
+check "and so does a reload that was about something else" "2" "$(speed_rule_count "$SPEED_UP_CHAIN")"
+speed_switch '{"enabled": true, "rate_mbit": 7.5}'
+speed_reload
+check "but a new rate rebuilds them" "1" "$(speed_rule_count "$SPEED_UP_CHAIN")"
+# The kernel keeps hashlimit tables by name, so reusing one could keep the old rate.
+check "under a table named for the new rate" "sw-up-7500" \
+    "$(mangle_chain "$SPEED_UP_CHAIN" | grep -o 'sw-up-[0-9]*')"
+check "and a fraction of a Mbit/s is converted exactly" "937500b/s" \
+    "$(mangle_chain "$SPEED_UP_CHAIN" | grep -o '[0-9]*b/s')"
+
+echo "82. a limit lost to somebody else's flush is put back"
+iptables -t mangle -F "$SPEED_DOWN_CHAIN"
+speed_apply
+check "a missing rule is noticed and reinstated" "1" "$(speed_rule_count "$SPEED_DOWN_CHAIN")"
+iptables -t mangle -D PREROUTING -i awg0 -s 10.8.0.0/24 -j "$SPEED_UP_CHAIN"
+check "a missing hook is reported while it is gone" "true" \
+    "$(case "$(speed_error)" in *"nothing is being sent through them"*) echo true ;; *) echo "$(speed_error)" ;; esac)"
+speed_apply
+check "and the next tick puts it back" "-i awg0 -s 10.8.0.0/24 / -o awg0 -d 10.8.0.0/24" "$(speed_hooks)"
+check "with nothing left to warn about" "" "$(speed_error)"
+
+echo "83. what the limit is doing reaches the panel"
+hit_rule 30 'sw-up-7500'
+hit_rule 12 'sw-dn-7500'
+speed_write_state
+check "the rate in force is published in Mbit/s" "7.5" "$(speed_state .rate_mbit)"
+check "with the packets each direction dropped" "30 12 42" \
+    "$(speed_state '"\(.dropped.up) \(.dropped.down) \(.dropped.total)"')"
+check "where the setting came from" "file" "$(speed_state .source)"
+check "that both rules are in" "true 2" "$(speed_state '"\(.active) \(.rules)"')"
+check "what this kernel could do" "true" "$(speed_state .capabilities.hashlimit)"
+check "and that there is nothing to warn about" "null" "$(speed_state .error)"
+
+echo "84. a file that cannot be used keeps the limit already in force"
+speed_switch 'not json at all'
+speed_reload
+check "the rate is unchanged" "7500" "$SPEED_KBIT"
+check "and still enforced" "-i awg0 -s 10.8.0.0/24 / -o awg0 -d 10.8.0.0/24" "$(speed_hooks)"
+check "the reason is recorded" "true" \
+    "$(case "$(speed_error)" in *"not a JSON object"*) echo true ;; *) echo "$(speed_error)" ;; esac)"
+speed_switch '{"enabled": true, "rate_mbit": "fast"}'
+speed_reload
+check "so does a rate that is not a number" "7500" "$SPEED_KBIT"
+check "which is named" "true" \
+    "$(case "$(speed_error)" in *"'fast' is not a rate"*) echo true ;; *) echo "$(speed_error)" ;; esac)"
+speed_switch '{"enabled": true, "rate_mbit": 20000}'
+speed_reload
+check "and one beyond what the kernel counts precisely" "7500" "$SPEED_KBIT"
+speed_switch '{"enabled": true}'
+speed_reload
+check "and a switch with no rate behind it" "7500" "$SPEED_KBIT"
+
+echo "85. rates are read the way an operator writes them"
+check "a whole number of Mbit/s" "50000" "$(speed_kbit 50)"
+check "a fraction of one" "250" "$(speed_kbit 0.25)"
+check "with the unit spelled out" "100000 100000 100000" \
+    "$(speed_kbit 100mbit) $(speed_kbit '100 Mbit/s') $(speed_kbit 100Mbps)"
+check "\"mb\" is refused rather than guessed at" "no" "$(speed_kbit 50mb || echo no)"
+check "and so is MBps, which is megabytes" "no no" \
+    "$(speed_kbit 50MBps || echo no) $(speed_kbit '50 MBPS' || echo no)"
+check "while MBit is still megabits" "50000" "$(speed_kbit 50MBit)"
+check "and so is anything out of range" "no no" \
+    "$(speed_kbit 0.05 || echo no) $(speed_kbit 10001 || echo no)"
+check "and back again, exactly" "0.1 7.5 12.05 10000" \
+    "$(speed_mbit 100) $(speed_mbit 7500) $(speed_mbit 12050) $(speed_mbit 10000000)"
+
+echo "86. switching it off takes every rule with it and keeps the rate on file"
+speed_switch '{"enabled": false, "rate_mbit": 50}'
+speed_reload
+check "nobody is limited" "0" "$SPEED_KBIT"
+check "neither direction is hooked" "none / none" "$(speed_hooks)"
+check "no chain is left behind" "" "$(speed_chains)"
+speed_write_state
+check "and the panel is told nothing is in force" "null false" \
+    "$(speed_state '"\(.rate_mbit) \(.active)"')"
+check "while the rate waits on file for the switch" "50" "$(jq -r .rate_mbit "$SPEED_LIMIT_FILE")"
+
+echo "87. a kernel without hashlimit limits nobody, and says so"
+FAKE_MATCHES="conntrack string comment connbytes set length multiport"
+speed_switch '{"enabled": true, "rate_mbit": 50}'
+speed_reload
+check "nothing is hooked" "none / none" "$(speed_hooks)"
+check "and no chain is left half-built" "" "$(speed_chains)"
+check "the operator is told why" "true" \
+    "$(case "$(speed_error)" in *"no iptables hashlimit match"*) echo true ;; *) echo "$(speed_error)" ;; esac)"
+speed_write_state
+check "and the panel sees a missing capability rather than a limit" "false false" \
+    "$(speed_state '"\(.capabilities.hashlimit) \(.active)"')"
+FAKE_MATCHES=$FAKE_MATCHES_ALL
+speed_apply
+check "a tick does not keep asking a kernel that said no" "none / none" "$(speed_hooks)"
+speed_reload
+check "but reading the setting again does, and finds the module" \
+    "-i awg0 -s 10.8.0.0/24 / -o awg0 -d 10.8.0.0/24" "$(speed_hooks)"
+check "and the warning goes with it" "" "$(speed_error)"
+
+echo "88. without the comment match the rules still go in, and are still counted"
+FAKE_MATCHES="conntrack string connbytes set length multiport hashlimit"
+speed_teardown
+speed_reload
+check "the rule goes in unlabelled" "absent" \
+    "$(mangle_chain "$SPEED_UP_CHAIN" | grep -q 'saucewg:limit' && echo present || echo absent)"
+hit_rule 3 'sw-up-50000'
+speed_write_state
+check "and is counted by its table's name instead" "3" "$(speed_state .dropped.up)"
+FAKE_MATCHES=$FAKE_MATCHES_ALL
+speed_teardown
+speed_reload
+
+echo "89. the environment overrides the panel, and says so"
+export SPEED_LIMIT=20
+speed_reload
+check "the operator's rate wins over the file" "20000" "$SPEED_KBIT"
+check "and the panel is told the setting is not its own" "env" "$SPEED_SOURCE"
+export SPEED_LIMIT=off
+speed_reload
+check "off in the environment lifts it whatever the file says" "0 none / none" \
+    "$SPEED_KBIT $(speed_hooks)"
+export SPEED_LIMIT=50mb
+speed_reload
+check "a value that might mean megabytes limits nobody rather than guessing" "0" "$SPEED_KBIT"
+check "and is reported" "true" \
+    "$(case "$(speed_error)" in *"neither off nor a rate"*) echo true ;; *) echo "$(speed_error)" ;; esac)"
+unset SPEED_LIMIT
+
+echo "90. tearing the node down leaves no limit behind"
+speed_reload
+check "the limit is up" "-i awg0 -s 10.8.0.0/24 / -o awg0 -d 10.8.0.0/24" "$(speed_hooks)"
+uplinks_teardown
+check "both hooks are gone" "none / none" "$(speed_hooks)"
+check "and so are the chains" "" "$(speed_chains)"
+
+echo "91. what a killed container left behind is cleared with no limit set"
+speed_reload
+# No teardown runs for a container that is killed, and the next one starts knowing
+# nothing — which is what sourcing the file again gives this shell.
+# shellcheck source=../docker/awg/speedlimit.sh
+. "$ROOT/docker/awg/speedlimit.sh"
+rm -f "$SPEED_LIMIT_FILE"
+speed_reload
+check "the leftover hooks are cleared" "none / none" "$(speed_hooks)"
+check "and so are the chains" "" "$(speed_chains)"
 
 echo
 printf '%s passed, %s failed\n' "$PASSED" "$FAILED"

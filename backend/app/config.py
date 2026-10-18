@@ -76,6 +76,8 @@ class Settings(BaseSettings):
     # One client seeding is what gets an exit server suspended, so this is a switch
     # rather than a list. Same directory again.
     torrent_registry_file: str = "/etc/saucewg/host/torrent-block.json"
+    # The one rate every client is held to, each way. Same directory again.
+    speed_limit_registry_file: str = "/etc/saucewg/host/speed-limit.json"
     # Set to false to make the panel read-only with respect to the cascade, e.g.
     # when the node list is managed by configuration management.
     node_provision_enabled: bool = True
@@ -203,6 +205,12 @@ class Settings(BaseSettings):
         # Its own file rather than a key in uplinks.json: the same filter runs on
         # an exit node, which has no cascade state to publish it alongside.
         return f"{self.awg_socket_dir}/torrents.json"
+
+    @property
+    def speed_limit_state_file(self) -> str:
+        # Its own file for the same reason: it is published whether or not the
+        # cascade is running, since the limit applies either way.
+        return f"{self.awg_socket_dir}/speed-limit.json"
 
     @property
     def uplink_reload_file(self) -> str:

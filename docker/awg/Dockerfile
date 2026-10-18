@@ -56,6 +56,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY lib.sh /usr/local/lib/awg-lib.sh
 COPY uplinks.sh /usr/local/lib/awg-uplinks.sh
 COPY torrents.sh /usr/local/lib/awg-torrents.sh
+COPY speedlimit.sh /usr/local/lib/awg-speedlimit.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh \
     && mkdir -p /etc/amnezia/amneziawg /var/run/amneziawg
 

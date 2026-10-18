@@ -76,7 +76,12 @@ POST /api/admins        # requires a sudo token
 { "username": "central-api", "password": "…", "is_sudo": false, "is_active": true }
 ```
 
-Non-sudo admins can do everything in this document except manage other admins.
+A non-sudo admin can do everything this document describes for clients (§3–§5), read
+the node's state, and steer failover with `activate` and `auto`. What changes the node
+itself takes a sudo token and answers `403` without one: managing admins; adding,
+changing, controlling and recovering exit nodes, including reading an exit server's own
+status and logs; and writing the routes, reopened destinations, torrent switch and speed
+limit of §7–§10. An integration that only provisions users is right to stay non-sudo.
 
 Cache the token and re-authenticate on `401`. Do not fetch a token per request.
 
@@ -1101,7 +1106,105 @@ match. The equivalent on the entry node itself is `saucewg torrents`.
 
 ---
 
-## 10. Node information
+## 10. Limiting each client's speed
+
+One rate, held for every client separately and for each direction separately. At
+`rate_mbit: 50` every client can download at up to 50 Mbit/s and upload at up to
+50 Mbit/s, whatever the others are doing — a ceiling on each client, not a total shared
+between them, so ten clients at the limit move 500 Mbit/s each way. It is off on a new
+installation and on an updated one until a rate is chosen.
+
+```http
+GET /api/speed-limit         # the rate on file, and what the node is enforcing
+PUT /api/speed-limit         # set the rate, turn it on or off, or both (sudo)
+```
+
+```json
+{
+  "enabled": true,
+  "rate_mbit": 50,
+  "active": true,
+  "active_rate_mbit": 50,
+  "rules": 2,
+  "capabilities": { "hashlimit": true, "comment": true },
+  "dropped": { "up": 1840, "down": 52210, "total": 54050 },
+  "live": true,
+  "editable": true,
+  "config_error": null
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `enabled` | the switch, as configured here |
+| `rate_mbit` | the rate in **megabits** per second, as configured here, or `null` until one is chosen. **Kept while `enabled` is false**, so switching off and on again returns to the same rate |
+| `active` | the node container has the limit installed right now |
+| `active_rate_mbit` | the rate it is actually enforcing, or `null` when nothing is. Differs from `rate_mbit` for a second after a change, and permanently while `SPEED_LIMIT` overrides the file |
+| `rules` | how many iptables rules that took: `2`, one each way, when everything went in |
+| `capabilities` | which kernel matches this host has, or `null` until there has been a rate to install — see below |
+| `dropped` | packets dropped for being over the limit: `up` from clients, `down` to them, and `total`. Read off the rules themselves, so it starts again from zero whenever they are rebuilt — a new rate, the limit switched off and on, the node container restarting |
+| `live` | `false` when the node container is not publishing this — it is stopped, or older than this feature. Everything from `active` on is then unconfirmed |
+| `editable` | `false` when the panel cannot change the setting: `NODE_PROVISION_ENABLED=false`, or `SPEED_LIMIT` pinning it in the node container's environment |
+| `config_error` | why what is configured is not what is in force, or `null` |
+
+**Units.** `rate_mbit` is megabits per second, from `0.1` to `10000`, rounded to whole
+kbit/s — three decimals. Browsers, download managers and most speed tests report
+megabytes per second, which is an eighth of it: `50` is 6.25 MB/s, and a user who asks
+for "50 MB/s" means `400`. Convert at the edge of your system and store Mbit/s.
+
+```http
+PUT /api/speed-limit
+{ "enabled": true, "rate_mbit": 50 }   # one call sets the rate and turns it on
+{ "rate_mbit": 100 }                   # moves the rate without touching the switch
+{ "enabled": false }                   # lifts it; rate_mbit stays on file
+{ "enabled": true }                    # puts the kept rate back
+```
+
+Both fields are optional and independent, and the answer is the same object the `GET`
+returns. Turning the limit on needs a rate, in the same request or already on file.
+
+| Code | When |
+| --- | --- |
+| `403` | the token is not a sudo admin's: the limit applies to every client on the node, so it is a sudo setting like the rest of §7–§9 |
+| `409` | the setting is not the panel's to change — `NODE_PROVISION_ENABLED=false`, or `SPEED_LIMIT` set in the node container's environment. Both show on the `GET` as `editable: false`, with the reason in `config_error`, so a UI can disable the control rather than discover it on submit |
+| `422` | `rate_mbit` outside 0.1–10000 or not a number, or `enabled: true` with no rate anywhere |
+| `400` | `config/speed-limit.json` was broken by hand and the request names only one field — send both to replace the file — or the panel could not write it at all, which is `./config` not mounted read-write |
+| `503` | on the `GET`, the same broken file — there is no setting to report |
+
+**How it is enforced, and what follows from that.** The node container installs one
+`hashlimit` rule each way on the client interface, keeping a token bucket per client
+address: what clients send is counted on the way in from `awg0`, what they receive on
+the way out to it. A packet that finds its bucket empty is dropped rather than queued,
+and TCP settles at the rate the way it would on a slower link. What that means for an
+integration:
+
+- It is per **address**, so it applies from the moment a client exists, needs nothing on
+  the client's side and does not appear in the profile. A user with two client records
+  has two allowances.
+- The bucket holds **one second** of the rate. A client that has been idle gets that
+  much at full speed, so a page load does not feel throttled; over anything longer the
+  average is the limit. A speed test of a few seconds can read above the rate because of
+  it.
+- It covers every way a client's traffic leaves — the active exit node, a direct route of
+  §7, the entry node during a fallback, a reopened destination of §8 — and never the
+  tunnel itself: handshakes travel outside `awg0`, so a client at its limit stays
+  connected.
+- It is **one rate for everyone**. There is no per-client override, so plans that differ
+  in speed are not something this setting can express.
+
+**`capabilities.hashlimit: false`** means the host kernel has no `xt_hashlimit`, and
+nothing is limited at all: `active` stays `false` and `config_error` says why. It reads
+`null` rather than `false` until a rate is set, because the node asks its kernel only
+when there is something to install — so check it after turning the limit on, and never
+read the switch alone as proof that clients are limited. Without `comment` the rules go
+in unlabelled and are counted all the same.
+
+Changes apply within about a second and disturb no tunnel. The equivalent on the entry
+node itself is `saucewg speed-limit [RATE|on|off]`.
+
+---
+
+## 11. Node information
 
 ```http
 GET /api/system
@@ -1179,7 +1282,7 @@ as a liveness probe.
 
 ---
 
-## 11. Errors
+## 12. Errors
 
 FastAPI's shape throughout:
 
@@ -1192,10 +1295,11 @@ defensively.
 
 | Code | When | What to do |
 | --- | --- | --- |
+| `400` | a value the endpoint understood but cannot use — a prefix it will not route, disabling your own account — or a control file under `config/` that was broken by hand | fix the payload, or replace the file |
 | `401` | missing, expired or revoked token | re-authenticate once, then fail |
-| `403` | non-sudo token on an admin endpoint, or a disabled subscription | do not retry |
+| `403` | non-sudo token on an endpoint that changes the node (see §2), or a disabled subscription | do not retry |
 | `404` | unknown client, admin or exit node | do not retry |
-| `409` | duplicate name/public key, config for a key-only client, another task still running for that exit node, or a cascade this panel does not own | reconcile your state |
+| `409` | duplicate name/public key, config for a key-only client, another task still running for that exit node, a cascade this panel does not own, or a setting the node's environment pins (`TORRENT_BLOCK`, `SPEED_LIMIT`) | reconcile your state |
 | `422` | validation, or missing SSH credentials for an operation that needs them | fix the payload |
 | `503` | node container not ready, or a control file unwritable | retry with backoff |
 
@@ -1206,7 +1310,7 @@ Restrict `CORS_ORIGINS` too — it defaults to `*`.
 
 ---
 
-## 12. Integration recipes
+## 13. Integration recipes
 
 **Provision a user**
 
@@ -1280,7 +1384,7 @@ must not block operations on the others.
 
 ---
 
-## 13. Configuration reference
+## 14. Configuration reference
 
 Values the central system may need to know about, set in the entry node's `.env`.
 
@@ -1311,6 +1415,7 @@ Values the central system may need to know about, set in the entry node's `.env`
 | `BYPASS_ATTEMPTS` / `BYPASS_PARALLEL` | 96 / 6 | the retry path's handshake budget per connection, and how many of them are outstanding at once |
 | `TORRENT_BLOCK` | — | `off`, `on` or `strict` pins the torrent guard of §9 and makes it read-only through the API; empty leaves the switch to the panel |
 | `TORRENT_TCP_PORTS` / `TORRENT_UDP_PORTS` | see §9 | the ports `strict` leaves open. Adding 500, 4500 or 51820 lets a client run its own VPN out of the tunnel, and torrent inside that |
+| `SPEED_LIMIT` | — | a rate in Mbit/s (`50`, `7.5`, `100mbit`) or `off` pins the speed limit of §10 and makes it read-only through the API; empty leaves it to the panel. A value that could mean megabytes, such as `50mb` or `50MBps`, is refused and limits nobody |
 | `NODE_PROVISION_ENABLED` | `true` | `false` makes the cascade read-only through the API — see [`SAUCEWG_USAGE.md` §6](SAUCEWG_USAGE.md#6-files-on-the-server) |
 | `NODE_RECOVERY_ENABLED` | `true` | whether the panel tries to restart a failed exit node on its own, as in §6 |
 | `NODE_RECOVERY_GRACE_SECONDS` | `300` | how long a node must be unhealthy before the first attempt |
@@ -1319,7 +1424,7 @@ Values the central system may need to know about, set in the entry node's `.env`
 
 ---
 
-## 14. Things that will surprise you
+## 15. Things that will surprise you
 
 * **`name` is the primary key in the API.** Renaming a client changes every URL. Use
   immutable IDs from your system as names.
@@ -1377,6 +1482,20 @@ Values the central system may need to know about, set in the entry node's `.env`
   `on`, so a UI that sends the mode alongside every toggle will fight the panel.
 * **Check `capabilities.string` once per node.** Without it the guard is a port filter
   and nothing more, which is not what the switch being green implies.
+* **The speed limit is per client and per direction, not a total.** `rate_mbit: 50`
+  lets every client download at 50 Mbit/s and upload at 50 Mbit/s at the same time;
+  the server is not divided between them.
+* **`rate_mbit` is megabits.** A user's "50 MB/s" is `400`, and a UI that labels the
+  field in MB/s without converting gives everybody an eighth of what was meant.
+* **`rate_mbit` survives being switched off,** and cannot be cleared — `null` in a `PUT`
+  means "leave it". Nothing needs it cleared: a rate on file with `enabled: false`
+  limits nobody.
+* **A short speed test reads above the limit.** The bucket holds a second of the rate,
+  which an idle client spends at full speed before it is held to the limit.
+* **The speed limit is not a status.** A client held to it stays `active`; it has
+  nothing to do with `data_limit` or `limited`, which are about volume. Its `dropped`
+  counters start from zero whenever the rules are rebuilt — a new rate, the limit
+  switched off and on, a restart of the node container — so take differences.
 * **Failover does not repair.** A failed exit node stays failed until the panel's
   recovery gets it back or an operator does. `recovery.blocked == "unreachable"` is the
   one that needs a human: that server is not answering at all.

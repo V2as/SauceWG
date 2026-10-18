@@ -36,6 +36,11 @@ follows by suspending that server — so one client seeding costs every client o
 discovery, the peer wire and every address caught speaking either are blocked on the
 forwarding path, on by default, with a switch in the panel.
 
+How fast a client may go is one number for everybody: at 50 Mbit/s every client can
+download at up to 50 Mbit/s and upload at up to 50 Mbit/s, each on its own, whatever the
+others are doing. It is off until a rate is chosen, from the panel's **Speed limit**
+page, its API or the CLI. See [Limiting each client's speed](#limiting-each-clients-speed).
+
 ```
    client                 entry node (unblocked IP)                exit nodes
  ┌────────┐  AmneziaWG   ┌───────────────────────┐  awg1  ┌──────────────┐
@@ -297,11 +302,17 @@ curl -H "Authorization: Bearer $TOKEN" http://<host>/api/clients
 | `GET/POST` | `/api/bypass` | destinations the entry node reopens for itself / add some |
 | `PUT/DELETE` | `/api/bypass/{cidr}` | change its IPv6 counterpart or disable it / remove it |
 | `GET/PUT` | `/api/torrents` | whether BitTorrent is blocked here, what it caught / switch it |
+| `GET/PUT` | `/api/speed-limit` | the rate every client is held to, and what went over it / set it |
 | `GET` | `/api/system` | host stats, client counts, live speed, cascade state |
 | `GET` | `/api/system/usage?hours=` | node-wide traffic history |
 | `POST` | `/api/system/sync` | force peer reconciliation |
 | `GET` | `/api/settings` | interface, AmneziaWG generation and obfuscation parameters |
 | `GET` | `/sub/{token}` | the client profile, no admin auth required |
+
+Any admin can manage clients, read the node's state and steer failover (`activate`,
+`auto`). Changing the node itself — exit nodes and their servers, routes, reopened
+destinations, the torrent guard, the speed limit — takes a sudo admin, as do the admin
+endpoints; anyone else gets a `403`.
 
 Interactive docs are at `/api/docs` when `DOCS_ENABLED=true`.
 [`AWG_USAGE.md`](AWG_USAGE.md) documents every field and its semantics;
@@ -879,6 +890,66 @@ empty — the default — the setting comes from `config/torrent-block.json`, wh
 panel and `saucewg torrents` write and the node container applies within a second
 without disturbing a tunnel.
 
+## Limiting each client's speed
+
+One number caps how fast any single client can go through the entry node: at 50 Mbit/s
+every client can download at up to 50 Mbit/s and upload at up to 50 Mbit/s, whatever the
+others are doing. It is a ceiling on each client, not a share of the server — ten clients
+at the limit are 500 Mbit/s each way, and the server's own link is still the ceiling
+above that. It is off until a rate is chosen, on a new installation and on an updated
+one alike.
+
+```bash
+saucewg speed-limit                  # the rate, and how much went over it
+saucewg speed-limit 50               # every client to 50 Mbit/s each way
+saucewg speed-limit off              # lift it; the rate is kept for `on`
+```
+
+Or the **Speed limit** page in the panel, or `PUT /api/speed-limit` with
+`{"enabled": true, "rate_mbit": 50}` — the same file behind all three. The rate is in
+**megabits** per second, from 0.1 to 10000, because that is what links and tariffs are
+sold in. A browser or a speed test reporting megabytes per second shows an eighth of
+that: 50 Mbit/s is 6.25 MB/s, and 50 MB/s is `400`. The page shows both, and the CLI
+refuses `50MB` with the conversion rather than guessing.
+
+It is a policer rather than a shaper. One `hashlimit` rule each way keeps a token bucket
+per client address — in `mangle/PREROUTING` for what clients send in on `awg0`, in
+`mangle/POSTROUTING` for what goes out to them — and a packet that finds its bucket empty
+is dropped rather than queued. TCP reads the drop as congestion and settles at the rate,
+which is what a speed test sees. The bucket holds one second's worth of the rate, so a
+client that has been idle can send that much at full speed before the limit bites; over
+anything longer, the average is the limit.
+
+Keying the bucket on the address inside the tunnel is what makes this one rule rather
+than a class per client kept in step with the panel: a client created a second ago is
+limited from its first packet, and a deleted one leaves nothing to clean up. It also
+means the limit follows a client whichever way its traffic leaves — the active exit
+node, a direct route, the entry node during a fallback, the relay for a reopened
+destination. The tunnel itself is never throttled: handshakes and keepalives travel
+encrypted outside `awg0`, so a client at its limit stays connected.
+
+What it is not:
+
+- **Not `data_limit`.** That is a *volume* per client, which cuts the client off when it
+  is used up; this is a *rate*, the same for everyone, that never cuts anyone off.
+- **Not capacity.** The userspace tunnel usually runs out of CPU long before a generous
+  limit is reached (see [Operating notes](#operating-notes)). A limit decides how what
+  there is gets shared; it does not add any.
+- **Not a per-client plan.** There is one rate and no override for a particular client.
+- **Not on an exit node.** An exit node sees one address per entry node rather than
+  clients, so there is nothing per client to limit by there.
+
+Changes apply within a second and disturb no tunnel. A new rate rebuilds the rules, so
+the counters of dropped packets start again from zero, as they do when the node
+container restarts. The node probes its kernel for `xt_hashlimit` and publishes what it
+found; a host without it limits nothing, and the panel says so rather than showing a
+limit that is not there.
+
+`SPEED_LIMIT=50` (or `off`) pins the setting in the environment and takes it out of the
+panel, the same way `TORRENT_BLOCK` does for the torrent guard. Left empty — the default
+— it comes from `config/speed-limit.json`, which the panel and `saucewg speed-limit`
+write.
+
 ## Monitoring
 
 The collector polls the device every `COLLECTOR_INTERVAL_SECONDS` and:
@@ -982,6 +1053,14 @@ workflow does.
   `ip -6 rule` for `awg0`, so no packet a client sends can reach the IPv6 bridge even
   when the cascade has one. Giving clients IPv6 means giving the guard an `ip6tables`
   half in the same change.
+- **The speed limit** is in `mangle` as well, but in `PREROUTING` and `POSTROUTING`
+  rather than `FORWARD`: what a client sends to the bypass relay is delivered locally
+  and never forwarded, and the relay's answers come from the node itself. Its two hooks
+  go in at position 1 and are re-checked on the node container's regular tick, so a
+  rule something else flushed comes back on its own. The rate is part of each rule's
+  bucket-table name, because the kernel keeps tables by name and a rule added under a
+  live name would quietly keep the old rate. IPv4-only for the same reason as the
+  torrent guard.
 - **Performance.** Both hops run the userspace `amneziawg-go`, which is CPU-bound. On a
   2-core VPS expect tens of Mbit/s per node. Installing the AmneziaWG kernel module on the
   host and pointing `WG_QUICK_USERSPACE_IMPLEMENTATION` at it is the usual next step if you
@@ -1002,10 +1081,13 @@ backend/          FastAPI service (app/awg = UAPI client, app/services = workers
 frontend/         Vue 3 + Vite single-page UI
 docker/awg/       AmneziaWG node image: entrypoint, generations, uplinks + failover monitor
 docker/awg/torrents.sh  the layered BitTorrent filter, and what it publishes about itself
+docker/awg/speedlimit.sh  the per-client speed limit, and what it publishes about itself
 docker/awg/bypass/  awg-bypass, the transparent relay for reopened destinations (Go)
 docker/caddy/     frontend build + Caddy reverse proxy image
 scripts/          bootstrap helpers, the exit node list manager, CI test harnesses
-config/           the four lists the panel and the node share, bind-mounted into the node
+config/           the lists and switches the panel and the node share, bind-mounted into
+                  the node: exit-nodes.json, direct-routes.json, bypass.json,
+                  torrent-block.json, speed-limit.json
 .github/workflows/  CI checks and the Docker Hub publish pipeline
 AWG_USAGE.md      integration reference for managing users from a central API
 SAUCEWG_USAGE.md  installing and managing servers, from a shell or a bot

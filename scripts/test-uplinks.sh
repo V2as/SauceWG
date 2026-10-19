@@ -74,16 +74,136 @@ FAKE_DEFAULT6=""
 # but allocates no address — and that combination is not IPv6 egress however much
 # it looks like it.
 FAKE_GLOBAL6="2001:db8:ffff::1/128"
+# Whether this host's gateway can only be named with `onlink`. A VPS whose address is
+# a /32 reaches its gateway through an `onlink` default route and has no route of
+# link scope to it, and the kernel then refuses every other route through that
+# gateway that does not say `onlink` as well.
+FAKE_GATEWAY_ONLINK=false
+# Destinations the kernel refuses to route whatever the next hop, space-separated.
+FAKE_ROUTE_REFUSE=""
+# Every call that changes a route or a rule, in order, so that a test can tell an
+# apply that changed nothing from one that took something down and put it back.
+IP_LOG="$WORK/ip.log"
+: > "$IP_LOG"
 
-ip() {
-    local args=() x table=main i family=4 metric=""
+# A host route is stored with its /32, as it was asked for, and compared that way;
+# the kernel is asked both ways and prints it without.
+fake_dest() {
+    case $2 in
+        ''|default|*/*) printf '%s' "$2" ;;
+        *) if [ "$1" = 6 ]; then printf '%s/128' "$2"; else printf '%s/32' "$2"; fi ;;
+    esac
+}
+
+# Whether the fake kernel takes a route, saying why not on stderr the way iproute2
+# does. Takes the family, the destination and the words after it.
+fake_route_allowed() {
+    local family=$1 dest=$2 x via=false onlink=false
+    shift 2
     for x in "$@"; do
         case $x in
-            -4) family=4 ;;
-            -6) family=6 ;;
-            *) args+=("$x") ;;
+            via) via=true ;;
+            onlink) onlink=true ;;
         esac
     done
+    case " $FAKE_ROUTE_REFUSE " in
+        *" ${dest} "*) printf 'RTNETLINK answers: Invalid argument\n' >&2; return 1 ;;
+    esac
+    if [ "$family" = 4 ] && [ "$FAKE_GATEWAY_ONLINK" = true ] && $via && ! $onlink; then
+        printf 'Error: Nexthop has invalid gateway.\n' >&2
+        return 1
+    fi
+    return 0
+}
+
+# Policy rules are matched the way the kernel matches them: every attribute a
+# command names has to agree, and one it leaves out matches whatever is there.
+# `exact` finds the duplicate an add is refused for, `first` the rule a delete
+# takes — the lowest priority of those that match. Prints a line number of $RULES.
+fake_rule_match() {
+    awk -F'\t' -v f="$1" -v how="$2" -v spec="$3" '
+        function parse(s, kv,    n, w, i, k) {
+            split("", kv)
+            n = split(s, w, " ")
+            for (i = 1; i <= n; i++) {
+                k = w[i]
+                if (k == "table") k = "lookup"
+                else if (k == "pref" || k == "preference" || k == "prio") k = "priority"
+                kv[k] = (i < n) ? w[++i] : ""
+            }
+        }
+        BEGIN { parse(spec, want); best = 0 }
+        $1 == f {
+            parse($2, have)
+            for (k in want) if (!(k in have) || have[k] != want[k]) next
+            if (how == "exact") {
+                for (k in have) if (!(k in want)) next
+                print NR
+                exit
+            }
+            p = ("priority" in have) ? have["priority"] + 0 : 0
+            if (!best || p < bestp) { best = NR; bestp = p }
+        }
+        END { if (how != "exact" && best) print best }' "$RULES"
+}
+
+# Without a metric this takes every route to the destination, which is what the
+# callers that drop a default route mean.
+fake_route_drop() {
+    awk -F'\t' -v f="$1" -v t="$2" -v d="$3" -v m="$4" \
+        '!($1 == f && $2 == t && $3 == d && (m == "" || $5 == m))' \
+        "$ROUTES" > "$ROUTES.tmp" || true
+    mv "$ROUTES.tmp" "$ROUTES"
+}
+
+# `ip rule show`: every rule of the family in priority order, in the kernel's format.
+fake_rule_show() {
+    {
+        printf '0\tfrom all lookup local\n'
+        printf '32766\tfrom all lookup main\n'
+        [ "$1" = 6 ] || printf '32767\tfrom all lookup default\n'
+        awk -F'\t' -v f="$1" '$1 == f {
+            n = split($2, w, " "); pref = 0; out = ""
+            for (i = 1; i <= n; i++) {
+                if (w[i] == "priority" || w[i] == "pref" || w[i] == "preference") { pref = w[++i]; continue }
+                out = out (out == "" ? "" : " ") w[i]
+            }
+            if (out !~ /^from /) out = "from all " out
+            print pref "\t" out
+        }' "$RULES"
+    } | sort -s -n -k1,1 | awk -F'\t' '{print $1 ":\t" $2}'
+}
+
+ip() {
+    local args=() table=main i family=4 metric="" force=false batch=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -4) family=4 ;;
+            -6) family=6 ;;
+            -force) force=true ;;
+            -batch) batch=${2:--}; shift ;;
+            *) args+=("$1") ;;
+        esac
+        shift
+    done
+
+    # One command per line, the way `ip -batch` reads them. A refusal stops the batch
+    # unless -force says to carry on, and is reported with the line it was on.
+    if [ -n "$batch" ]; then
+        local line n=0 status=0 words
+        while IFS= read -r line; do
+            n=$((n + 1))
+            read -r -a words <<< "$line"
+            [ "${#words[@]}" -gt 0 ] || continue
+            if ! ip "-${family}" "${words[@]}"; then
+                printf 'Command failed %s:%s\n' "$batch" "$n" >&2
+                status=1
+                [ "$force" = true ] || return "$status"
+            fi
+        done
+        return "$status"
+    fi
+
     for ((i = 0; i < ${#args[@]}; i++)); do
         [ "${args[$i]}" = table ] && table=${args[$((i + 1))]}
         # Two routes to the same destination coexist when their metrics differ,
@@ -110,19 +230,21 @@ ip() {
                 replace|add)
                     # "unreachable default" names the type before the destination.
                     [ "$dest" != unreachable ] || dest=${args[3]:-}
-                    display=$(printf '%s' "${args[*]:2}" | sed 's/ table [0-9]*//')
-                    ip "-${family}" route del "$dest" table "$table" metric "$metric" >/dev/null 2>&1
+                    dest=$(fake_dest "$family" "$dest")
+                    fake_route_allowed "$family" "$dest" "${args[@]:3}" || return 2
+                    printf '%s %s\n' "$family" "${args[*]}" >> "$IP_LOG"
+                    display=$(printf '%s' "${args[*]:2}" | sed 's/ table [0-9]*//' \
+                        | sed -e 's|^\([0-9.]*\)/32 |\1 |' -e 's|^\([0-9.]*\)/32$|\1|')
+                    fake_route_drop "$family" "$table" "$dest" "$metric"
                     printf '%s\t%s\t%s\t%s\t%s\n' "$family" "$table" "$dest" "$display" "$metric" >> "$ROUTES"
                     ;;
                 del)
-                    # Without a metric this takes every route to the destination,
-                    # which is what the callers that drop a default route mean.
-                    awk -F'\t' -v f="$family" -v t="$table" -v d="$dest" -v m="$metric" \
-                        '!($1 == f && $2 == t && $3 == d && (m == "" || $5 == m))' \
-                        "$ROUTES" > "$ROUTES.tmp" || true
-                    mv "$ROUTES.tmp" "$ROUTES"
+                    dest=$(fake_dest "$family" "$dest")
+                    printf '%s %s\n' "$family" "${args[*]}" >> "$IP_LOG"
+                    fake_route_drop "$family" "$table" "$dest" "$metric"
                     ;;
                 flush)
+                    printf '%s %s\n' "$family" "${args[*]}" >> "$IP_LOG"
                     awk -F'\t' -v f="$family" -v t="$table" \
                         '!($1 == f && $2 == t)' "$ROUTES" > "$ROUTES.tmp" || true
                     mv "$ROUTES.tmp" "$ROUTES"
@@ -137,21 +259,30 @@ ip() {
             fi
             ;;
         rule)
-            local selector="${args[*]:2}"
-            selector=${selector% priority *}
+            local hit
             case "${args[1]:-}" in
-                add) printf '%s\t%s\n' "$family" "${args[*]:2}" >> "$RULES" ;;
+                add)
+                    if [ -n "$(fake_rule_match "$family" exact "${args[*]:2}")" ]; then
+                        printf 'RTNETLINK answers: File exists\n' >&2
+                        return 2
+                    fi
+                    printf '%s %s\n' "$family" "${args[*]}" >> "$IP_LOG"
+                    printf '%s\t%s\n' "$family" "${args[*]:2}" >> "$RULES"
+                    ;;
                 del)
-                    # `del lookup <table>` names no source and takes whatever rule
+                    # `del lookup <table>` names no source and takes a rule that
                     # points at that table, which is how a rule is removed without
                     # having to know the prefix it was added for.
-                    local anchored=1
-                    case $selector in "lookup "*) anchored=0 ;; esac
-                    awk -F'\t' -v f="$family" -v s="$selector" -v a="$anchored" \
-                        '!($1 == f && (a ? index($2, s) == 1 : index($2, s) > 0))' \
-                        "$RULES" > "$RULES.tmp" || true
+                    hit=$(fake_rule_match "$family" first "${args[*]:2}")
+                    if [ -z "$hit" ]; then
+                        printf 'RTNETLINK answers: No such file or directory\n' >&2
+                        return 2
+                    fi
+                    printf '%s %s\n' "$family" "${args[*]}" >> "$IP_LOG"
+                    awk -v n="$hit" 'NR != n' "$RULES" > "$RULES.tmp" || true
                     mv "$RULES.tmp" "$RULES"
                     ;;
+                show|list|ls|lst|'') fake_rule_show "$family" ;;
             esac
             ;;
     esac
@@ -309,7 +440,11 @@ ipset() {
     return 0
 }
 
-conntrack() { :; }
+# Recorded, because which open flows an edit drops is the difference between a
+# change that takes effect and one that leaves connections hanging on the old path.
+CONNTRACK_LOG="$WORK/conntrack.log"
+: > "$CONNTRACK_LOG"
+conntrack() { printf '%s\n' "$*" >> "$CONNTRACK_LOG"; }
 
 # Whether the far end still reaches the internet, which is the second half of a
 # probe: a tunnel can be handshaking and still be carrying nothing. The two
@@ -543,6 +678,12 @@ direct_table() {
 
 direct_route_of() {
     awk -F'\t' -v t="$CASCADE_DIRECT_TABLE" -v d="$1" '$1 == 4 && $2 == t && $3 == d {print $4}' "$ROUTES"
+}
+
+# Whether client traffic is looked up in the bypass table at all, as the kernel's own
+# rule list says.
+direct_rule() {
+    if direct_rule_present; then printf 'yes'; else printf 'no'; fi
 }
 
 # Which uplinks the bridge's own IPv6 can leave through, as interface names in
@@ -910,7 +1051,9 @@ routes '["203.0.113.0/24", "198.51.100.7", {"cidr": "192.0.2.128/25", "note": "y
 direct_reload
 check "each one is in the bypass table" "192.0.2.128/25 198.51.100.7/32 203.0.113.0/24" \
     "$(direct_table)"
-check "a bare address is a single host" "198.51.100.7/32 via 192.0.2.1 dev eth0" \
+# The kernel prints a host route without its /32. `onlink` is there because the
+# gateway is the entry node's own: the main table has already found it on that link.
+check "a bare address is a single host" "198.51.100.7 via 192.0.2.1 dev eth0 onlink" \
     "$(direct_route_of 198.51.100.7/32)"
 check "the bypass table is consulted first" "450 451" "$(rule_tables)"
 check "the entry node NATs what it sends out" "yes" "$(has_nat "-s 10.8.0.0/24 -o eth0 -j MASQUERADE")"
@@ -952,7 +1095,7 @@ routes '["203.0.113.0/24"]'
 direct_reload
 FAKE_DEFAULT="default via 192.0.2.254 dev eth1"
 direct_routes_apply
-check "the route is rebuilt on the new gateway" "203.0.113.0/24 via 192.0.2.254 dev eth1" \
+check "the route is rebuilt on the new gateway" "203.0.113.0/24 via 192.0.2.254 dev eth1 onlink" \
     "$(direct_route_of 203.0.113.0/24)"
 check "and the NAT moves with it" "yes" "$(has_nat "-s 10.8.0.0/24 -o eth1 -j MASQUERADE")"
 check "the old NAT rule is withdrawn" "no" "$(has_nat "-s 10.8.0.0/24 -o eth0 -j MASQUERADE")"
@@ -1883,6 +2026,144 @@ rm -f "$SPEED_LIMIT_FILE"
 speed_reload
 check "the leftover hooks are cleared" "none / none" "$(speed_hooks)"
 check "and so are the chains" "" "$(speed_chains)"
+
+echo "92. a gateway that is only reachable on-link still carries the direct routes"
+# A VPS whose address is a /32 has no route of link scope to its gateway, only an
+# `onlink` default route, and the kernel refuses every other route through that
+# gateway that does not say `onlink` too. Without it a real entry node installed no
+# direct route at all, and published every one of them as applied.
+FAKE_DEFAULT="default via 192.0.2.1 dev eth0 proto static onlink"
+FAKE_GATEWAY_ONLINK=true
+check "the fake kernel refuses such a route without onlink" "refused" \
+    "$(if ip -4 route replace 192.0.2.0/25 via 192.0.2.1 dev eth0 table 999 2>/dev/null; then echo accepted; else echo refused; fi)"
+routes '["203.0.113.0/24", "198.51.100.7"]'
+direct_reload
+check "both are routed" "198.51.100.7/32 203.0.113.0/24" "$(direct_table)"
+check "through the gateway, on-link" "203.0.113.0/24 via 192.0.2.1 dev eth0 onlink" \
+    "$(direct_route_of 203.0.113.0/24)"
+check "client traffic is looked up in them" "yes" "$(direct_rule)"
+uplinks_write_state
+check "both are published as in effect" "198.51.100.7/32 203.0.113.0/24" \
+    "$(jq -r '.direct.routes | sort | join(" ")' "$UPLINK_STATE_FILE")"
+check "with nothing to report" "null" "$(jq -r .direct.error "$UPLINK_STATE_FILE")"
+check "along with the next hop they use" "via 192.0.2.1 dev eth0 onlink" \
+    "$(jq -r .direct.nexthop "$UPLINK_STATE_FILE")"
+
+echo "93. a route the kernel refuses is reported, not published as in effect"
+FAKE_ROUTE_REFUSE="100.64.0.0/10"
+routes '["100.64.0.0/10", "198.51.100.7", "192.0.2.128/25"]'
+direct_reload
+uplinks_write_state
+check "only what the kernel took is in effect" "192.0.2.128/25 198.51.100.7/32" \
+    "$(jq -r '.direct.routes | sort | join(" ")' "$UPLINK_STATE_FILE")"
+check "the list is published beside it" "100.64.0.0/10 192.0.2.128/25 198.51.100.7/32" \
+    "$(jq -r '.direct.listed | sort | join(" ")' "$UPLINK_STATE_FILE")"
+check "and the count is of what is in effect" "2" "$(jq -r .direct.applied "$UPLINK_STATE_FILE")"
+direct_state_error=$(jq -r .direct.error "$UPLINK_STATE_FILE")
+check "the operator is told how many, and what the kernel said" "true" \
+    "$(case "$direct_state_error" in *"refused 1 of 3"*"Invalid argument"*) echo true ;; *) echo "$direct_state_error" ;; esac)"
+
+echo "94. a refusal is retried, but not on every tick"
+FAKE_ROUTE_REFUSE=""
+direct_heal "$(date -u +%s)"
+check "a tick inside the retry interval leaves it be" "2" "$DIRECT_APPLIED"
+direct_heal "$DIRECT_RETRY_AT"
+check "the retry installs it" "3" "$DIRECT_APPLIED"
+check "and the error goes with it" "" "$(direct_error)"
+
+echo "95. what is taken away from outside is put back on the next tick"
+# systemd-networkd reconfiguring the interface, or an operator's `ip rule flush`,
+# takes these away without the list or the gateway changing.
+: > "$CONNTRACK_LOG"
+ip -4 route flush table "$CASCADE_DIRECT_TABLE"
+direct_heal "$(date -u +%s)"
+check "the routes are back" "100.64.0.0/10 192.0.2.128/25 198.51.100.7/32" "$(direct_table)"
+check "and in effect" "3" "$DIRECT_APPLIED"
+ip rule del from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE"
+direct_heal "$(date -u +%s)"
+check "so is the rule" "yes" "$(direct_rule)"
+check "and everything is in effect again" "3" "$DIRECT_APPLIED"
+check "flows bound to the direct path before it went are left to carry on" "" \
+    "$(cat "$CONNTRACK_LOG")"
+
+echo "96. applying the same list again takes nothing down"
+: > "$IP_LOG"
+direct_reload
+check "no route and no rule is touched" "" "$(cat "$IP_LOG")"
+: > "$CONNTRACK_LOG"
+routes '["100.64.0.0/10", "198.51.100.7", "192.0.2.128/25", "203.0.113.0/24"]'
+direct_reload
+check "adding one writes only that one" \
+    "4 route replace 203.0.113.0/24 via 192.0.2.1 dev eth0 onlink table ${CASCADE_DIRECT_TABLE}" \
+    "$(cat "$IP_LOG")"
+
+echo "97. an edit drops the open flows to what it moved, and nothing else"
+check "the flows to the one added are dropped" "-D -s 10.8.0.0/24 -d 203.0.113.0/24" \
+    "$(cat "$CONNTRACK_LOG")"
+: > "$CONNTRACK_LOG"
+routes '["100.64.0.0/10", "198.51.100.7", "192.0.2.128/25"]'
+direct_reload
+check "and so are the flows to the one removed" "-D -s 10.8.0.0/24 -d 203.0.113.0/24" \
+    "$(cat "$CONNTRACK_LOG")"
+# A new container starts knowing nothing, and the flows still open were bound by the
+# one before it to paths that are still there.
+: > "$CONNTRACK_LOG"
+# shellcheck disable=SC2034  # both are read by the code under test
+DIRECT_STARTED=false
+# shellcheck disable=SC2034
+DIRECT_ACTIVE=()
+direct_reload
+check "a container that has just started drops nothing" "" "$(cat "$CONNTRACK_LOG")"
+
+echo "98. what a killed container left behind is corrected rather than trusted"
+ip rule add from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE" priority 449
+ip -4 route replace 198.51.100.7/32 via 192.0.2.99 dev eth9 onlink table "$CASCADE_DIRECT_TABLE"
+direct_reload
+check "one rule is left, at its own priority" "${CASCADE_DIRECT_RULE_PRIORITY}" \
+    "$(direct_rule_priorities | tr '\n' ' ' | sed 's/ $//')"
+check "and a route through another gateway is moved to this one" \
+    "198.51.100.7 via 192.0.2.1 dev eth0 onlink" "$(direct_route_of 198.51.100.7/32)"
+
+echo "99. the entry node's own route is read off its keywords, not its columns"
+FAKE_DEFAULT="default dev ppp0 scope link"
+check "a point-to-point link has no gateway to name" "ppp0|dev ppp0" "$(wan_iface)|$(wan_nexthop)"
+FAKE_DEFAULT="default nhid 7 via 192.0.2.1 dev eth0 proto static"
+check "a nexthop object puts a pair in front" "eth0|via 192.0.2.1 dev eth0 onlink" \
+    "$(wan_iface)|$(wan_nexthop)"
+FAKE_DEFAULT=$'default proto static metric 100\n\tnexthop via 192.0.2.1 dev eth0 weight 1\n\tnexthop via 192.0.2.2 dev eth1 weight 1'
+check "a multipath route is taken by its first hop" "eth0|via 192.0.2.1 dev eth0 onlink" \
+    "$(wan_iface)|$(wan_nexthop)"
+
+echo "100. with no route of its own, nothing is published as in effect"
+FAKE_DEFAULT=""
+direct_reload
+uplinks_write_state
+check "the table is emptied" "" "$(direct_table)"
+check "and nothing is in effect" "0 []" \
+    "$(jq -r '"\(.direct.applied) \(.direct.routes | tostring)"' "$UPLINK_STATE_FILE")"
+direct_state_error=$(jq -r .direct.error "$UPLINK_STATE_FILE")
+check "the operator is told why" "true" \
+    "$(case "$direct_state_error" in *"no default route"*) echo true ;; *) echo "$direct_state_error" ;; esac)"
+FAKE_DEFAULT="default via 192.0.2.1 dev eth0 proto static onlink"
+direct_routes_apply
+check "a route coming back brings them back" "3" "$DIRECT_APPLIED"
+
+echo "101. a list the kernel refuses entirely leaves clients on the cascade, and says so"
+# shellcheck disable=SC2034  # read by the code under test
+FALLBACK_ACTIVE=false
+FAKE_ROUTE_REFUSE="100.64.0.0/10 198.51.100.7/32 192.0.2.128/25"
+ip -4 route flush table "$CASCADE_DIRECT_TABLE"
+direct_reload
+check "no rule sends client traffic to an empty table" "no" "$(direct_rule)"
+check "nor does the entry node NAT for it" "no" "$(has_nat "-s 10.8.0.0/24 -o eth0 -j MASQUERADE")"
+uplinks_write_state
+check "nothing is published as in effect" "0" "$(jq -r .direct.applied "$UPLINK_STATE_FILE")"
+direct_state_error=$(jq -r .direct.error "$UPLINK_STATE_FILE")
+check "and the panel is told why" "true" \
+    "$(case "$direct_state_error" in *"refused 3 of 3"*) echo true ;; *) echo "$direct_state_error" ;; esac)"
+FAKE_ROUTE_REFUSE=""
+FAKE_GATEWAY_ONLINK=false
+FAKE_DEFAULT="default via 192.0.2.1 dev eth0"
 
 echo
 printf '%s passed, %s failed\n' "$PASSED" "$FAILED"

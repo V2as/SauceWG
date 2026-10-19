@@ -422,9 +422,12 @@ PREFIX           STATUS   NOTE
 198.51.100.0/24  off      paused
 ```
 
-`direct` is in the routing table, `pending` is listed but not installed, `off` is
+`direct` is in effect, `pending` is listed but not installed, `off` is
 `enabled: false`, and `unknown` means the node container is not answering, so nothing
-about the routing table is known either way.
+about the routing table is known either way. Under the table, a warning says why
+anything is `pending` — for a route the kernel refused, in the kernel's own words. The
+node container reads its routes back from the kernel on every health tick, retries a
+refused one every minute and puts back any that something else on the host removed.
 
 A bare address means one host, and an address inside a range is stored as the range —
 `10.20.30.40/24` becomes `10.20.30.0/24`, which is what it means and what the kernel
@@ -445,10 +448,11 @@ as well as objects:
 ```
 
 Each enabled prefix becomes one route in policy table `450`, which the entry node
-consults before the cascade table, and traffic leaving that way is NATed to the entry
-node's own address. Nothing changes on the client. `CASCADE_DIRECT_ROUTES` in `.env`
-puts the list in the environment instead, which overrides the file and makes the panel's
-**Routing** page read-only.
+consults before the cascade table: a copy of the entry node's own default route, marked
+`onlink` so that a VPS with a /32 address behind an `onlink` gateway accepts it. Traffic
+leaving that way is NATed to the entry node's own address. Nothing changes on the
+client. `CASCADE_DIRECT_ROUTES` in `.env` puts the list in the environment instead,
+which overrides the file and makes the panel's **Routing** page read-only.
 
 ### 4.6 When every exit node is down
 

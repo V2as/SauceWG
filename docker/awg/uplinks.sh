@@ -195,7 +195,30 @@ FALLBACK_ACTIVE=false
 DIRECT_PREFIXES=()
 DIRECT_SOURCE=none
 DIRECT_ERROR=""
+# The listed prefixes that are in effect, as read back from the kernel: routed in
+# the direct table through the entry node's own next hop, with the rule that sends
+# client traffic there in place. This, not the list, is what gets published — a
+# prefix the kernel refused, or that something else removed, is not working, and
+# saying otherwise is how a list can look applied while every client still goes
+# through an exit node.
+DIRECT_ACTIVE=()
 DIRECT_APPLIED=0
+# How many listed prefixes are routed at all, rule or no rule.
+DIRECT_ROUTED=0
+# What the kernel said when it refused part of the last apply, and when to ask it
+# again. A refusal about the routes themselves does not go away by itself and is
+# retried slowly rather than on every tick; anything that changes the inputs — the
+# list, the gateway — applies again straight away.
+DIRECT_INSTALL_ERROR=""
+DIRECT_RULE_ERROR=""
+DIRECT_RETRY_AT=0
+DIRECT_RETRY_INTERVAL=60
+# The outcome last written to the log, so that a retry that changes nothing is quiet.
+DIRECT_LOGGED=""
+# Whether this container has applied the list before. Flows still open across a
+# restart were bound by the previous container to the paths it had, so the first
+# apply leaves them alone.
+DIRECT_STARTED=false
 # The entry node's own way out, as an `ip route` next hop, and the interface it uses.
 # Kept from the last apply so a DHCP lease change can be noticed and followed.
 DIRECT_NEXTHOP=""
@@ -774,6 +797,7 @@ direct_source_json() {
 # should not put every other destination back on the cascade unannounced.
 direct_parse() {
     local json kind value bad=0 first=""
+    local -A seen=()
 
     DIRECT_SOURCE=$(direct_config_source)
     DIRECT_ERROR=""
@@ -786,10 +810,16 @@ direct_parse() {
         return 1
     fi
 
+    # Deduplicated, because what is in effect is counted against this list, and
+    # 10.0.0.1/24 and 10.0.0.0/24 are one route once masked.
     DIRECT_PREFIXES=()
     while IFS=$'\x1f' read -r kind value; do
         case $kind in
-            ok) DIRECT_PREFIXES+=("$value") ;;
+            ok)
+                [ -z "${seen[$value]:-}" ] || continue
+                seen[$value]=1
+                DIRECT_PREFIXES+=("$value")
+                ;;
             bad)
                 bad=$((bad + 1))
                 [ -n "$first" ] || first=$value
@@ -826,62 +856,256 @@ direct_nexthop() {
     printf '%s' "$nexthop"
 }
 
-# Writes DIRECT_PREFIXES into their own routing table, adding and removing only what
-# changed — a full rewrite on every tick would break the connections of prefixes that
-# did not. One table lookup covers any number of prefixes, which is why this is a
-# table and not an `ip rule` per entry.
+# "<gateway> <interface>" of a next hop as direct_nexthop writes it, with "-" for a
+# gateway it does not name. `onlink` is left out: whether a route carries it changes
+# how the kernel checked the gateway, not where the traffic goes.
+direct_hop() {
+    printf '%s\n' "$1" | awk '{
+        gw = "-"; dev = "-"
+        for (i = 1; i < NF; i++) {
+            if ($i == "via") gw = $(i + 1)
+            else if ($i == "dev") dev = $(i + 1)
+        }
+        print gw, dev
+        exit
+    }'
+}
+
+# The routes in the direct table, one per line, as "<network/bits> <gateway> <interface>"
+# in the same form. The kernel prints a host route without its /32, and it is given one
+# back so that it compares equal to the list entry it was installed for. A route of any
+# type but unicast is never one of ours and leaves through nothing.
+direct_table_routes() {
+    ip -4 route show table "$CASCADE_DIRECT_TABLE" 2>/dev/null | awk '
+        NF == 0 || /^[[:space:]]/ { next }
+        {
+            i = 1
+            typed = ($1 ~ /^(unicast|unreachable|blackhole|prohibit|throw|local|broadcast|anycast|multicast|nat)$/)
+            if (typed) i = 2
+            dest = $i
+            if (dest == "default") dest = "0.0.0.0/0"
+            else if (dest !~ /\//) dest = dest "/32"
+            gw = "-"; dev = "-"
+            if (!typed || $1 == "unicast") {
+                for (j = i + 1; j < NF; j++) {
+                    if ($j == "via") gw = $(j + 1)
+                    else if ($j == "dev") dev = $(j + 1)
+                }
+            }
+            print dest, gw, dev
+        }'
+}
+
+# The priorities of the rules that send client traffic to the direct table. Normally
+# one; a container that was killed rather than stopped can leave its own behind, and
+# a priority changed between runs leaves the old one.
+direct_rule_priorities() {
+    ip -4 rule show 2>/dev/null | awk -v from="$AWG_SUBNET" -v table="$CASCADE_DIRECT_TABLE" '{
+        pref = $1; sub(/:$/, "", pref)
+        src = ""; lookup = ""
+        for (i = 2; i < NF; i++) {
+            if ($i == "from") src = $(i + 1)
+            else if ($i == "lookup" || $i == "table") lookup = $(i + 1)
+        }
+        if (src == from && lookup == table) print pref
+    }'
+}
+
+direct_rule_present() {
+    case " $(direct_rule_priorities | tr '\n' ' ') " in
+        *" ${CASCADE_DIRECT_RULE_PRIORITY} "*) return 0 ;;
+    esac
+    return 1
+}
+
+# Leaves that rule in place exactly once, at its own priority, or removes every copy.
+# An existing rule is kept rather than removed and added back: between the two, a new
+# flow to a direct prefix is NATed into the cascade, its binding outlives the rule's
+# return, and the flow then leaves the entry node with an exit node's address and is
+# never answered.
+direct_rule_sync() {
+    local want=$1 pref kept=false err
+    DIRECT_RULE_ERROR=""
+    for pref in $(direct_rule_priorities); do
+        if [ "$want" = present ] && [ "$kept" = false ] && [ "$pref" = "$CASCADE_DIRECT_RULE_PRIORITY" ]; then
+            kept=true
+            continue
+        fi
+        ip rule del priority "$pref" from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
+    done
+    { [ "$want" = present ] && [ "$kept" = false ]; } || return 0
+    if ! err=$(ip rule add from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE" \
+            priority "$CASCADE_DIRECT_RULE_PRIORITY" 2>&1); then
+        DIRECT_RULE_ERROR=$(printf '%s\n' "$err" | awk '
+            NF { sub(/^(Error|RTNETLINK answers): */, ""); sub(/\.$/, ""); print; exit }')
+    fi
+}
+
+# Reads back which listed prefixes are in effect and sets DIRECT_ACTIVE and
+# DIRECT_APPLIED from what the kernel holds. DIRECT_ROUTED counts the ones routed
+# through the entry node's own next hop whether or not the rule is there to send
+# anything to them.
+direct_verify() {
+    local hop
+    DIRECT_ACTIVE=()
+    if [ -n "$DIRECT_NEXTHOP" ] && [ "${#DIRECT_PREFIXES[@]}" -gt 0 ]; then
+        hop=$(direct_hop "$DIRECT_NEXTHOP")
+        mapfile -t DIRECT_ACTIVE < <({
+            direct_table_routes | sed 's/^/have /'
+            printf 'want %s\n' "${DIRECT_PREFIXES[@]}"
+        } | awk -v hop="$hop" '
+            $1 == "have" { if (($3 " " $4) == hop) ok[$2] = 1; next }
+            $1 == "want" && ($2 in ok) && !seen[$2]++ { print $2 }')
+    fi
+    DIRECT_ROUTED=${#DIRECT_ACTIVE[@]}
+    if [ "$DIRECT_ROUTED" -gt 0 ] && ! direct_rule_present; then
+        DIRECT_ACTIVE=()
+    fi
+    DIRECT_APPLIED=${#DIRECT_ACTIVE[@]}
+}
+
+# A flow already open to a prefix that an edit just moved on or off the direct path
+# keeps the NAT binding of the path it started on: one that began in the cascade
+# leaves the entry node with an exit node's bridge address, one that began here
+# reaches the exit node with the entry node's own. Neither is ever answered, so they
+# are dropped, and reconnect over the new path at once instead of hanging until the
+# application gives up. Past a few dozen prefixes, one pass over every client flow is
+# cheaper than a pass per prefix.
+direct_conntrack_flush() {
+    local before=$1 after=$2 prefix changed=()
+    mapfile -t changed < <(printf '%s\n%s\n' "$before" "$after" | sed '/^$/d' | sort | uniq -u)
+    [ "${#changed[@]}" -gt 0 ] || return 0
+    if [ "${#changed[@]}" -gt 64 ]; then
+        conntrack -D -s "$AWG_SUBNET" >/dev/null 2>&1 || true
+        return 0
+    fi
+    for prefix in "${changed[@]}"; do
+        conntrack -D -s "$AWG_SUBNET" -d "$prefix" >/dev/null 2>&1 || true
+    done
+}
+
+# Writes DIRECT_PREFIXES into their own routing table and reads back what came of it.
+# Only what differs is touched — a route already leaving through the right next hop is
+# left alone, one nobody listed is removed, and the rest are written with `replace`,
+# which swaps a route in place, so a prefix moving to a new gateway is never without
+# one. One table lookup covers any number of prefixes, which is why this is a table
+# and not an `ip rule` per entry, and the writes go to the kernel as one batch so that
+# a list of thousands is applied in a moment.
+#
+# Pass "keep" to leave open flows alone, which is what putting back routes that went
+# missing wants: the flows that matter are the ones bound to the direct path before
+# it went, and they carry on as soon as it is back.
 direct_routes_apply() {
-    local prefix desired=" " keep=" " nexthop applied=0
+    local mode=${1:-flush}
+    local nexthop hop plan="" err="" before listed=${#DIRECT_PREFIXES[@]} refused summary
 
     nexthop=$(direct_nexthop)
     if [ -n "$DIRECT_NEXTHOP" ] && [ "$nexthop" != "$DIRECT_NEXTHOP" ]; then
-        log "direct routes: the entry node's route out changed (${DIRECT_NEXTHOP} -> ${nexthop:-none}); rebuilding"
-        ip route flush table "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
+        log "direct routes: the entry node's route out changed (${DIRECT_NEXTHOP} -> ${nexthop:-none}); moving them"
     fi
     DIRECT_NEXTHOP=$nexthop
     DIRECT_WAN=$(direct_wan_iface)
+    before=$(printf '%s\n' ${DIRECT_ACTIVE[@]+"${DIRECT_ACTIVE[@]}"})
+    hop=$(direct_hop "$nexthop")
 
-    for prefix in ${DIRECT_PREFIXES[@]+"${DIRECT_PREFIXES[@]}"}; do
-        desired="${desired}${prefix} "
-    done
+    # With no next hop nothing is wanted, and whatever is in the table goes.
+    plan=$({
+        direct_table_routes | sed 's/^/have /'
+        if [ -n "$nexthop" ] && [ "$listed" -gt 0 ]; then
+            printf 'want %s\n' "${DIRECT_PREFIXES[@]}"
+        fi
+    } | awk -v hop="$hop" -v nexthop="$nexthop" -v table="$CASCADE_DIRECT_TABLE" '
+        $1 == "have" { have[$2] = $3 " " $4; next }
+        $1 == "want" && !($2 in want) { want[$2] = 1; order[++n] = $2 }
+        END {
+            for (p in have) if (!(p in want)) print "route del " p " table " table
+            for (i = 1; i <= n; i++) {
+                p = order[i]
+                if ((p in have) && have[p] == hop) continue
+                print "route replace " p " " nexthop " table " table
+            }
+        }')
 
-    while read -r prefix; do
-        [ -n "$prefix" ] || continue
-        case $prefix in */*) ;; *) prefix="${prefix}/32" ;; esac
-        case "$desired" in
-            *" ${prefix} "*) keep="${keep}${prefix} " ;;
-            *) ip route del "$prefix" table "$CASCADE_DIRECT_TABLE" 2>/dev/null || true ;;
-        esac
-    done < <(ip -4 route show table "$CASCADE_DIRECT_TABLE" 2>/dev/null | awk 'NF {print $1}')
-
-    if [ -n "$nexthop" ]; then
-        for prefix in ${DIRECT_PREFIXES[@]+"${DIRECT_PREFIXES[@]}"}; do
-            case "$keep" in
-                *" ${prefix} "*)
-                    applied=$((applied + 1))
-                    continue
-                    ;;
-            esac
-            # shellcheck disable=SC2086  # the next hop is deliberately several words
-            if ip route replace "$prefix" $nexthop table "$CASCADE_DIRECT_TABLE" 2>/dev/null; then
-                applied=$((applied + 1))
-            fi
-        done
-    elif [ "${#DIRECT_PREFIXES[@]}" -gt 0 ]; then
-        log "direct routes: the entry node has no default route of its own; ${#DIRECT_PREFIXES[@]} prefix(es) stay on the cascade"
-    fi
-    DIRECT_APPLIED=$applied
-
-    # The rule is what makes the table consulted at all, and it is only worth having
-    # while something is in the table.
-    ip rule del from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
-    if [ "$applied" -gt 0 ]; then
-        ip rule add from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE" \
-            priority "$CASCADE_DIRECT_RULE_PRIORITY" 2>/dev/null || true
-        log "direct routes: ${applied} prefix(es) bypass the cascade via ${DIRECT_WAN:-the entry node}"
+    if [ -n "$plan" ]; then
+        # -force carries on past a command the kernel refuses, so one bad prefix costs
+        # only itself. What each one came to is read back below rather than inferred
+        # from here; this is kept for the reason the kernel gave.
+        err=$(printf '%s\n' "$plan" | ip -4 -force -batch - 2>&1 >/dev/null) || true
+        err=$(printf '%s\n' "$err" | awk '
+            /^Command failed/ || NF == 0 { next }
+            { sub(/^(Error|RTNETLINK answers): */, ""); sub(/\.$/, ""); print; exit }')
     fi
 
+    direct_verify
+    if [ "$DIRECT_ROUTED" -gt 0 ]; then
+        # The NAT goes in before the rule, so that no flow is ever steered out of this
+        # interface without it.
+        DIRECT_APPLIED=$DIRECT_ROUTED
+        direct_path_rules
+        direct_rule_sync present
+    else
+        direct_rule_sync absent
+    fi
+    direct_verify
     direct_path_rules
+    if [ "$mode" != keep ] && [ "$DIRECT_STARTED" = true ]; then
+        direct_conntrack_flush "$before" "$(printf '%s\n' ${DIRECT_ACTIVE[@]+"${DIRECT_ACTIVE[@]}"})"
+    fi
+    DIRECT_STARTED=true
+
+    DIRECT_INSTALL_ERROR=""
+    if [ -z "$nexthop" ]; then
+        [ "$listed" -eq 0 ] || log "direct routes: the entry node has no default route of its own; ${listed} prefix(es) stay on the cascade"
+    elif [ "$listed" -gt 0 ]; then
+        refused=$((listed - DIRECT_ROUTED))
+        if [ "$refused" -gt 0 ]; then
+            DIRECT_INSTALL_ERROR="the kernel refused ${refused} of ${listed} direct route(s) out of ${DIRECT_WAN:-the entry node}${err:+ (${err})}, so those destinations still go through the cascade"
+        elif [ "$DIRECT_APPLIED" -eq 0 ]; then
+            DIRECT_INSTALL_ERROR="the rule that sends client traffic to table ${CASCADE_DIRECT_TABLE} could not be installed${DIRECT_RULE_ERROR:+ (${DIRECT_RULE_ERROR})}, so every destination still goes through the cascade"
+        fi
+    fi
+    if [ -n "$DIRECT_INSTALL_ERROR" ]; then
+        DIRECT_RETRY_AT=$(( $(date -u +%s) + DIRECT_RETRY_INTERVAL ))
+    fi
+
+    # Logged when the outcome changes rather than on every apply: a refusal is retried
+    # every DIRECT_RETRY_INTERVAL and would otherwise repeat itself in the log.
+    summary="${DIRECT_APPLIED}|${listed}|${DIRECT_WAN}|${DIRECT_INSTALL_ERROR}"
+    if [ "$summary" != "$DIRECT_LOGGED" ]; then
+        DIRECT_LOGGED=$summary
+        [ "$DIRECT_APPLIED" -eq 0 ] \
+            || log "direct routes: ${DIRECT_APPLIED} of ${listed} prefix(es) bypass the cascade via ${DIRECT_WAN:-the entry node}"
+        [ -z "$DIRECT_INSTALL_ERROR" ] || log "direct routes: ${DIRECT_INSTALL_ERROR}"
+    fi
+}
+
+# Called on every health tick. Something other than this container — systemd-networkd
+# reconfiguring the interface, an operator's `ip rule flush` — can take the direct
+# routes or their rule away, and nothing else would notice: neither the list nor the
+# gateway changed. Reading the table back is one `ip` call, and puts back what went
+# missing within a CASCADE_PROBE_INTERVAL.
+direct_heal() {
+    local now=$1 had=$DIRECT_APPLIED
+    [ -n "$DIRECT_NEXTHOP" ] || return 0
+    [ "${#DIRECT_PREFIXES[@]}" -gt 0 ] || return 0
+
+    direct_verify
+    if [ "$DIRECT_APPLIED" -lt "$had" ]; then
+        if [ "$DIRECT_APPLIED" -eq 0 ] && [ "$DIRECT_ROUTED" -gt 0 ]; then
+            log "direct routes: the rule sending client traffic to table ${CASCADE_DIRECT_TABLE} was removed by something outside this container; putting it back"
+        else
+            log "direct routes: $((had - DIRECT_APPLIED)) of ${had} prefix(es) were removed from table ${CASCADE_DIRECT_TABLE} by something outside this container; putting them back"
+        fi
+        direct_routes_apply keep
+    elif [ "$DIRECT_APPLIED" -lt "${#DIRECT_PREFIXES[@]}" ] \
+        && { [ -z "$DIRECT_INSTALL_ERROR" ] || [ "$now" -ge "$DIRECT_RETRY_AT" ]; }; then
+        # Short of the list with no refusal on record to explain it, which is not a
+        # state to wait out.
+        direct_routes_apply keep
+    else
+        # The NAT this needs is reasserted for the same reason the routes are.
+        direct_path_rules
+    fi
 }
 
 # Client traffic leaves through the entry node's own interface in two cases: a
@@ -919,14 +1143,20 @@ direct_reload() {
     direct_routes_apply
 }
 
-# What an operator needs to be told about the direct list, if anything: entries that
-# were skipped, or an entry node with no route of its own to send them out of.
+# What an operator needs to be told about the direct list, if anything: an entry node
+# with no route of its own to send them out of, routes or a rule the kernel would not
+# take, and entries that were skipped.
 direct_error() {
+    local parts=() part out=""
     if [ -z "$DIRECT_NEXTHOP" ] && [ "${#DIRECT_PREFIXES[@]}" -gt 0 ]; then
-        printf 'the entry node has no default route of its own, so the direct routes are not in effect'
-        return 0
+        parts+=("the entry node has no default route of its own, so the direct routes are not in effect")
     fi
-    printf '%s' "$DIRECT_ERROR"
+    [ -z "$DIRECT_INSTALL_ERROR" ] || parts+=("$DIRECT_INSTALL_ERROR")
+    [ -z "$DIRECT_ERROR" ] || parts+=("$DIRECT_ERROR")
+    for part in ${parts[@]+"${parts[@]}"}; do
+        out="${out:+${out}; }${part}"
+    done
+    printf '%s' "$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -1492,9 +1722,12 @@ uplinks_setup_all() {
 uplinks_teardown() {
     local i
     ip rule del from "$AWG_SUBNET" lookup "$CASCADE_TABLE" 2>/dev/null || true
-    ip rule del from "$AWG_SUBNET" lookup "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
+    direct_rule_sync absent
     ip route flush table "$CASCADE_TABLE" 2>/dev/null || true
     ip route flush table "$CASCADE_DIRECT_TABLE" 2>/dev/null || true
+    DIRECT_ACTIVE=()
+    DIRECT_APPLIED=0
+    DIRECT_ROUTED=0
     ip -6 route flush table "$CASCADE_TABLE" 2>/dev/null || true
     ip -6 rule del lookup "$CASCADE_BRIDGE6_TABLE" 2>/dev/null || true
     ip -6 route flush table "$CASCADE_BRIDGE6_TABLE" 2>/dev/null || true
@@ -1935,9 +2168,11 @@ uplinks_write_state() {
         active_name=${UP_NAME[$ACTIVE_INDEX]}
     fi
 
-    local direct_json
-    direct_json=$(printf '%s\n' ${DIRECT_PREFIXES[@]+"${DIRECT_PREFIXES[@]}"} \
+    local direct_json direct_listed
+    direct_json=$(printf '%s\n' ${DIRECT_ACTIVE[@]+"${DIRECT_ACTIVE[@]}"} \
         | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null) || direct_json='[]'
+    direct_listed=$(printf '%s\n' ${DIRECT_PREFIXES[@]+"${DIRECT_PREFIXES[@]}"} \
+        | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null) || direct_listed='[]'
 
     local bypass_json bypass_runtime
     bypass_json=$(printf '%s\n' ${BYPASS_ROWS[@]+"${BYPASS_ROWS[@]}"} \
@@ -1970,7 +2205,9 @@ uplinks_write_state() {
         --arg direct_source "$DIRECT_SOURCE" \
         --arg direct_error "$(direct_error)" \
         --arg direct_wan "$DIRECT_WAN" \
+        --arg direct_nexthop "$DIRECT_NEXTHOP" \
         --argjson direct_routes "$direct_json" \
+        --argjson direct_listed "$direct_listed" \
         --argjson direct_applied "${DIRECT_APPLIED:-0}" \
         --arg bypass_mode "$BYPASS_MODE" \
         --arg bypass_groups "$BYPASS_GROUPS" \
@@ -2020,9 +2257,15 @@ uplinks_write_state() {
             },
             direct: {
                 source: $direct_source,
+                # The prefixes in effect, read back from the kernel on every tick —
+                # which is what the panel and `saucewg routes` call active. `listed`
+                # is what the list asked for; a prefix in one and not the other is
+                # explained by `error`.
                 routes: $direct_routes,
+                listed: $direct_listed,
                 applied: $direct_applied,
                 via: (if $direct_wan == "" then null else $direct_wan end),
+                nexthop: (if $direct_nexthop == "" then null else $direct_nexthop end),
                 error: (if $direct_error == "" then null else $direct_error end)
             },
             bypass: {
@@ -2356,9 +2599,13 @@ uplinks_monitor() {
             fi
 
             # A DHCP lease change moves the entry node's own gateway, which the direct
-            # routes name explicitly and would otherwise keep pointing at.
+            # routes name explicitly and would otherwise keep pointing at. Short of
+            # that, what is in the kernel is checked against what was applied, so a
+            # route or rule taken away from outside is put back.
             if [ "$(direct_nexthop)" != "$DIRECT_NEXTHOP" ]; then
                 direct_routes_apply
+            else
+                direct_heal "$now"
             fi
 
             # Reconciled on every tick rather than only on a state change: the

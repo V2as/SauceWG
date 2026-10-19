@@ -139,12 +139,33 @@ addr_host4() {
     esac
 }
 
+# The first way out the host's own default route names, as "<gateway> <interface>",
+# with "-" for a gateway it does not have. Read off the keywords rather than off
+# columns: `default dev ppp0 scope link` has no gateway, `default nhid 7 via ...` has
+# an extra pair, and a multipath route — which is what two IPv6 routers advertising
+# at once produce — lists its next hops on the lines below.
+default_route_hop() {
+    ip "-${1:-4}" route show default 2>/dev/null | awk '
+        function hop(   i, gw, dev) {
+            gw = "-"; dev = ""
+            for (i = 1; i < NF; i++) {
+                if ($i == "via") gw = ($(i + 1) ~ /^inet6?$/) ? $(i + 2) : $(i + 1)
+                else if ($i == "dev") dev = $(i + 1)
+            }
+            if (dev == "") return 0
+            print gw, dev
+            return 1
+        }
+        /^default/ { if (hop()) exit; multipath = 1; next }
+        multipath && $1 == "nexthop" { if (hop()) exit }'
+}
+
 wan_iface() {
-    ip -4 route show default | awk '/default/ {print $5; exit}'
+    default_route_hop 4 | awk '{print $2; exit}'
 }
 
 wan_iface6() {
-    ip -6 route show default 2>/dev/null | awk '/default/ {print $5; exit}'
+    default_route_hop 6 | awk '{print $2; exit}'
 }
 
 # Whether this host can reach the IPv6 internet at all. Dialling an exit node's
@@ -170,24 +191,24 @@ has_ipv6_egress() {
 }
 
 # The host's own way to the internet, as the tail of an `ip route` command:
-# "via 203.0.113.1 dev eth0" or, on a point-to-point link, "dev eth0".
+# "via 203.0.113.1 dev eth0 onlink" or, on a point-to-point link, "dev eth0".
 #
 # A route in another table cannot say "resolve this in the main table", so anything
 # the entry node sends out of its own uplink instead of into the cascade has to name
 # the next hop explicitly. Re-read rather than cached: a DHCP lease change moves it.
+#
+# `onlink` because the kernel accepts a gateway only if a route of link scope
+# reaches it, and a VPS whose address is a /32 behind an `onlink` default route has
+# no such route anywhere. Without it every copy of that gateway is refused with
+# "Nexthop has invalid gateway" while the host's own default route works fine. The
+# main table has already established that the gateway sits on that link; this only
+# stops the kernel from asking again in a table that cannot answer.
 wan_nexthop() {
-    ip -4 route show default | awk '
-        /^default/ {
-            gw = ""; dev = ""
-            for (i = 2; i < NF; i++) {
-                if ($i == "via") gw = $(i + 1)
-                else if ($i == "dev") dev = $(i + 1)
-            }
-            if (dev == "") next
-            if (gw == "") print "dev " dev
-            else print "via " gw " dev " dev
-            exit
-        }'
+    default_route_hop 4 | awk '{
+        if ($1 == "-") print "dev " $2
+        else print "via " $1 " dev " $2 " onlink"
+        exit
+    }'
 }
 
 # KEY=VALUE state file that survives container restarts. Everything the panel needs

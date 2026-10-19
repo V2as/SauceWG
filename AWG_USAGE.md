@@ -820,7 +820,7 @@ DELETE /api/routes/{cidr}     # put that destination back on the cascade
 | --- | --- |
 | `cidr` | the destination, always masked to its network — `8.8.8.8` is stored as `8.8.8.8/32` |
 | `enabled` | `false` keeps the entry in the list without routing it |
-| `active` | **the one that matters.** `true` when the node container has it in its routing table; `false` means listed but not in effect |
+| `active` | **the one that matters.** `true` when the node container finds it in effect in the kernel — routed out of the entry node's own interface, with the rule that sends client traffic there in place — as read back on every health tick rather than taken from the file; `false` means listed but not in effect |
 | `via` | the entry node's own interface these leave through |
 | `live` | `false` when the node container is not publishing routing state — stopped, or older than this feature — so every `active` above is unknown rather than false |
 | `editable` | `false` when this panel cannot write the list (`NODE_PROVISION_ENABLED=false`) |
@@ -856,8 +856,27 @@ Encoding it as `%2F` works too.
 
 Changes reach the node container within a second and disturb no tunnel. `active` is what
 to poll if you need to confirm one landed; a prefix that stays `false` with `live: true`
-and a `config_error` means the container could not install it — most often because the
-entry node has no default route of its own to send it out of.
+and a `config_error` means the container could not install it, and `config_error` says
+why. Either the entry node has no default route of its own to send it out of, or the
+kernel refused the route itself, in which case the sentence carries the kernel's
+reason:
+
+```
+The node container could not apply the direct routes: the kernel refused 3 of 51 direct
+route(s) out of eth0 (Invalid argument), so those destinations still go through the cascade
+```
+
+Refused routes are retried every minute, and the error clears by itself once they go in.
+A route or rule removed by something else on the host is put back within one probe
+interval, so an `active` that reads `false` for one poll and `true` again is the node
+repairing itself rather than flapping; the node container logs it either way.
+
+Connections already open to a prefix you add or remove are dropped, so that they
+reconnect over the new path at once rather than hanging on the old one: a client in the
+middle of a stream to that destination sees one reconnect. An edit that changes more
+than 64 prefixes at once drops every client connection instead, once, rather than
+deleting them prefix by prefix. A restart of the node container and its own repairs
+drop nothing.
 
 Writes answer `409` when the list is not the panel's to edit, with the reason in
 `detail`: `NODE_PROVISION_ENABLED=false`, or a `CASCADE_DIRECT_ROUTES` environment
@@ -1245,8 +1264,9 @@ Host metrics, client totals, live throughput, and the cascade summary:
 carrying traffic, including while `fallback_active` is `true` and users are online
 through the entry node. `cascade.stalled` is the worst way for it to be `false` — `node`
 names an exit node, client traffic is routed to it, and it has stopped handshaking
-without failover moving anyone off it. `direct_routes` counts the prefixes of §7 the node container has
-actually installed as routes. `bypass_active` and `bypass_routes` are the same for §8 —
+without failover moving anyone off it. `direct_routes` counts the prefixes of §7 that are
+in effect as read back from the kernel, not the length of the list: fewer than are
+enabled means `GET /api/routes` has a `config_error`. `bypass_active` and `bypass_routes` are the same for §8 —
 both zero on a healthy cascade in the default mode, which is the intended state rather
 than a fault.
 
@@ -1365,6 +1385,8 @@ Alert when any of these hold for more than a couple of poll cycles:
 * `GET /api/system` → `node_ready == false` after startup.
 * `GET /api/routes` → an entry with `enabled: true`, `active: false` and `live: true`
   for more than a poll cycle — a bypass route that is configured but not in force.
+  `config_error` beside it is the reason; a refusal that outlasts the minute-long retry
+  needs a person.
 
 **Move users off an exit node for maintenance**
 
@@ -1442,6 +1464,13 @@ Values the central system may need to know about, set in the entry node's `.env`
   address until an exit node recovers. Read `fallback_active`, not just `active`.
 * **A direct route is a destination, not a client setting.** It applies to every client
   on the node, needs nothing on their side, and is invisible in their profile.
+* **`active: true` is a fact about the entry node, not about the service.** It means
+  client traffic to that prefix leaves through the entry node's own interface. Which
+  country the service then puts the user in is its own geolocation of the entry node's
+  address, which can disagree with other databases, and a service that also uses ranges
+  missing from the list is only partly direct. Check from a client: with Google's ranges
+  listed, `dig +short TXT o-o.myaddr.l.google.com @216.239.32.10` prints the address
+  Google sees.
 * **`endpoint` is not necessarily the endpoint you sent.** A node with both an IPv4 and
   an IPv6 endpoint is dialled on one of them, and is moved to the other if that one
   stops handshaking. Read `endpoint_family` rather than inferring it.

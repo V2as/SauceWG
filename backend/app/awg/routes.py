@@ -139,8 +139,8 @@ def state() -> dict[str, Any]:
     """What the node container reports about the routes it has actually installed.
 
     A prefix can be in the file and not in effect — the container has not re-read it
-    yet, or it has no route of its own to send it out of — so the applied set is read
-    back rather than assumed.
+    yet, has no route of its own to send it out of, or the kernel refused it — so the
+    applied set is read back rather than assumed.
     """
     try:
         with open(settings.uplink_state_file, "r", encoding="utf-8") as handle:

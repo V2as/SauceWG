@@ -671,10 +671,17 @@ saucewg remove-route --note youtube                   # the whole group
 
 The node container applies changes within a second, without disturbing a tunnel: each
 prefix becomes one route in table `450`, which is consulted before the cascade table.
-Traffic leaving that way is NATed to the entry node's address, so no configuration is
-needed on the client.
+The route is a copy of the entry node's own default route — the same gateway, the same
+interface — marked `onlink`. That is what makes it work on a VPS whose address is a /32
+behind an `onlink` gateway: the kernel accepts a gateway only if a route of link scope
+reaches it, there is none on such a host, and without `onlink` every direct route is
+refused while the host's own default route works fine. Traffic leaving that way is
+NATed to the entry node's address, so no configuration is needed on the client.
+Connections already open to a prefix an edit moves on or off the list are dropped, so
+that they reconnect over the new path at once instead of hanging on the old one; an
+edit that changes more than 64 prefixes at a time drops every client connection once.
 
-Three things to know:
+Four things to know:
 
 - **IPv4 only, and no names.** The cascade routes IPv4; a hostname is not resolved, so
   add the ranges a service actually uses. `scripts/keenetic/gen-routes.py` in this
@@ -683,8 +690,19 @@ Three things to know:
   `saucewg fallback direct` does during an outage; as a route it would silently disable
   the cascade entirely.
 - **A prefix can be listed and not in effect.** The `active` field, the `direct` column
-  in `saucewg routes` and the badge in the panel all come from what the node container
-  actually installed, not from the file.
+  in `saucewg routes`, the badge in the panel and `direct_routes` in `/api/system` all
+  come from the node container reading table `450` and its rule back from the kernel,
+  not from the file. A prefix the kernel refuses stays inactive, and the reason, in the
+  kernel's own words, is the warning under `saucewg routes` and `config_error` in the
+  panel; refused routes are retried every minute. A route or the rule taken away by
+  something else on the host — systemd-networkd reconfiguring the interface does this —
+  is put back on the next health tick, and the node container's log says so.
+- **Check it from a client, not from the panel.** With Google's ranges listed,
+  `dig +short TXT o-o.myaddr.l.google.com @216.239.32.10` on a connected client prints
+  the address Google sees: the entry node's own address means the route is working, an
+  exit node's means it is not. The country a service then shows is its own geolocation
+  of that address, which can disagree with other databases about where the entry node
+  is; and a service that also uses ranges missing from the list is only partly direct.
 
 `CASCADE_DIRECT_ROUTES` puts the list in the environment instead, with the same
 precedence and the same read-only consequence for the panel as `CASCADE_NODES_JSON`.
@@ -1029,7 +1047,13 @@ workflow does.
 - **Routing.** The entry node uses policy routing rather than a default route, so SSH and
   the panel keep using the normal one. Client traffic is looked up in table `450`
   (destinations that bypass the cascade) and then table `451` (everything else);
-  failover is a single `ip route replace default dev awgN table 451`.
+  failover is a single `ip route replace default dev awgN table 451`. Table `450` holds
+  `onlink` copies of the entry node's own default route, written in one `ip -batch` and
+  read back afterwards: what gets published is what the kernel holds, and the same read
+  on every health tick puts back whatever something outside the container removed. Its
+  rule is kept in place rather than removed and re-added on each apply, because a flow
+  that starts in that gap is NATed into the cascade and is never answered once the rule
+  returns.
 - **Fallback.** `CASCADE_FALLBACK` decides what happens while no exit node is usable:
   `direct` (the default) empties table 451 so the entry node carries the traffic itself,
   `block` fills it with an unreachable route so clients are cut off instead. The old

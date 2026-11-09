@@ -138,8 +138,9 @@ places that describe a generation from drifting apart.
 > way. Cascade hops keep real padding — both ends there run `amneziawg-go`, which honours
 > it, and that is the hop a censor actually sees. Pin `AWG_S3`/`AWG_S4` in `.env` if every
 > client you serve is a router. 3.x has no zero to fall back on — header protection takes
-> its nonce from the padding — and every app release that loads 3.x honours it; moving
-> back down to 2.0 puts the zero back.
+> its nonce from the padding — and the 5.x desktop app hands all of it to its backend (read
+> in the 5.1.0.6 source; the mobile apps were not checked); moving back down to 2.0 puts
+> the zero back.
 
 ## Components
 

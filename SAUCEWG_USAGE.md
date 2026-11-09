@@ -298,9 +298,10 @@ saucewg --json upgrade-nodes         # the report below
 the walk stopped, failed to start, or a node failed; a node that did not answer is
 `pending` rather than a failure. The walk runs inside the panel container, which holds the
 SSH key, so it is the same one the panel runs by itself a couple of minutes after it
-starts (`NODE_AUTO_UPGRADE_DELAY_SECONDS`) and from **Upgrade exit nodes** on the Exit
-nodes page; only one runs at a time. `NODE_AUTO_UPGRADE=false` turns all of that off —
-including the step in `update` — and leaves the nodes for `upgrade-nodes`.
+starts (`NODE_AUTO_UPGRADE_DELAY_SECONDS`) — unless `update` or anything else walked the
+nodes in the meantime, whose report it then leaves in place — and from **Upgrade exit
+nodes** on the Exit nodes page; only one runs at a time. `NODE_AUTO_UPGRADE=false` turns
+all of that off — including the step in `update` — and leaves the nodes for `upgrade-nodes`.
 
 An exit node is upgraded with its own `saucewg update`, run over SSH, so it fetches the
 script and images from the same mirror and registry as the entry node
@@ -1130,14 +1131,14 @@ mid-install.
 | `PUT /api/nodes/{name}` | `{"priority": 5}`, `{"endpoint": "…"}`, `{"endpoint6": "[2001:db8::9]:51820"}`, `{"family": "6"}`, `{"address6": "none"}`, `{"note": "…"}`, `{"protocol": "1.0"}` | Applied immediately; a priority change is only a routing decision, the rest rebuild the uplink |
 | `DELETE /api/nodes/{name}` | `{}` or `{"uninstall": true}` | `202` + task. Without `uninstall` the server is left running and simply detached |
 | `POST /api/nodes/{name}/repair` | `{}` | `202` + task. Reinstalls the uplink key on a node that shows as unpaired |
-| `POST /api/nodes/{name}/protocol` | `{"protocol": "2.0", "signature": "quic"}` | `202` + task. Reconfigures both ends of the uplink |
+| `POST /api/nodes/{name}/protocol` | `{"protocol": "3.1", "signature": "quic"}` | `202` + task. Reconfigures both ends of the uplink |
 | `POST /api/nodes/{name}/activate` | — | Prefer this node |
 | `POST /api/nodes/auto` | — | Drop the preference |
 | `GET /api/nodes/fleet` | — | How upgrading the exit nodes stands: `release` and `protocol` they are taken to, `auto`, `running`, and `last` — the walk under way or the last one's report, including one `saucewg update` ran ([§3.1](#31-updating-the-exit-nodes-with-the-entry-node)) |
 | `POST /api/nodes/upgrade` | `{}`, `{"protocol": "3.0"}` or `{"keep_protocol": true}` | `202` + task. Upgrades every managed exit node one at a time, the one carrying traffic last; `409` while a walk is already running, from the panel or from `saucewg` |
 
-`GET /api/nodes` also says, per node, whether `protocol_pinned` — the generation was
-chosen by hand and an upgrade leaves it there — and lists in `protocols` the generations
+`GET /api/nodes` also says, per node, whether `protocol_pinned` — a generation other than
+3.1 was chosen by hand and an upgrade leaves it there — and lists in `protocols` the generations
 this entry node's own image can build an uplink on. Every call above that changes a node
 answers `409` while the exit nodes are being upgraded; `activate` and `auto` stay open, and
 the walk leaves a choice made during it in place.
@@ -1300,7 +1301,7 @@ assert probe["reachable"] and probe["root"], probe["error"]
 # 4. Install it. No password anywhere: the panel logs in with its own key.
 task = requests.post(
     f"{PANEL}/api/nodes", headers=head,
-    json={"name": "eu-fr", "host": "203.0.113.9", "protocol": "2.0"},
+    json={"name": "eu-fr", "host": "203.0.113.9"},
 ).json()
 
 while task["status"] not in ("succeeded", "failed"):
@@ -1435,14 +1436,18 @@ Settings that matter for node management specifically:
   can act on every exit server through the API. Removing a node with
   `{"uninstall": true}` takes the key back off that server; `NODE_SSH_KEY_ENABLED=false`
   opts out of the whole mechanism.
-* **`s1`–`s4` and `h1`–`h4` must match on both ends** of an uplink, and each uplink
-  should use a different set. `install-node` generates them and `add-node` carries them
-  across, so this only bites when the object is assembled by hand. `jc`/`jmin`/`jmax` and
-  `i1`–`i5` are built by the sender and never parsed, so those may differ freely.
+* **`s1`–`s4`, `h1`–`h4` and, from 3.0 on, `header_protection_key` and `random_trailers`
+  must match on both ends** of an uplink, and each uplink should use a different set.
+  `install-node` generates them and `add-node` carries them across, so this only bites
+  when the object is assembled by hand. `jc`/`jmin`/`jmax` and `i1`–`i5` are built by the
+  sender and never parsed, and the other 3.x settings only govern the end that has them,
+  so those may differ freely.
 * **A generation is a set of parameters, not a version number.** Nothing on the wire says
-  "2.0" — a profile *is* 2.0 because it carries `S3`, `S4` and `I1`. That is why moving a
-  node between generations adds and drops parameters rather than setting a field, and why
-  a hand-edited profile with a stray `S3` will not connect to a 1.0 peer.
+  "2.0" — a profile *is* 2.0 because it carries `S3`, `S4` and `I1`, 3.0 because it adds a
+  `HeaderProtectionKey`, and 3.1 because it carries `RandomTrailers` or `DisableCookies`.
+  That is why moving a node between generations adds and drops parameters rather than
+  setting a field, and why a hand-edited profile with a stray `S3` will not connect to a
+  1.0 peer.
 * **`set-protocol` on an exit node only does its own half.** It prints the pairing object
   precisely because the entry node still has to be told; until `update-node` runs there,
   that uplink is down. `POST /api/nodes/{name}/protocol` avoids the window.
@@ -1452,14 +1457,19 @@ Settings that matter for node management specifically:
   the padding the server adds and the tunnel connects while carrying nothing. `install`
   and `set-protocol` therefore leave both at `0` on an entry node, while an exit node's
   own interface — which only ever faces the entry node's `amneziawg-go` — gets real
-  padding. Pin `AWG_S3`/`AWG_S4` in `.env` if every client you serve is a router.
+  padding. Pin `AWG_S3`/`AWG_S4` in `.env` if every client you serve is a router. 3.x has
+  no zero to fall back on, because header protection takes its nonce from the padding,
+  so an entry node moved onto 3.x pads for real and one moved back to 2.0 pads by zero
+  again.
 * **Non-zero `S3`/`S4` on the entry node make a generation change disconnect everyone.**
   The padding changes every transport packet, so a peer that does not expect it cannot
   read one, and each client has to re-import its config or re-fetch its subscription
   link. With the default zero padding the generations differ only in `I1`, which the
   receiver never parses, so already-issued profiles keep working — re-export them anyway
-  so they declare the generation the node is actually on. `set-protocol` confirms before
-  touching an entry node either way, and does not bother on an exit node.
+  so they declare the generation the node is actually on. Moving an entry node onto 3.x
+  or off it is always the disconnecting kind, since the padding and the header
+  protection key both change. `set-protocol` confirms before touching an entry node
+  either way, and does not bother on an exit node.
 * **The uplink address must be inside the exit node's `--subnet`.** The defaults
   (`10.77.0.0/24` everywhere, `.2`, `.3`, `.4`… on the entry side) satisfy this, and the
   same holds for `--address6` and the exit node's `--subnet6`.

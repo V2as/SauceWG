@@ -239,7 +239,9 @@ can wear a different disguise from the server's own.
 
 The presence of those parameters *is* the AmneziaWG generation, so a profile from a 2.0
 entry node (with `S3`, `S4` and `I1`) needs a client that understands them: AmneziaVPN
-4.8.2 or newer, or a router on KeeneticOS 5.1 Alpha 3 or newer. `GET /api/settings`
+4.8.2 or newer, or a router on KeeneticOS 5.1 Alpha 3 or newer. A profile from a 3.0 entry
+node adds a header protection key and needs AmneziaVPN 5.0.0.5, one from 3.1 needs
+5.0.1.5; on a router, KeeneticOS 5.2 Alpha 11 for either. `GET /api/settings`
 reports which generation the node is on before you hand a profile out; if the users you
 serve are on older routers, put the entry node on `1.0`
 ([`SAUCEWG_USAGE.md` §2.2](SAUCEWG_USAGE.md#22-install-options)).

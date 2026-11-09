@@ -613,7 +613,11 @@ iface_up() {
 
 wait_for_socket() {
     local iface=$1 tries=0
-    while [ ! -S "/var/run/amneziawg/${iface}.sock" ]; do
+    # /var/run/amneziawg outlives the container, so a process that was killed rather
+    # than stopped leaves its socket behind until amneziawg-go replaces it. Applying a
+    # config to that dead socket makes awg fall back to the kernel module, which is
+    # not there, and the node fails to start with "Protocol not supported".
+    until [ -S "/var/run/amneziawg/${iface}.sock" ] && awg show "$iface" >/dev/null 2>&1; do
         tries=$((tries + 1))
         [ "$tries" -gt 100 ] && return 1
         sleep 0.1

@@ -749,6 +749,7 @@ async def adopt_node(payload: ExitNodeAdopt, admin: SudoAdminDep) -> ExitNodeLis
     the entry node generates in return still has to be installed on that server.
     """
     _require_provisioning()
+    _reject_if_busy(payload.name)
     _servable(payload.protocol)
     try:
         nodes = registry.load_nodes()

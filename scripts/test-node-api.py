@@ -221,7 +221,7 @@ async def walk_the_fleet(client: httpx.AsyncClient) -> None:
             releases={name: release for name in hosts},
             speaks={name: "2.0" for name in (*hosts, "fl-hand")},
             down=set(), breaks=set(), refuses=set(), unreachable=set(),
-            calls=[], during={}, busy=None, operator=None, operator_status=None,
+            calls=[], during={}, busy=None, adopt_busy=None, operator=None, operator_status=None,
         )
         with open(settings.uplink_control_file, "w", encoding="utf-8") as handle:
             json.dump({"mode": "auto", "node": None}, handle)
@@ -288,6 +288,12 @@ async def walk_the_fleet(client: httpx.AsyncClient) -> None:
         # Anything else that would touch an exit node has to wait for the walk.
         if world["busy"] is None:
             world["busy"] = (await client.put("/api/nodes/fl-a", json={"note": "x"})).status_code
+            world["adopt_busy"] = (
+                await client.post(
+                    "/api/nodes/adopt",
+                    json={"name": "fl-late", "endpoint": "198.51.100.77:51820", "public_key": "K-late"},
+                )
+            ).status_code
         if world["operator"] and name == "fl-a":
             response = await client.post(f"/api/nodes/{world['operator']}/activate")
             world["operator_status"] = response.status_code
@@ -370,6 +376,7 @@ async def walk_the_fleet(client: httpx.AsyncClient) -> None:
         )
         check("the kept node's uplink is untouched", stored["fl-c"]["protocol"] == "2.0", stored["fl-c"])
         check("nothing else could touch a node meanwhile", world["busy"] == 409, world["busy"])
+        check("nor add one", world["adopt_busy"] == 409, world["adopt_busy"])
         check("and the lock is released", fleet.running() is False, "")
         body = (await client.get("/api/nodes/fleet")).json()
         check("the panel reports how the walk went", body["last"]["ok"] is True and len(body["last"]["nodes"]) == 4, body)

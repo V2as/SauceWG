@@ -1,17 +1,19 @@
 # AmneziaWG userspace node.
 #
-# amneziawg-go v0.2.x + amneziawg-tools v1.0.x implement every generation a router can
-# load: 1.0 (Jc/Jmin/Jmax, S1/S2, H1-H4), 1.5 (plus I1) and 2.0 (plus S3/S4). Which one
-# an interface speaks is decided per interface at runtime by entrypoint.sh, so one image
-# serves all three. The v3.x line is a protocol no router firmware speaks and is
-# intentionally not built here.
+# amneziawg-go v3.x + amneziawg-tools v3.x implement every generation there is: 1.0
+# (Jc/Jmin/Jmax, S1/S2, H1-H4), 1.5 (plus I1), 2.0 (plus S3/S4), 3.0 (plus header
+# protection, content padding and randomised timings) and 3.1 (plus RandomTrailers and
+# DisableCookies). A profile without the 3.x parameters is the same on the wire as it
+# was under v0.2, so routers and apps that stop at 2.0 keep connecting. Which
+# generation an interface speaks is decided per interface at runtime by entrypoint.sh,
+# so one image serves all five.
 
-ARG AWG_GO_REF=v0.2.19
-ARG AWG_TOOLS_REF=v1.0.20260618-2
+ARG AWG_GO_REF=v3.1.20260828
+ARG AWG_TOOLS_REF=v3.1.20260812
 
 # Go cross-compiles, so this stage runs natively on the build host even when the
-# target is a different architecture.
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS go-build
+# target is a different architecture. amneziawg-go v3 needs Go 1.25.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS go-build
 ARG AWG_GO_REF
 ARG TARGETOS
 ARG TARGETARCH
@@ -42,6 +44,8 @@ RUN git clone --depth 1 --branch "${AWG_TOOLS_REF}" https://github.com/amnezia-v
     && make install DESTDIR=/out WITH_BASHCOMPLETION=no WITH_WGQUICK=yes WITH_SYSTEMDUNITS=no
 
 FROM alpine:3.20
+ARG AWG_GO_REF
+ARG AWG_TOOLS_REF
 # jq parses the exit node list and renders the uplink state file; conntrack-tools
 # drops stale NAT bindings when the active uplink changes. ipset holds the
 # addresses the torrent filter has caught, which is what carries a block across a
@@ -60,8 +64,14 @@ COPY speedlimit.sh /usr/local/lib/awg-speedlimit.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh \
     && mkdir -p /etc/amnezia/amneziawg /var/run/amneziawg
 
+# AWG_GENERATIONS is how saucewg on the host tells, before recreating a container,
+# whether the image it is about to run can serve the generation it is being asked
+# for. It has to list what lib.sh accepts.
 ENV WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go \
-    AWG_CONFIG_DIR=/etc/amnezia/amneziawg
+    AWG_CONFIG_DIR=/etc/amnezia/amneziawg \
+    AWG_GENERATIONS="1.0 1.5 2.0 3.0 3.1" \
+    AWG_GO_VERSION=${AWG_GO_REF} \
+    AWG_TOOLS_VERSION=${AWG_TOOLS_REF}
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD /usr/local/bin/entrypoint.sh healthcheck

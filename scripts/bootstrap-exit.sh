@@ -27,7 +27,7 @@ SUBNET6=""
 PEER_ALLOWED_IPS=""
 ENV_FILE=.env
 NODE_NAME=""
-PROTOCOL=$AWG_PROTOCOL_DEFAULT
+PROTOCOL=$AWG_PROTOCOL_NODES
 SIGNATURE=""
 
 while [ $# -gt 0 ]; do
@@ -79,7 +79,7 @@ if [ ! -f "$ENV_FILE" ]; then
 
     cat > "$ENV_FILE" <<EOF
 COMPOSE_PROJECT_NAME=saucewg-exit
-IMAGE_AWG=saucewg/awg:1.5.1
+IMAGE_AWG=saucewg/awg:1.6.0
 
 AWG_IFACE=awg0
 AWG_PORT=${PORT}
@@ -89,7 +89,8 @@ AWG_SUBNET6=${SUBNET6}
 AWG_MTU=1420
 
 # The generation this uplink speaks. The entry node's entry for this node has to name
-# the same one, and carry the S and H values below; Jc/Jmin/Jmax and I1 are the
+# the same one, and carry the S and H values below — under 3.x the header protection
+# key and RandomTrailers as well; Jc/Jmin/Jmax, I1 and the 3.x timings are the
 # sender's own business and need not match.
 AWG_PROTOCOL=${PROTOCOL}
 $(emit_env_obfuscation)
@@ -134,12 +135,18 @@ fi
 
 # Emit the entry that goes straight into the entry node's config/exit-nodes.json. Only
 # the parameters this generation carries are listed, because a stray S3 would leave the
-# entry node advertising 2.0 to a node that does not speak it.
+# entry node advertising 2.0 to a node that does not speak it. Of those, the ones both
+# ends must agree on, plus the signature: the rest are each sender's own.
 echo "Exit node started. Add this object to the entry node's exit-nodes.json:"
 echo
+FIELDS=""
+for suffix in $(awg_protocol_params "$PROTOCOL"); do
+    case $suffix in I1) ;; *) awg_param_shared "$suffix" || continue ;; esac
+    FIELDS="${FIELDS:+$FIELDS }$suffix"
+done
 printf '%s\n' "$PARAMS" | jq -Rn --arg name "$NODE_NAME" --arg ip "$PUBLIC_IP" \
     --arg ip6 "$PUBLIC_IP6" --arg subnet6 "$SUBNET6" \
-    --arg protocol "$PROTOCOL" --arg fields "$(awg_protocol_params "$PROTOCOL")" '
+    --arg protocol "$PROTOCOL" --arg fields "$FIELDS" '
     [inputs | select(test("=")) | capture("^(?<k>[^=]+)=(?<v>.*)$")]
     | map({(.k): (.v | sub("^\u0027"; "") | sub("\u0027$"; ""))}) | add as $p
     | {name: $name,
@@ -152,7 +159,6 @@ printf '%s\n' "$PARAMS" | jq -Rn --arg name "$NODE_NAME" --arg ip "$PUBLIC_IP" \
       + (if $ip6 == "" then {} else {endpoint6: "[\($ip6)]:\($p.SERVER_PORT)"} end)
       + (if $subnet6 == "" then {} else {subnet6: $subnet6} end)
       + ( $fields | split(" ")
-          | map(select(startswith("J") | not))
           | map({(ascii_downcase): $p["SERVER_\(.)"]})
           | add
           | with_entries(select(.value != null and .value != ""))

@@ -150,7 +150,9 @@ class AWGDevice:
             elif key == "tx_bytes":
                 current.tx_bytes = int(value)
             elif key == "persistent_keepalive_interval":
-                current.persistent_keepalive = int(value)
+                # amneziawg-go v3 reports a range ("25-35") when the interval is drawn
+                # afresh for every keepalive; the shortest one is what bounds idling.
+                current.persistent_keepalive = int(value.split("-", 1)[0])
 
         if state.private_key:
             from .keys import public_from_private

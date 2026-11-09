@@ -4,6 +4,9 @@ import {
   api,
   type ExitNode,
   type ExitNodeList,
+  type FleetNodeStatus,
+  type FleetReport,
+  type FleetStatus,
   type NodeCheckResult,
   type NodeStatus,
   type NodeTask,
@@ -27,7 +30,9 @@ const recovering = ref<ExitNode | null>(null)
 const editing = ref<ExitNode | null>(null)
 const switching = ref<ExitNode | null>(null)
 const managing = ref<ExitNode | null>(null)
+const upgradingFleet = ref(false)
 const task = ref<NodeTask | null>(null)
+const fleet = ref<FleetStatus | null>(null)
 
 const probe = ref<NodeCheckResult | null>(null)
 const remote = ref<NodeStatus | null>(null)
@@ -58,10 +63,51 @@ function bridgeState(node: ExitNode): string {
   return node.latency6_ms ? `IPv6 ${Math.round(node.latency6_ms)} ms` : 'IPv6 up'
 }
 
-// The generations an exit node can serve, newest first. 2.0 is the default for a new
-// install; 1.0 is what an older Keenetic on the client side needs.
-const PROTOCOLS = ['2.0', '1.5', '1.0']
+// The generations an exit node can serve, newest first. Only the two servers speak it
+// and both run this release's AmneziaWG, so a new node gets the newest; what clients
+// speak is the entry node's own setting.
+const PROTOCOLS = ['3.1', '3.0', '2.0', '1.5', '1.0']
+const NEWEST = PROTOCOLS[0]
 const SIGNATURES = ['quic', 'dns', 'random', 'short', 'none']
+
+/** Whether this entry node can build an uplink on a generation. Its node container is
+ *  what builds it, so an older image there caps every exit node at what it speaks. */
+function servable(version: string): boolean {
+  const s = state.value
+  if (!s || s.stale || !s.protocols?.length) return true
+  return s.protocols.includes(version)
+}
+
+function protocolNote(version: string): string {
+  if (!servable(version)) return ' — update this entry node first'
+  if (version === NEWEST) return ' — newest'
+  if (version === '1.0') return ' — legacy'
+  return ''
+}
+
+const FLEET_BADGES: Record<FleetNodeStatus, string> = {
+  current: 'badge-disabled',
+  upgraded: 'badge-active',
+  skipped: 'badge-disabled',
+  unreachable: 'badge-limited',
+  failed: 'badge-expired',
+}
+
+/** "1.5.1 → 1.6.0", or just the one value when nothing changed. */
+function transition(before: string | null, after: string | null): string {
+  if (before === after) return before ?? '—'
+  return `${before ?? '—'} → ${after ?? '—'}`
+}
+
+// The walk may be running in `saucewg update` rather than as a task of this page, so
+// this is read from the panel rather than inferred from anything started here.
+const fleetRunning = computed(() => fleet.value?.running ?? false)
+const fleetPending = computed(() => (fleet.value?.last?.nodes ?? []).filter((n) => n.pending))
+/** The per-node results of the walk this page started, once there are any. */
+const fleetResult = computed(() => {
+  const result = task.value?.result as FleetReport | null | undefined
+  return result && Array.isArray(result.nodes) ? result : null
+})
 
 const blank = {
   name: '',
@@ -72,7 +118,7 @@ const blank = {
   port: 51820,
   priority: null as number | null,
   preshared_key: '',
-  protocol: '2.0',
+  protocol: NEWEST,
   signature: 'quic',
   // Whether this node carries IPv6 for the cascade. Follows the entry node's own
   // bridge by default, which is what the two ends have to agree on; unchecking it
@@ -84,15 +130,19 @@ const form = ref({ ...blank })
 const removeForm = ref({ uninstall: false, ssh_password: '' })
 const repairForm = ref({ ssh_password: '' })
 const editForm = ref({ priority: 0, note: '', endpoint: '', endpoint6: '', family: 'auto' })
-const protocolForm = ref({ protocol: '2.0', signature: 'quic', ssh_password: '' })
+const protocolForm = ref({ protocol: NEWEST, signature: 'quic', ssh_password: '' })
+const fleetForm = ref({ move: true })
 
 async function refresh() {
-  try {
-    state.value = await api.exitNodes()
+  const [nodes, walk] = await Promise.allSettled([api.exitNodes(), api.fleet()])
+  if (nodes.status === 'fulfilled') {
+    state.value = nodes.value
     error.value = ''
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err)
+  } else {
+    error.value = nodes.reason instanceof Error ? nodes.reason.message : String(nodes.reason)
   }
+  // Only ever adds a banner, so a panel that cannot answer it is not an error.
+  fleet.value = walk.status === 'fulfilled' ? walk.value : null
 }
 
 /** Reading the key is what creates it, so this also seeds a fresh installation. */
@@ -151,7 +201,7 @@ function follow(started: NodeTask, onDone: (final: NodeTask) => void) {
 }
 
 function openAdd() {
-  form.value = { ...blank }
+  form.value = { ...blank, protocol: PROTOCOLS.find(servable) ?? NEWEST }
   task.value = null
   probe.value = null
   adding.value = true
@@ -429,6 +479,29 @@ async function upgrade() {
   }
 }
 
+function openFleet() {
+  fleetForm.value = { move: true }
+  task.value = null
+  upgradingFleet.value = true
+}
+
+async function submitFleet() {
+  busy.value = 'fleet'
+  try {
+    const started = await api.upgradeFleet(fleetForm.value.move ? {} : { keep_protocol: true })
+    follow(started, (final) => {
+      const report = final.result as FleetReport | null
+      if (final.status === 'failed') notify(final.error ?? 'Upgrading the exit nodes failed', 'error')
+      else if (report && !report.ok) notify(report.halted ?? report.error ?? 'Not every exit node was upgraded', 'error')
+      else notify('The exit nodes are upgraded', 'success')
+    })
+  } catch (err) {
+    notify(err instanceof Error ? err.message : String(err), 'error')
+  } finally {
+    busy.value = ''
+  }
+}
+
 function closeTaskModal() {
   if (taskRunning.value) return
   window.clearInterval(taskTimer)
@@ -438,6 +511,7 @@ function closeTaskModal() {
   recovering.value = null
   switching.value = null
   managing.value = null
+  upgradingFleet.value = false
   task.value = null
 }
 
@@ -514,7 +588,16 @@ onUnmounted(() => {
       <button class="btn" :disabled="busy !== '' || state?.mode === 'auto'" @click="auto">
         {{ state?.mode === 'auto' ? 'Automatic failover on' : 'Return to automatic' }}
       </button>
-      <button class="btn btn-primary" :disabled="!state?.provisioning" @click="openAdd">
+      <button
+        v-if="state?.nodes.some((n) => n.managed)"
+        class="btn"
+        title="Bring every exit node this panel installed to its release, one at a time"
+        :disabled="busy !== '' || !state?.provisioning || fleetRunning"
+        @click="openFleet"
+      >
+        {{ fleetRunning ? 'Upgrading exit nodes…' : 'Upgrade exit nodes' }}
+      </button>
+      <button class="btn btn-primary" :disabled="!state?.provisioning || fleetRunning" @click="openAdd">
         + Add exit node
       </button>
     </div>
@@ -567,6 +650,28 @@ onUnmounted(() => {
         Restarting and re-pairing both ran without the tunnel coming back, so the exit
         server needs looking at directly.
       </template>
+    </div>
+
+    <div v-if="fleetRunning && fleet" class="alert alert-warn" style="margin-bottom: 14px">
+      The exit nodes are being upgraded to SauceWG {{ fleet.release }}, one at a time<template
+        v-if="fleet.last?.current"
+      >, now <span class="mono">{{ fleet.last.current }}</span></template
+      >. Clients are kept on a node that is not being touched, and other changes to the
+      nodes wait until it is done.
+    </div>
+
+    <div v-else-if="fleet?.last?.halted" class="alert alert-error" style="margin-bottom: 14px">
+      The last upgrade of the exit nodes stopped: {{ fleet.last.halted }}. The nodes after
+      it were left on the release they had. Look at that node — its log is under ⚙ — and
+      run the upgrade again.
+    </div>
+
+    <div v-else-if="fleetPending.length && fleet" class="alert alert-warn" style="margin-bottom: 14px">
+      <span class="mono">{{ fleetPending.map((n) => n.name).join(', ') }}</span>
+      {{ fleetPending.length === 1 ? 'is' : 'are' }} not on SauceWG {{ fleet.release }} yet:
+      {{ fleetPending.map((n) => n.detail).join('; ') }}.
+      <template v-if="fleet.auto">The panel tries again by itself.</template>
+      <template v-else>Run the upgrade again once they answer.</template>
     </div>
 
     <div v-if="!state.provisioning && !state.config_error" class="alert alert-warn" style="margin-bottom: 14px">
@@ -672,7 +777,16 @@ onUnmounted(() => {
                   {{ recoveryLabel(node) }}
                 </div>
               </td>
-              <td class="mono">{{ node.protocol ?? '1.0' }}</td>
+              <td class="mono">
+                {{ node.protocol ?? '1.0' }}
+                <div
+                  v-if="node.protocol_pinned"
+                  class="stat-sub"
+                  title="Put on this generation by hand, so upgrading the exit nodes leaves it here"
+                >
+                  kept
+                </div>
+              </td>
               <td class="mono">{{ node.priority }}</td>
               <td class="mono">
                 {{ node.endpoint ?? '—' }}
@@ -706,7 +820,7 @@ onUnmounted(() => {
                   <button
                     class="btn btn-ghost btn-sm"
                     title="Priority and note"
-                    :disabled="!state.provisioning || !!node.task_id"
+                    :disabled="!state.provisioning || !!node.task_id || fleetRunning"
                     @click="openEdit(node)"
                   >
                     ✎
@@ -715,7 +829,7 @@ onUnmounted(() => {
                     v-if="node.managed && !node.healthy"
                     class="btn btn-sm"
                     title="Restart this server's service, and re-pair it if that is not enough"
-                    :disabled="busy !== '' || !state.provisioning || !!node.task_id || !node.ssh_key"
+                    :disabled="busy !== '' || !state.provisioning || !!node.task_id || !node.ssh_key || fleetRunning"
                     @click="recover(node)"
                   >
                     Recover
@@ -733,7 +847,7 @@ onUnmounted(() => {
                     v-if="node.managed"
                     class="btn btn-ghost btn-sm"
                     title="Change the AmneziaWG generation this node serves"
-                    :disabled="!state.provisioning || !!node.task_id"
+                    :disabled="!state.provisioning || !!node.task_id || fleetRunning"
                     @click="openProtocol(node)"
                   >
                     ⇅
@@ -742,7 +856,7 @@ onUnmounted(() => {
                     v-if="node.managed"
                     class="btn btn-ghost btn-sm"
                     title="Re-install the uplink key on this server"
-                    :disabled="!state.provisioning || !!node.task_id"
+                    :disabled="!state.provisioning || !!node.task_id || fleetRunning"
                     @click="openRepair(node)"
                   >
                     ↻
@@ -751,7 +865,7 @@ onUnmounted(() => {
                     class="btn btn-ghost btn-sm"
                     title="Remove"
                     style="color: var(--danger)"
-                    :disabled="!state.provisioning || !!node.task_id"
+                    :disabled="!state.provisioning || !!node.task_id || fleetRunning"
                     @click="openRemove(node)"
                   >
                     ✕
@@ -896,14 +1010,21 @@ onUnmounted(() => {
         <div class="field">
           <label>AmneziaWG generation</label>
           <select v-model="form.protocol">
-            <option v-for="version in PROTOCOLS" :key="version" :value="version">
-              {{ version }}{{ version === '2.0' ? ' — newest' : version === '1.0' ? ' — legacy' : '' }}
+            <option
+              v-for="version in PROTOCOLS"
+              :key="version"
+              :value="version"
+              :disabled="!servable(version)"
+            >
+              {{ version }}{{ protocolNote(version) }}
             </option>
           </select>
           <span class="hint">
             This is the uplink between the two servers, so it is independent of what
-            clients speak. 1.5 and 2.0 obfuscate more but need a recent AmneziaWG build
-            on the exit node, which the installer provides.
+            clients speak, and the installer gives the exit node an AmneziaWG that
+            speaks every generation. 3.x also encrypts the packet headers with a key
+            both ends share. Anything older than {{ NEWEST }} keeps the node there when
+            the exit nodes are upgraded.
           </span>
         </div>
         <div class="field">
@@ -1128,8 +1249,13 @@ onUnmounted(() => {
         <div class="field">
           <label>Generation</label>
           <select v-model="protocolForm.protocol">
-            <option v-for="version in PROTOCOLS" :key="version" :value="version">
-              {{ version }}{{ version === (switching.protocol ?? '1.0') ? ' — current' : '' }}
+            <option
+              v-for="version in PROTOCOLS"
+              :key="version"
+              :value="version"
+              :disabled="!servable(version)"
+            >
+              {{ version }}{{ version === (switching.protocol ?? '1.0') ? ' — current' : protocolNote(version) }}
             </option>
           </select>
         </div>
@@ -1158,6 +1284,11 @@ onUnmounted(() => {
       <p style="margin: 0; color: var(--text-dim); font-size: 12.5px">
         This only changes the uplink between the two servers. What your own clients
         speak is set on the Node page.
+        <template v-if="protocolForm.protocol !== NEWEST">
+          The node is then kept on {{ protocolForm.protocol }}: upgrading the exit nodes
+          brings it new releases but leaves its generation alone until it is moved to
+          {{ NEWEST }} here.
+        </template>
       </p>
     </template>
 
@@ -1255,6 +1386,90 @@ onUnmounted(() => {
     <template #footer>
       <button class="btn btn-primary" :disabled="taskRunning" @click="closeTaskModal">
         {{ taskRunning ? 'Working…' : 'Done' }}
+      </button>
+    </template>
+  </ModalShell>
+
+  <!-- Upgrade every node --------------------------------------------------->
+  <ModalShell v-if="upgradingFleet" wide title="Upgrade the exit nodes" @close="closeTaskModal">
+    <template v-if="!task">
+      <p style="margin: 0; color: var(--text-muted); font-size: 13px">
+        Every exit node this panel installed is brought to SauceWG {{ fleet?.release ?? 'this release' }},
+        one at a time. Standbys go first; then traffic is moved onto one that is already
+        upgraded, and the node that carried it goes last — so clients stay connected
+        throughout. A node that worked before its upgrade and does not afterwards stops
+        the walk there. <span class="mono">saucewg update</span> on this server does the
+        same by itself.
+      </p>
+
+      <label v-if="fleet?.protocol" class="switch">
+        <input v-model="fleetForm.move" type="checkbox" />
+        <span>Also move them to AmneziaWG {{ fleet.protocol }}</span>
+      </label>
+
+      <p style="margin: 0; color: var(--text-dim); font-size: 12.5px">
+        <template v-if="fleet?.protocol">
+          A node put on a generation by hand stays on it. One that does not come up on
+          {{ fleet.protocol }} is put back on the generation it had and kept there, and
+          no other node is moved after it.
+        </template>
+        <template v-else>
+          <span class="mono">NODE_UPGRADE_PROTOCOL</span> is empty, so every node stays on
+          the generation it speaks.
+        </template>
+        Nodes added by hand are listed but not touched; run
+        <span class="mono">saucewg update</span> on those servers.
+      </p>
+    </template>
+
+    <template v-else>
+      <div class="row-between">
+        <strong>{{ task.step || 'Starting' }}</strong>
+        <span class="badge" :class="task.status === 'failed' ? 'badge-expired' : task.status === 'succeeded' ? 'badge-active' : 'badge-limited'">
+          {{ task.status }}
+        </span>
+      </div>
+      <pre class="config">{{ task.log.map((l) => l.text).join('\n') }}</pre>
+      <div v-if="task.error" class="alert alert-error">{{ task.error }}</div>
+      <div v-if="fleetResult?.halted" class="alert alert-error">{{ fleetResult.halted }}</div>
+
+      <div v-if="fleetResult?.nodes.length" class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th class="plain">Node</th>
+              <th class="plain">Result</th>
+              <th class="plain">Release</th>
+              <th class="plain">Generation</th>
+              <th class="plain"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in fleetResult.nodes" :key="item.name">
+              <td><strong>{{ item.name }}</strong></td>
+              <td>
+                <span class="badge" :class="FLEET_BADGES[item.status] ?? 'badge-disabled'">
+                  {{ item.status }}
+                </span>
+              </td>
+              <td class="mono">{{ transition(item.version_before, item.version_after) }}</td>
+              <td class="mono">{{ transition(item.protocol_before, item.protocol_after) }}</td>
+              <td class="stat-sub">{{ item.detail }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </template>
+
+    <template #footer>
+      <template v-if="!task">
+        <button class="btn" @click="upgradingFleet = false">Cancel</button>
+        <button class="btn btn-primary" :disabled="busy !== '' || fleetRunning" @click="submitFleet">
+          Upgrade
+        </button>
+      </template>
+      <button v-else class="btn btn-primary" :disabled="taskRunning" @click="closeTaskModal">
+        {{ taskRunning ? 'Upgrading…' : 'Done' }}
       </button>
     </template>
   </ModalShell>

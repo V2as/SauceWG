@@ -29,7 +29,7 @@ UPLINK_SUBNET6=""
 ENDPOINT_FAMILY=auto
 HTTP_PORT=80
 ENV_FILE=.env
-PROTOCOL=$AWG_PROTOCOL_DEFAULT
+PROTOCOL=$AWG_PROTOCOL_CLIENTS
 SIGNATURE=""
 
 while [ $# -gt 0 ]; do
@@ -82,9 +82,9 @@ if [ ! -f "$ENV_FILE" ]; then
 
     cat > "$ENV_FILE" <<EOF
 COMPOSE_PROJECT_NAME=saucewg
-IMAGE_AWG=saucewg/awg:1.5.1
-IMAGE_PANEL=saucewg/panel:1.5.1
-IMAGE_WEB=saucewg/web:1.5.1
+IMAGE_AWG=saucewg/awg:1.6.0
+IMAGE_PANEL=saucewg/panel:1.6.0
+IMAGE_WEB=saucewg/web:1.6.0
 
 PANEL_TITLE=SauceWG
 PANEL_HTTP_PORT=${HTTP_PORT}

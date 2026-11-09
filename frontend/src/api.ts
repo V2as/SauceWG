@@ -122,6 +122,9 @@ export interface ExitNode {
   // Which AmneziaWG generation this uplink speaks. Null from a node container that
   // predates generation selection, which is serving 1.0 either way.
   protocol: string | null
+  // True when an operator put it on that generation, so upgrading the exit nodes
+  // gives it the new release but leaves the generation alone.
+  protocol_pinned: boolean
   managed: boolean
   ssh_host: string | null
   ssh_port: number | null
@@ -209,8 +212,54 @@ export interface ExitNodeList {
   updated_at: string | null
   config_error: string | null
   provisioning: boolean
+  // The generations this entry node's own image can build an uplink on; an exit
+  // node cannot be put on any other.
+  protocols: string[]
   bridge: CascadeBridge
   nodes: ExitNode[]
+}
+
+export type FleetNodeStatus = 'current' | 'upgraded' | 'skipped' | 'unreachable' | 'failed'
+
+export interface FleetNodeOutcome {
+  name: string
+  status: FleetNodeStatus
+  detail: string
+  version_before: string | null
+  version_after: string | null
+  protocol_before: string | null
+  protocol_after: string | null
+  healthy: boolean | null
+  // The panel tries this node again by itself.
+  pending: boolean
+}
+
+// One walk over the exit nodes: the one under way, or how the last one ended. It may
+// have been run by `saucewg update` rather than from here.
+export interface FleetReport {
+  ok: boolean
+  running: boolean
+  origin: 'update' | 'startup' | 'panel' | 'cli'
+  release: string
+  protocol: string | null
+  started_at: string | null
+  finished_at: string | null
+  current: string | null
+  // Why the walk stopped before the end: a node that worked before its upgrade and
+  // does not now.
+  halted: string | null
+  error: string | null
+  nodes: FleetNodeOutcome[]
+}
+
+export interface FleetStatus {
+  // The release a walk takes nodes to, which is this panel's own.
+  release: string
+  // The generation it moves them onto, or null when they stay where they are.
+  protocol: string | null
+  auto: boolean
+  running: boolean
+  last: FleetReport | null
 }
 
 export interface DirectRoute {
@@ -550,6 +599,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  // Every managed exit node onto this panel's release, one at a time, with traffic
+  // moved off each before it is touched.
+  fleet: () => request<FleetStatus>('/nodes/fleet'),
+  upgradeFleet: (payload: { protocol?: string | null; keep_protocol?: boolean } = {}) =>
+    request<NodeTask>('/nodes/upgrade', { method: 'POST', body: JSON.stringify(payload) }),
 
   // Destinations that bypass the cascade. The prefix is part of the path and
   // contains a slash, which the API takes as-is.

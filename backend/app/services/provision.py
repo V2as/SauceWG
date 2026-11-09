@@ -283,10 +283,16 @@ def _installer_env() -> str:
     pairs = {
         "SAUCEWG_REPO": settings.saucewg_repo,
         "SAUCEWG_REF": settings.saucewg_ref,
+        "SAUCEWG_REGISTRY": settings.saucewg_registry,
         "SAUCEWG_NAMESPACE": settings.saucewg_namespace,
         "SAUCEWG_IMAGE_PREFIX": settings.saucewg_image_prefix,
         "SAUCEWG_TAG": settings.saucewg_tag,
     }
+    # The CLI replaces itself with whatever copy is published there, so a mirror the
+    # entry node updates from has to be the one its exit nodes update from too, or
+    # an update would swap the panel's script for an older one mid-run.
+    if settings.saucewg_raw_base:
+        pairs["SAUCEWG_RAW_BASE"] = settings.saucewg_raw_base
     return " ".join(f"{key}={shlex.quote(value)}" for key, value in pairs.items())
 
 

@@ -65,14 +65,17 @@ entirely by which obfuscation parameters the `[Interface]` section carries. That
 how AmneziaVPN and KeeneticOS tell them apart, and it is why a profile can only be loaded
 into a client that understands every parameter in it.
 
-SauceWG serves the three generations that router firmware can load, and defaults new
-installations to **2.0**:
+SauceWG serves all five generations. A new entry node gives its clients **2.0**, the
+newest a router on a stable KeeneticOS loads; the link to the exit nodes runs
+`amneziawg-go` at both ends, so a new exit node speaks **3.1**:
 
-| Generation | Parameters on top of WireGuard | KeeneticOS |
+| Generation | Parameters on top of WireGuard | Clients that load it |
 | --- | --- | --- |
-| `1.0` | `Jc` `Jmin` `Jmax` `S1` `S2` `H1`–`H4` | 4.2 Alpha 2 and newer |
-| `1.5` | the same, plus `I1` | 5.1 Alpha 3 and newer |
-| `2.0` | the same, plus `I1` `S3` `S4` | 5.1 Alpha 3 and newer |
+| `1.0` | `Jc` `Jmin` `Jmax` `S1` `S2` `H1`–`H4` | KeeneticOS 4.2 Alpha 2 and newer, every AmneziaVPN |
+| `1.5` | the same, plus `I1` | KeeneticOS 5.1 Alpha 3 and newer, AmneziaVPN 4.8.12.9 |
+| `2.0` | the same, plus `I1` `S3` `S4` | KeeneticOS 5.1 Alpha 3 and newer, AmneziaVPN 4.8.12.9 |
+| `3.0` | 2.0, plus `HeaderProtectionKey`, `ContentPaddingAddition` and five timers | KeeneticOS 5.2 Alpha 11, AmneziaVPN 5.0.0.5 |
+| `3.1` | 3.0, plus `RandomTrailers` and `DisableCookies` | KeeneticOS 5.2 Alpha 11, AmneziaVPN 5.0.1.5 |
 
 Loading a 1.5 or 2.0 profile into KeeneticOS 5.0.8 or older fails with
 `"Wireguard": invalid H1 value` — the firmware is not rejecting `H1`, it simply does not
@@ -81,10 +84,8 @@ build for most models; if a router cannot be moved to it, that node stays on 1.0
 [Amnezia's own instructions](https://docs.amnezia.org/ru/documentation/instructions/keenetic-os-awg/)
 also note is the more blockable of the three. AmneziaVPN calls 1.0 **AmneziaWG Legacy**;
 `legacy` is accepted as a spelling of `1.0` everywhere in SauceWG for that reason.
-
-AmneziaWG 3.0 — header protection, content padding, custom timings — is deliberately
-absent. No router firmware speaks it, so a 3.0 profile could not be loaded into a
-Keenetic at all.
+3.x reaches routers only on the 5.2 alpha channel, which is why clients are not moved to
+it by default; `saucewg set-protocol 3.1` on the entry node does that once they can load it.
 
 | Parameter | Meaning | Must match on both sides |
 | --- | --- | --- |
@@ -95,13 +96,19 @@ Keenetic at all.
 | `S3` / `S4` | padding of the cookie reply and of every transport packet | **yes** |
 | `H1`–`H4` | replacement values for the four packet type headers | **yes** |
 | `I1`–`I5` | signature packets sent ahead of the handshake | no |
+| `HeaderProtectionKey` | 3.x: the key packet headers are encrypted with; needs every `S1`–`S4` ≥ 12 | **yes** |
+| `ContentPaddingAddition` | 3.x: content padding, added by the sender alone | no |
+| `RekeyAfterTime` … `MaxHandshakeAttempts` | 3.x: the five handshake timers, each drawn from a range | no |
+| `RandomTrailers` | 3.1: whether a packet longer than expected is accepted | **yes** |
+| `DisableCookies` | 3.1: a switch for this end's cookie handling | no |
 
 The asymmetry matters for what a profile has to contain. `S1`–`S4` change how long each
 message is and `H1`–`H4` change its type header, so a mismatch is a tunnel that never
-handshakes — the panel copies those verbatim into every client profile. Junk packets and
-signature packets are only ever *built* by the sender and never parsed by the receiver, so
-each side may use its own: the entry node keeps its own `I1` disguise while handing clients
-whatever `CLIENT_SIGNATURE`, `CLIENT_JC`, `CLIENT_JMIN` and `CLIENT_JMAX` say.
+handshakes — the panel copies those verbatim into every client profile, along with the
+header protection key and `RandomTrailers` on 3.x. Junk packets, signature packets, the
+timers and the switches are only ever acted on by the sender, so each side may use its
+own: the entry node keeps its own `I1` disguise while handing clients whatever
+`CLIENT_SIGNATURE`, `CLIENT_JC`, `CLIENT_JMIN` and `CLIENT_JMAX` say.
 
 A signature packet is what a censor's classifier sees first, so `I1` is chosen from a
 preset rather than written by hand — `quic` (the default, matching the entry node's UDP/443),
@@ -109,24 +116,30 @@ preset rather than written by hand — `quic` (the default, matching the entry n
 `<b 0x…><r n>` spec is accepted anywhere a preset name is.
 
 Every node, uplink and client profile carries its own generation, so a cascade can serve
-2.0 to phones while an uplink to an older exit node stays on 1.0. Moving a node between
-generations is one command (`saucewg set-protocol`, or the **⇅** button on the Exit nodes
-page) and only adds or drops parameters — the padding both ends already agreed on is
-kept, so the tunnel is not rekeyed.
+2.0 to phones while its uplinks run 3.1, or an uplink to an older exit node stays on 1.0.
+Moving a node between generations is one command (`saucewg set-protocol`, or the **⇅**
+button on the Exit nodes page) and only adds or drops parameters — the padding both ends
+already agreed on is kept where the new generation allows it, so the tunnel is not
+rekeyed. Moving onto 3.x replaces any padding shorter than the 12 bytes header
+protection needs.
 
-The node image pins `amneziawg-go` v0.2.x with `amneziawg-tools` v1.0.x, which implement
-all three; `scripts/test-protocol-parity.sh` in CI keeps the three places that describe a
-generation from drifting apart.
+The node image pins `amneziawg-go` v3.1.20260828 with `amneziawg-tools` v3.1.20260812,
+which implement all five. A profile without the 3.x parameters is the older protocol on
+the wire, which is what lets an entry node on this image keep talking to exit nodes that
+have not been upgraded yet. `scripts/test-protocol-parity.sh` in CI keeps the three
+places that describe a generation from drifting apart.
 
 > **A client-facing 2.0 interface pads by zero.** `S3` and `S4` default to `0` on the
-> interface app clients dial, because the AmneziaVPN app has an
+> interface app clients dial, because the AmneziaVPN 4.x app has an
 > [open bug](https://github.com/amnezia-vpn/amnezia-client/issues/2582) where it does not
 > hand non-zero `S3`/`S4` to its own backend: it strips no padding from transport packets
 > that have it, so the handshake completes and nothing flows. The profile is still a valid
 > 2.0 one, and routers using the AmneziaWG kernel module (Keenetic among them) work either
 > way. Cascade hops keep real padding — both ends there run `amneziawg-go`, which honours
 > it, and that is the hop a censor actually sees. Pin `AWG_S3`/`AWG_S4` in `.env` if every
-> client you serve is a router.
+> client you serve is a router. 3.x has no zero to fall back on — header protection takes
+> its nonce from the padding — and every app release that loads 3.x honours it; moving
+> back down to 2.0 puts the zero back.
 
 ## Components
 
@@ -160,7 +173,8 @@ out to serve the panel over plain HTTP by IP.
 
 The entry node comes up on AmneziaWG 2.0 with no exit nodes, so the panel is usable
 immediately. Add `--protocol 1.0` if the clients that will connect are routers on
-KeeneticOS 5.0.8 or older — it can also be changed later with `saucewg set-protocol`.
+KeeneticOS 5.0.8 or older, or `--protocol 3.1` if every one of them runs AmneziaVPN 5.0.1.5
+or newer — it can also be changed later with `saucewg set-protocol`.
 
 ### 2. Exit nodes
 
@@ -204,7 +218,7 @@ its IPv6 address as the host, or by hand pass `--endpoint-host6` to `install-nod
 detects the server's own addresses either way and reports both. See [IPv6](#ipv6).
 
 Optionally add a pre-shared key to an uplink for post-quantum resistance: generate one
-with `docker run --rm --entrypoint awg saucewg/awg:1.5.1 genpsk` and pass it as
+with `docker run --rm --entrypoint awg saucewg/awg:1.6.0 genpsk` and pass it as
 `--psk` to `install-node` and `preshared_key` in the object above.
 
 Private keys are generated inside the node container on first start and persisted in the
@@ -227,8 +241,9 @@ The installer leaves a `saucewg` command behind on both roles:
 saucewg status                 # what is running
 saucewg start | stop | restart
 saucewg logs -f awg            # awg, panel, postgres, caddy
-saucewg update                 # pull newer images and recreate
+saucewg update                 # pull newer images, recreate, then upgrade the exit nodes
 saucewg nodes                  # the cascade, with health
+saucewg upgrade-nodes          # bring the exit nodes to this release, one at a time
 saucewg recover                # try to bring failed exit nodes back
 saucewg routes                 # destinations that bypass the cascade
 saucewg bypass                 # destinations this node reopens for itself
@@ -383,7 +398,8 @@ dies is rebuilt on the next tick.
 Three invariants when adding nodes by hand:
 
 - `s1`–`s4` and `h1`–`h4` must be identical on both ends of an uplink, and different
-  between uplinks. `jc`/`jmin`/`jmax` and `i1` need not match.
+  between uplinks; so must `header_protection_key` and `random_trailers` on 3.x.
+  `jc`/`jmin`/`jmax`, `i1` and the 3.x timers need not match.
 - `protocol` must be one the exit node actually serves. Both ends have to carry the same
   parameters, and an exit node on 1.0 does not read `s3`, `s4` or `i1` at all.
 - an uplink's `address` must be inside that exit node's `AWG_SUBNET`, since the exit
@@ -465,6 +481,52 @@ same code. Asking for it by hand also clears whatever the automatic attempts had
 up on, since an operator asking has usually just fixed the reason — as does restarting the
 panel, the count being held in memory, so an update starts a node over. Set
 `NODE_RECOVERY_ENABLED=false` to leave failed nodes alone entirely.
+
+### Updating keeps the exit nodes in step
+
+An entry node and its exit nodes are one installation, so `saucewg update` on the entry
+node does not stop at itself. Once the new panel answers, it brings every exit node the
+panel installed to the same release, one at a time, in an order chosen so clients never
+lose the cascade:
+
+1. Standbys first, the least preferred first.
+2. The node carrying traffic last — after traffic has been moved onto one that is already
+   upgraded, and the failover choice handed back afterwards.
+3. After the release, each node is moved to `NODE_UPGRADE_PROTOCOL` (3.1) unless an
+   operator put it on another generation; both ends of its tunnel move together.
+
+The walk waits for every tunnel to handshake *after* its node was replaced before going on.
+A node that worked before and does not afterwards stops the walk there, and the nodes after
+it keep their release. A node that does not come up on the new generation is put back on
+the one it had and kept there, and no other node is moved after it. A node that does not
+answer SSH is left for later: the panel retries it every `NODE_AUTO_UPGRADE_RETRY_SECONDS`
+(15 min) until it has been upgraded. A node added by hand gives the panel no way in, so it is
+listed with what to run on it instead — `saucewg update` on that server.
+
+```bash
+saucewg update                  # the entry node, then the exit nodes
+saucewg update --no-nodes       # the entry node alone
+saucewg upgrade-nodes           # the exit nodes alone, e.g. after one was down
+saucewg upgrade-nodes eu-nl     # just this one
+saucewg upgrade-nodes --keep-protocol   # the release only, every node on its generation
+# NAME     RESULT    RELEASE        GENERATION  DETAIL
+# eu-de    upgraded  1.5.1 → 1.6.0  2.0 → 3.1   -
+# eu-nl    upgraded  1.5.1 → 1.6.0  2.0 → 3.1   -
+# by-hand  skipped   -              2.0         added by hand, so the panel has no way in; run `saucewg update` on that server
+```
+
+The same walk runs from the **Upgrade exit nodes** button on the Exit nodes page and from
+`POST /api/nodes/upgrade`, and the panel starts one by itself a couple of minutes after it
+starts, for whatever `saucewg update` could not reach. Only one runs at a time, wherever it
+was started, and recovery and every change to a node wait for it. Switching which node
+carries traffic stays open, and the walk leaves a choice made meanwhile alone. Set
+`NODE_AUTO_UPGRADE=false` to keep the exit nodes where they are, and
+`NODE_UPGRADE_PROTOCOL=` (empty) to upgrade their release without moving their generation.
+
+> **Updating from 1.5.x.** The `saucewg` command on the server is 1.5.x until the update
+> replaces it, and 1.5.x does not know `--no-nodes`. To update the entry node alone from
+> there, put `NODE_AUTO_UPGRADE=false` in `/opt/saucewg/.env` first; the exit nodes are then
+> left for `saucewg upgrade-nodes`.
 
 ## IPv6
 
@@ -1031,9 +1093,9 @@ It needs no secrets.
 ### From your machine
 
 ```bash
-export IMAGE_AWG=yourname/saucewg-awg:1.5.1
-export IMAGE_PANEL=yourname/saucewg-panel:1.5.1
-export IMAGE_WEB=yourname/saucewg-web:1.5.1
+export IMAGE_AWG=yourname/saucewg-awg:1.6.0
+export IMAGE_PANEL=yourname/saucewg-panel:1.6.0
+export IMAGE_WEB=yourname/saucewg-web:1.6.0
 
 make build
 make push

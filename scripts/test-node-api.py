@@ -12,6 +12,7 @@ this stands in for the container and drives the API in-process.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 os.environ.setdefault("JWT_SECRET", "ci")
@@ -98,6 +100,9 @@ settings.node_ssh_query_timeout_seconds = 10
 
 checks = 0
 
+#: What a node container built on amneziawg-go v3 says it can build an uplink for.
+GENERATIONS = ["1.0", "1.5", "2.0", "3.0", "3.1"]
+
 
 def check(label: str, condition: bool, detail: object = "") -> None:
     global checks
@@ -118,12 +123,13 @@ def publish(
     direct: dict | None = None,
     bypass: dict | None = None,
     bridge: dict | None = None,
+    generations: list[str] | None = GENERATIONS,
 ) -> None:
     """Writes the state file the way the node container would.
 
-    ``fallback=None``, ``direct=None``, ``bypass=None`` and ``bridge=None`` leave
-    those keys out entirely, which is what a node container older than this panel
-    publishes.
+    ``fallback=None``, ``direct=None``, ``bypass=None``, ``bridge=None`` and
+    ``generations=None`` leave those keys out entirely, which is what a node
+    container older than this panel publishes.
     """
     state = {
         "updated_at": time.time() - age,
@@ -145,6 +151,8 @@ def publish(
         state["bypass"] = bypass
     if bridge is not None:
         state["bridge"] = bridge
+    if generations is not None:
+        state["generations"] = generations
     with open(settings.uplink_state_file, "w", encoding="utf-8") as handle:
         json.dump(state, handle)
 
@@ -171,6 +179,320 @@ async def drain(client: httpx.AsyncClient, task_id: str, timeout: float = 30.0) 
     raise SystemExit(f"FAIL  task {task_id} never finished")
 
 
+async def walk_the_fleet(client: httpx.AsyncClient) -> None:
+    """The fleet upgrade, against a container that fails a tunnel whose ends disagree.
+
+    Nothing here touches a server: the three SSH calls the walk makes are replaced
+    by fakes that keep a release and a generation per node, and the stand-in
+    container calls a node healthy only while both ends speak the same generation —
+    which is the property the walk exists to preserve.
+    """
+    from app import __version__
+    from app.awg.uplinks import load_uplink_state
+    from app.services import fleet, provision
+    from app.services.tasks import detached
+
+    fleet.SETTLE_TIMEOUT = 5
+    fleet.HEALTH_TIMEOUT = 4
+    fleet.SWITCH_TIMEOUT = 5
+
+    hosts = {"fl-a": "198.51.100.11", "fl-b": "198.51.100.12", "fl-c": "198.51.100.13"}
+    by_host = {host: name for name, host in hosts.items()}
+    world: dict[str, Any] = {}
+
+    def reset(*, release: str, keep: tuple[str, ...] = ()) -> None:
+        nodes = []
+        for priority, name in enumerate(("fl-a", "fl-b", "fl-c"), start=1):
+            entry = {
+                "name": name, "endpoint": f"{hosts[name]}:51820", "public_key": f"KEY-{name}",
+                "address": f"10.77.0.{priority + 1}/32", "priority": priority * 10,
+                "protocol": "2.0", "managed": True, "ssh_host": hosts[name], "ssh_key": True,
+            }
+            if name in keep:
+                entry["keep_protocol"] = True
+            nodes.append(entry)
+        # Added by hand: the panel has no way into it, so the walk can only report it.
+        nodes.append({
+            "name": "fl-hand", "endpoint": "198.51.100.14:51820", "public_key": "KEY-hand",
+            "address": "10.77.0.5/32", "priority": 40, "protocol": "2.0", "managed": False,
+        })
+        registry.save_nodes(nodes)
+        world.update(
+            releases={name: release for name in hosts},
+            speaks={name: "2.0" for name in (*hosts, "fl-hand")},
+            down=set(), breaks=set(), refuses=set(), unreachable=set(),
+            calls=[], during={}, busy=None, operator=None, operator_status=None,
+        )
+        with open(settings.uplink_control_file, "w", encoding="utf-8") as handle:
+            json.dump({"mode": "auto", "node": None}, handle)
+
+    def tick() -> None:
+        """The node container: applies the list and the failover choice, then probes."""
+        try:
+            with open(settings.uplink_reload_file, encoding="utf-8") as handle:
+                request_id = json.load(handle)["id"]
+        except (OSError, ValueError):
+            request_id = "0"
+        try:
+            with open(settings.uplink_control_file, encoding="utf-8") as handle:
+                control = json.load(handle)
+        except (OSError, ValueError):
+            control = {"mode": "auto", "node": None}
+        entries = sorted(registry.load_nodes(), key=lambda e: (e.get("priority", 0), e["name"]))
+        healthy = {
+            e["name"] for e in entries
+            if e["name"] not in world["down"]
+            and (e.get("protocol") or "1.0") == world["speaks"].get(e["name"])
+        }
+        pinned = control.get("node") if control.get("mode") == "manual" else None
+        active = pinned if pinned in healthy else next(
+            (e["name"] for e in entries if e["name"] in healthy), None
+        )
+        now = time.time()
+        state = {
+            "updated_at": now, "reload_id": request_id, "source": "file", "config_error": None,
+            "mode": control.get("mode") or "auto", "pinned": pinned, "active": active,
+            "killswitch": False, "fallback": "direct", "fallback_active": active is None,
+            "generations": GENERATIONS,
+            "nodes": [
+                {
+                    "name": e["name"], "iface": f"awg{index}", "address": e.get("address", ""),
+                    "priority": e.get("priority", 0), "public_key": f"UPLINK-{e['name']}",
+                    "endpoint": e.get("endpoint"), "peer_public_key": e.get("public_key"),
+                    "healthy": e["name"] in healthy, "active": e["name"] == active,
+                    "last_handshake": now if e["name"] in healthy else now - 3600,
+                    "protocol": e.get("protocol"),
+                }
+                for index, e in enumerate(entries, start=1)
+            ],
+        }
+        with open(settings.uplink_state_file, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+
+    async def run_container(stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            tick()
+            await asyncio.sleep(0.1)
+
+    async def fake_status(task, credentials):
+        name = by_host[credentials.host]
+        if name in world["unreachable"]:
+            raise provision.ProvisionError(f"could not connect to {credentials.host}")
+        return {"reachable": True, "cli_version": world["releases"][name], "containers": []}
+
+    async def fake_upgrade(task, credentials, tag=None):
+        name = by_host[credentials.host]
+        world["calls"].append(("upgrade", name))
+        with open(settings.uplink_control_file, encoding="utf-8") as handle:
+            world["during"][name] = (load_uplink_state().active, json.load(handle))
+        # Anything else that would touch an exit node has to wait for the walk.
+        if world["busy"] is None:
+            world["busy"] = (await client.put("/api/nodes/fl-a", json={"note": "x"})).status_code
+        if world["operator"] and name == "fl-a":
+            response = await client.post(f"/api/nodes/{world['operator']}/activate")
+            world["operator_status"] = response.status_code
+        world["releases"][name] = __version__
+        if name in world["breaks"]:
+            world["down"].add(name)
+        # A real update returns a while after its container restarted, by which time
+        # the cascade has seen the restart.
+        await asyncio.sleep(1.2)
+        return {"ok": True, "tag": "latest", "cli_version": __version__}
+
+    async def fake_protocol(task, credentials, protocol, signature=None):
+        name = by_host[credentials.host]
+        world["calls"].append(("protocol", name, protocol))
+        world["speaks"][name] = protocol
+        if name in world["refuses"] and protocol == "3.1":
+            world["down"].add(name)
+        else:
+            world["down"].discard(name)
+        await asyncio.sleep(1.2)
+        profile = {"protocol": protocol, "s1": 20, "s2": 31, "s3": 17, "s4": 12,
+                   "h1": "1-2", "h2": "3-4", "h3": "5-6", "h4": "7-8"}
+        if protocol in ("3.0", "3.1"):
+            profile |= {"header_protection_key": f"HPK-{name}", "random_trailers": "on"}
+        return profile
+
+    real = (provision.node_status, provision.upgrade_exit_node, provision.set_exit_node_protocol)
+    provision.node_status = fake_status
+    provision.upgrade_exit_node = fake_upgrade
+    provision.set_exit_node_protocol = fake_protocol
+    stop = asyncio.Event()
+    pump = asyncio.create_task(run_container(stop))
+
+    def outcomes(report: dict) -> dict[str, dict]:
+        return {item["name"]: item for item in report["nodes"]}
+
+    try:
+        print("walking the exit nodes onto this release")
+        reset(release="1.5.1", keep=("fl-c",))
+        await asyncio.sleep(0.3)
+        response = await client.post("/api/nodes/upgrade", json={})
+        check("the walk is started as a task", response.status_code == 202, response.text)
+        task = await drain(client, response.json()["id"], timeout=90)
+        report = task["result"] or {}
+        seen = outcomes(report)
+        check("it finishes cleanly", task["status"] == "succeeded" and report.get("ok") is True, task)
+        check(
+            "standbys go first, the least preferred first, and the active node last",
+            [item["name"] for item in report["nodes"]] == ["fl-hand", "fl-c", "fl-b", "fl-a"],
+            report["nodes"],
+        )
+        check("a node added by hand is reported, not touched", seen["fl-hand"]["status"] == "skipped", seen)
+        check("with what to run on it instead", "saucewg update" in seen["fl-hand"]["detail"], seen)
+        check(
+            "a node an operator kept on its generation gets the release but stays on it",
+            seen["fl-c"]["status"] == "upgraded" and seen["fl-c"]["protocol_after"] == "2.0"
+            and ("protocol", "fl-c", "3.1") not in world["calls"],
+            (seen["fl-c"], world["calls"]),
+        )
+        check(
+            "the others are upgraded and moved to 3.1",
+            all(seen[n]["status"] == "upgraded" and seen[n]["protocol_after"] == "3.1" for n in ("fl-a", "fl-b")),
+            seen,
+        )
+        check(
+            "with their release recorded",
+            seen["fl-a"]["version_before"] == "1.5.1" and seen["fl-a"]["version_after"] == __version__,
+            seen["fl-a"],
+        )
+        active, control = world["during"]["fl-a"]
+        check("traffic was moved off the active node before it was touched", active == "fl-b", world["during"])
+        check("onto a node already upgraded", control == {"mode": "manual", "node": "fl-b"}, control)
+        with open(settings.uplink_control_file, encoding="utf-8") as handle:
+            check("and the cascade chooses for itself again afterwards", json.load(handle)["mode"] == "auto", "")
+        stored = {e["name"]: e for e in registry.load_nodes()}
+        check(
+            "the uplinks carry the 3.1 profile the exit nodes report",
+            stored["fl-a"]["protocol"] == "3.1" and stored["fl-a"]["header_protection_key"] == "HPK-fl-a",
+            stored["fl-a"],
+        )
+        check("the kept node's uplink is untouched", stored["fl-c"]["protocol"] == "2.0", stored["fl-c"])
+        check("nothing else could touch a node meanwhile", world["busy"] == 409, world["busy"])
+        check("and the lock is released", fleet.running() is False, "")
+        body = (await client.get("/api/nodes/fleet")).json()
+        check("the panel reports how the walk went", body["last"]["ok"] is True and len(body["last"]["nodes"]) == 4, body)
+        check("and what it would move nodes to", body["protocol"] == "3.1" and body["release"] == __version__, body)
+        nodes_body = (await client.get("/api/nodes")).json()
+        pinned = {n["name"]: n["protocol_pinned"] for n in nodes_body["nodes"]}
+        check("the kept node is shown as pinned", pinned == {"fl-a": False, "fl-b": False, "fl-c": True, "fl-hand": False}, pinned)
+
+        response = await client.post("/api/nodes/upgrade", json={})
+        task = await drain(client, response.json()["id"], timeout=60)
+        seen = outcomes(task["result"])
+        check(
+            "a second walk finds nothing to do",
+            all(seen[n]["status"] == "current" for n in ("fl-a", "fl-b", "fl-c")) and len(world["calls"]) == 5,
+            (seen, world["calls"]),
+        )
+        check("and says why the kept node was left", "kept on AmneziaWG 2.0" in seen["fl-c"]["detail"], seen["fl-c"])
+
+        print("a node that does not come back stops the walk")
+        reset(release="1.5.1")
+        world["breaks"].add("fl-c")
+        await asyncio.sleep(0.3)
+        report = await fleet.upgrade(detached("upgrade-fleet", "fleet"), protocol="")
+        seen = outcomes(report)
+        check("the node that broke is reported", seen["fl-c"]["status"] == "failed", seen["fl-c"])
+        check("as the reason the walk stopped", "fl-c" in (report["halted"] or ""), report)
+        check(
+            "and nothing after it is touched",
+            seen["fl-b"]["status"] == "skipped" and seen["fl-a"]["status"] == "skipped"
+            and ("upgrade", "fl-a") not in world["calls"],
+            (seen, world["calls"]),
+        )
+        check("the walk counts as failed", report["ok"] is False, report)
+        check("--keep-protocol moved nobody", not any(call[0] == "protocol" for call in world["calls"]), world["calls"])
+
+        print("a generation that does not come up is undone")
+        reset(release=__version__)
+        world["refuses"].add("fl-c")
+        await asyncio.sleep(0.3)
+        report = await fleet.upgrade(detached("upgrade-fleet", "fleet"))
+        seen = outcomes(report)
+        stored = {e["name"]: e for e in registry.load_nodes()}
+        check("the node is reported as failed", seen["fl-c"]["status"] == "failed", seen["fl-c"])
+        check("and put back on the generation that worked", stored["fl-c"]["protocol"] == "2.0" and seen["fl-c"]["healthy"] is True, (stored["fl-c"], seen["fl-c"]))
+        check("where it is kept, so a restart does not try again", stored["fl-c"].get("keep_protocol") is True, stored["fl-c"])
+        check("the walk does not stop for it", report["halted"] is None, report)
+        check(
+            "but no other node is moved to that generation",
+            stored["fl-a"]["protocol"] == "2.0" and stored["fl-b"]["protocol"] == "2.0"
+            and "fl-c" in seen["fl-a"]["detail"],
+            (stored, seen["fl-a"]),
+        )
+
+        print("a node that does not answer is left for later")
+        reset(release="1.5.1")
+        world["unreachable"].add("fl-b")
+        await asyncio.sleep(0.3)
+        report = await fleet.upgrade(detached("upgrade-fleet", "fleet"))
+        seen = outcomes(report)
+        check("it is reported as unreachable", seen["fl-b"]["status"] == "unreachable", seen["fl-b"])
+        check("and as worth another try", seen["fl-b"]["pending"] is True, seen["fl-b"])
+        check("the rest are still upgraded", seen["fl-a"]["status"] == "upgraded" and seen["fl-c"]["status"] == "upgraded", seen)
+        check("a node that only did not answer does not fail the walk", report["halted"] is None, report)
+
+        print("an operator's choice made during the walk is kept")
+        reset(release="1.5.1")
+        world["operator"] = "fl-c"
+        await asyncio.sleep(0.3)
+        report = await fleet.upgrade(detached("upgrade-fleet", "fleet"), protocol="")
+        check("switching nodes stays open during the walk", world["operator_status"] == 200, world["operator_status"])
+        with open(settings.uplink_control_file, encoding="utf-8") as handle:
+            control = json.load(handle)
+        check("and the walk does not undo it", control == {"mode": "manual", "node": "fl-c"}, control)
+        check("the walk itself still finishes", report["ok"] is True, report)
+
+        print("the panel keeps trying a node that did not answer")
+        reset(release="1.5.1")
+        world["unreachable"].add("fl-b")
+        await asyncio.sleep(0.3)
+
+        async def until(predicate, timeout: float = 60) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if predicate():
+                    return True
+                await asyncio.sleep(0.1)
+            return False
+
+        def pending() -> list[str]:
+            report = fleet.last_report() or {}
+            return [item["name"] for item in report.get("nodes", []) if item.get("pending")]
+
+        saved = (settings.node_auto_upgrade_delay_seconds, settings.node_auto_upgrade_retry_seconds)
+        settings.node_auto_upgrade_delay_seconds, settings.node_auto_upgrade_retry_seconds = 0, 1
+        retrying = asyncio.create_task(fleet.loop())
+        try:
+            check("the walk after a start leaves it for later", await until(lambda: pending() == ["fl-b"]), fleet.last_report())
+            world["unreachable"].discard("fl-b")
+            check(
+                "and a later one reaches it",
+                await until(lambda: world["releases"]["fl-b"] == __version__ and not pending() and not fleet.running()),
+                fleet.last_report(),
+            )
+            started = (fleet.last_report() or {}).get("started_at")
+            await asyncio.sleep(2.5)
+            check(
+                "after which the panel stops walking",
+                (fleet.last_report() or {}).get("started_at") == started,
+                fleet.last_report(),
+            )
+        finally:
+            retrying.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await retrying
+            settings.node_auto_upgrade_delay_seconds, settings.node_auto_upgrade_retry_seconds = saved
+    finally:
+        stop.set()
+        await pump
+        provision.node_status, provision.upgrade_exit_node, provision.set_exit_node_protocol = real
+        registry.save_nodes([])
+        publish()
+
+
 async def main() -> None:
     publish()
     transport = httpx.ASGITransport(app=app)
@@ -181,6 +503,7 @@ async def main() -> None:
         check("an empty cascade is readable", response.status_code == 200, response.text)
         check("provisioning is offered", body["provisioning"] is True, body)
         check("no configuration error", body["config_error"] is None, body)
+        check("the generations a node can be put on are listed", body["protocols"] == GENERATIONS, body)
 
         print("adopting")
         payload = {"name": "eu-nl", "endpoint": "198.51.100.20:51820", "public_key": "KEY-NL"}
@@ -242,14 +565,38 @@ async def main() -> None:
             registry.load_nodes(),
         )
 
+        # What `saucewg install-node --json` prints for a 3.1 node: the header
+        # protection key and RandomTrailers have to reach the uplink like S1-S4 do.
+        v31 = {
+            "name": "eu-v3", "endpoint": "192.0.2.7:51820", "public_key": "KEY-V3",
+            "protocol": "3.1", "s1": 20, "s2": 31, "s3": 17, "s4": 12,
+            "h1": "1000-2000", "h2": "3000-4000", "h3": "5000-6000", "h4": "7000-8000",
+            "header_protection_key": "aGVhZGVyLXByb3RlY3Rpb24ta2V5LTMyLWJ5dGVzISE=",
+            "random_trailers": True,
+        }
+        response = await client.post("/api/nodes/adopt", json=v31)
+        check("a 3.1 node is adopted", response.status_code == 201, response.text)
+        stored = registry.find(registry.load_nodes(), "eu-v3")
+        check("with its header protection key", stored["header_protection_key"] == v31["header_protection_key"], stored)
+        check("and RandomTrailers spelled the way the tools read it", stored["random_trailers"] == "on", stored)
+        registry.save_nodes([n for n in registry.load_nodes() if n["name"] != "eu-v3"])
+
         response = await client.post(
-            "/api/nodes/adopt",
-            json={"name": "eu-v3", "endpoint": "192.0.2.7:51820", "public_key": "KEY-V3",
-                  "protocol": "3.0"},
+            "/api/nodes/adopt", json={k: v for k, v in v31.items() if k != "header_protection_key"}
         )
-        # 3.0 exists upstream but no router firmware speaks it, so a profile using it
-        # could never be loaded into a Keenetic.
-        check("a generation we cannot serve is refused", response.status_code == 422, response.text)
+        check("3.x without the exit node's key is refused", response.status_code == 422, response.text)
+        response = await client.post("/api/nodes/adopt", json={**v31, "s4": 8})
+        # amneziawg-go refuses header protection over a padding shorter than its nonce.
+        check("so is padding too short to protect headers in", response.status_code == 422, response.text)
+        response = await client.post("/api/nodes/adopt", json={**v31, "protocol": "4.0"})
+        check("a generation nobody speaks is refused", response.status_code == 422, response.text)
+
+        # A node container from before 3.x cannot build such an uplink at all.
+        publish(generations=None)
+        response = await client.post("/api/nodes/adopt", json=v31)
+        check("3.1 is refused while the node container speaks only 2.0", response.status_code == 409, response.text)
+        check("saying what to update", "saucewg update" in response.text, response.text)
+        publish()
 
         response = await client.put("/api/nodes/eu-v2", json={"protocol": "1.5"})
         check("the generation is editable", response.status_code == 200, response.text)
@@ -525,7 +872,7 @@ async def main() -> None:
         # params_store quotes a spec so the node's entrypoint can source the file; the
         # panel has to hand it to clients unquoted or AmneziaVPN rejects the profile.
         check("and an unquoted signature", body["obfuscation"].get("I1") == "<r 128>", body)
-        check("every generation is offered", body["protocols_supported"] == ["1.0", "1.5", "2.0"], body)
+        check("every generation is offered", body["protocols_supported"] == GENERATIONS, body)
 
         # An interface written before generations were named records none, but the
         # parameters it carries still say which one it is.
@@ -1245,6 +1592,8 @@ async def main() -> None:
 
         registry.save_nodes([])
         publish()
+
+        await walk_the_fleet(client)
 
         print("when the panel is not in charge")
         publish(source="env")

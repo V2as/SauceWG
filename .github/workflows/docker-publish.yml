@@ -104,8 +104,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            AWG_GO_REF=v0.2.19
-            AWG_TOOLS_REF=v1.0.20260618-2
+            AWG_GO_REF=v3.1.20260828
+            AWG_TOOLS_REF=v3.1.20260812
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 

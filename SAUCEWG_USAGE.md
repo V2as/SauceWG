@@ -96,7 +96,7 @@ bash /tmp/saucewg.sh --json --yes install \
   "admin_username": "admin",
   "admin_password": "a-strong-one",
   "endpoint": "203.0.113.7:443",
-  "version": "1.5.1"
+  "version": "1.6.0"
 }
 ```
 
@@ -118,17 +118,19 @@ Global flags may appear before or after the subcommand, with one exception:
 | `--endpoint-family F` | `auto` | Which family exit nodes publishing both are dialled over: `auto`, `4` or `6` |
 | `--uplink-port-base N` | none | Fixed ports for the uplinks so an exit node can dial this node; see [§4.11](#411-exit-nodes-that-dial-in) |
 | `--endpoint-host HOST` | detected | Public address written into client configs. Set it on a NATed server |
-| `--protocol V` | `2.0` | AmneziaWG generation clients connect with — `1.0` (alias `legacy`), `1.5` or `2.0` |
-| `--signature NAME` | `quic` | The `I1` disguise on 1.5 and 2.0: `quic`, `dns`, `random`, `short`, `none`, or a literal spec |
+| `--protocol V` | `2.0` | AmneziaWG generation clients connect with — `1.0` (alias `legacy`), `1.5`, `2.0`, `3.0` or `3.1` |
+| `--signature NAME` | `quic` | The `I1` disguise on 1.5 and newer: `quic`, `dns`, `random`, `short`, `none`, or a literal spec |
 | `--http-port N` / `--https-port N` | `80` / `443` | Caddy's listening ports |
 | `--no-start` | — | Write the configuration but do not pull or start anything |
 | `--reinstall` | — | Overwrite an existing installation in the same directory |
 
 `--protocol` decides what every client profile this panel hands out will contain, so it
-is the one flag worth thinking about before the first client is created. 2.0 resists DPI
-best; 1.0 is what a router on KeeneticOS 5.0.8 or older can load. It is not a one-way
-door — `saucewg set-protocol` changes it afterwards, and existing clients pick the new
-profile up when they re-download it.
+is the one flag worth thinking about before the first client is created. 3.1 resists DPI
+best and needs AmneziaVPN 5.0.1.5 or newer, or KeeneticOS 5.2 Alpha 11 on a router; 2.0
+is the newest a stable KeeneticOS loads, which is why it is the default; 1.0 is what a
+router on KeeneticOS 5.0.8 or older can load. It is not a one-way door —
+`saucewg set-protocol` changes it afterwards, and existing clients pick the new profile up
+when they re-download it.
 
 ### 2.3 `install-node` options
 
@@ -142,15 +144,18 @@ profile up when they re-download it.
 | `--psk KEY` / `--psk-stdin` | — | Optional pre-shared key. `--psk-stdin` reads it from stdin so it never appears in `ps` |
 | `--endpoint-host HOST` | detected | IPv4 address the entry node should dial |
 | `--endpoint-host6 HOST` | detected | IPv6 address the entry node should dial. Both are detected and reported; an IPv6-only server reports only this one |
-| `--protocol V` | `2.0` | AmneziaWG generation this uplink speaks — `1.0` (alias `legacy`), `1.5` or `2.0` |
-| `--signature NAME` | `quic` | The `I1` disguise on 1.5 and 2.0 |
+| `--protocol V` | `3.1` | AmneziaWG generation this uplink speaks — `1.0` (alias `legacy`), `1.5`, `2.0`, `3.0` or `3.1` |
+| `--signature NAME` | `quic` | The `I1` disguise on 1.5 and newer |
 | `--no-start` | — | Configure without starting |
 | `--reinstall` | — | Overwrite an existing installation |
 
 An uplink's generation is independent of what the entry node serves its clients: the two
-ends of the uplink have to agree with each other, and nothing else. Both ends are
-configured from the object below, so agreeing is automatic — but a node whose `--protocol`
-was set by hand on one end only will come up and never handshake.
+ends of the uplink have to agree with each other, and nothing else. Both ends run this
+image, which is why a new exit node speaks the newest generation while clients stay on
+2.0. Both ends are configured from the object below, so agreeing is automatic — but a node
+whose `--protocol` was set by hand on one end only will come up and never handshake. An
+entry node that has not been updated yet cannot build a 3.x uplink; `add-node` refuses
+one there and says to run `saucewg update` first.
 
 On success it prints the object the entry node needs:
 
@@ -161,15 +166,19 @@ On success it prints the object the entry node needs:
   "endpoint6": "[2001:db8::20]:51820",
   "public_key": "kQ3…=",
   "port": 51820,
-  "protocol": "2.0",
-  "s1": 96, "s2": 40, "s3": 31, "s4": 12,
+  "protocol": "3.1",
+  "s1": 96, "s2": 40, "s3": 31, "s4": 17,
   "h1": 1191142, "h2": 1298237, "h3": 1758452, "h4": 1854913,
-  "i1": "<b 0xc30000000108><r 8><b 0x08><r 8><b 0x0045dc><t><r 16>"
+  "i1": "<b 0xc30000000108><r 8><b 0x08><r 8><b 0x0045dc><t><r 16>",
+  "header_protection_key": "x9Qe…=",
+  "random_trailers": "on"
 }
 ```
 
 `s3`, `s4` and `i1` are absent on a 1.0 node and `s3`/`s4` on a 1.5 one, since carrying
-a parameter is what defines the generation. `endpoint6` is absent on a server with no
+a parameter is what defines the generation; `header_protection_key` appears from 3.0 on and
+`random_trailers` on 3.1. Only the parameters both ends must share are in it — the 3.x
+timers, content padding and `DisableCookies` are each end's own. `endpoint6` is absent on a server with no
 IPv6 and `endpoint` on one with no IPv4, so each object names exactly the addresses
 that server can actually be dialled at. `subnet6` appears when the node was installed
 with one. Pass the whole object to `add-node` rather than picking fields out of it and
@@ -193,7 +202,7 @@ release:
 | `NO_COLOR` | — | Any value disables ANSI colour |
 
 ```bash
-SAUCEWG_TAG=1.5.1 bash /tmp/saucewg.sh --json --yes install --domain panel.example.com
+SAUCEWG_TAG=1.6.0 bash /tmp/saucewg.sh --json --yes install --domain panel.example.com
 ```
 
 `--dir` also means several deployments can share one server for testing; each is a
@@ -215,7 +224,8 @@ surface, available on both roles:
 | `saucewg logs [-f] [-n N] [service]` | Container logs; services are `awg`, `panel`, `postgres`, `caddy` |
 | `saucewg shell [service]` | A shell inside a container — `panel` by default on an entry node, `awg` on an exit node |
 | `saucewg edit` | Open `.env` in `$EDITOR` and offer to restart |
-| `saucewg update [--tag T]` | Pull newer images, regenerate the compose file, restart |
+| `saucewg update [--tag T] [--no-nodes]` | Pull newer images, regenerate the compose file, restart — and on an entry node, upgrade the exit nodes after it (§3.1) |
+| `saucewg upgrade-nodes [NAME…] [--protocol V \| --keep-protocol]` | *(entry node)* Bring the exit nodes to this release, one at a time — see §3.1 |
 | `saucewg uninstall [--purge]` | Remove containers and volumes; `--purge` also deletes the directory and the CLI |
 | `saucewg info` | Machine-readable status — always JSON, whatever the flags |
 | `saucewg routes` | *(entry node)* Destinations that bypass the cascade — see §4.5 |
@@ -242,11 +252,68 @@ with `SAUCEWG_REF` is asking for that ref. If the mirror cannot be reached, or s
 something that is not this script, the update carries on with the CLI already installed
 rather than stopping.
 
+### 3.1 Updating the exit nodes with the entry node
+
+On an entry node, `saucewg update` goes on to the exit nodes once the new panel answers:
+every node the panel installed is brought to the same release, one at a time, and then
+moved to `NODE_UPGRADE_PROTOCOL` (3.1) unless an operator put it on another generation.
+The order is chosen so clients keep the cascade throughout — standbys first, the least
+preferred first, and the node carrying traffic last, after traffic has been moved onto an
+upgraded one. Each node has to handshake again *after* it was replaced before the next is
+touched.
+
+| What happens to a node | Result | What follows |
+| --- | --- | --- |
+| Already on this release and generation | `current` | nothing |
+| Upgraded and back up | `upgraded` | the next node |
+| Worked before, does not after | `failed` | the walk stops; the nodes after it are `skipped` and keep their release |
+| Does not come up on the new generation | `failed` | put back on the one it had and **kept** there; no other node is moved to it |
+| Does not answer SSH | `unreachable` | retried by the panel every `NODE_AUTO_UPGRADE_RETRY_SECONDS` |
+| Added by hand, or the panel holds no key | `skipped` | run `saucewg update` on that server |
+
+```bash
+saucewg update                       # the entry node, then the exit nodes
+saucewg update --no-nodes            # the entry node alone
+saucewg upgrade-nodes                # the exit nodes alone
+saucewg upgrade-nodes eu-nl eu-de    # only these
+saucewg upgrade-nodes --keep-protocol    # the release only
+saucewg upgrade-nodes --protocol 3.0     # a different generation this time
+saucewg --json upgrade-nodes         # the report below
+```
+
+```json
+{
+  "ok": true, "running": false, "origin": "cli", "release": "1.6.0", "protocol": "3.1",
+  "started_at": "2026-11-09T10:00:00+00:00", "finished_at": "2026-11-09T10:04:12+00:00",
+  "current": null, "halted": null, "error": null,
+  "nodes": [
+    {"name": "eu-de", "status": "upgraded", "detail": "",
+     "version_before": "1.5.1", "version_after": "1.6.0",
+     "protocol_before": "2.0", "protocol_after": "3.1", "healthy": true, "pending": false}
+  ]
+}
+```
+
+`update --json` carries the same report under `nodes`. The command exits non-zero when
+the walk stopped, failed to start, or a node failed; a node that did not answer is
+`pending` rather than a failure. The walk runs inside the panel container, which holds the
+SSH key, so it is the same one the panel runs by itself a couple of minutes after it
+starts (`NODE_AUTO_UPGRADE_DELAY_SECONDS`) and from **Upgrade exit nodes** on the Exit
+nodes page; only one runs at a time. `NODE_AUTO_UPGRADE=false` turns all of that off —
+including the step in `update` — and leaves the nodes for `upgrade-nodes`.
+
+An exit node is upgraded with its own `saucewg update`, run over SSH, so it fetches the
+script and images from the same mirror and registry as the entry node
+(`SAUCEWG_RAW_BASE`, `SAUCEWG_REGISTRY`).
+
+> The `saucewg` already on a 1.5.x server does not know `--no-nodes`. To update an entry
+> node alone from there, set `NODE_AUTO_UPGRADE=false` in `.env` first.
+
 `saucewg info` is the health endpoint for a monitoring system:
 
 ```json
 {
-  "cli_version": "1.5.1",
+  "cli_version": "1.6.0",
   "role": "entry",
   "dir": "/opt/saucewg",
   "endpoint": "203.0.113.7:443",
@@ -360,17 +427,27 @@ one, because both ends have to change together:
 
 ```bash
 # On the exit server — reconfigures it and prints its new pairing object
-saucewg --json set-protocol 2.0
+saucewg update                       # 3.x needs this release's image on both servers
+saucewg --json set-protocol 3.1
 
-# On the entry server — paste that object; it already carries the new parameters
-saucewg update-node --json '{"name":"eu-fr","protocol":"2.0","s3":31,"s4":12,"i1":"…"}'
+# On the entry server — paste the whole object; it already carries the new parameters
+saucewg update-node --json '{"name":"eu-fr","protocol":"3.1","s3":31,"s4":17,"header_protection_key":"…","random_trailers":"on","i1":"…"}'
 ```
 
 `set-protocol` keeps the padding and headers the two ends already agreed on, so the
-uplink is not rekeyed — only the parameters the new generation adds or drops move.
-Individual flags (`--protocol`, `--s3`, `--i1`, `--priority`, `--endpoint`) work too when
-you only need one of them. On a `managed` node, `POST /api/nodes/{name}/protocol` does
-both halves in one call instead.
+uplink is not rekeyed — only the parameters the new generation adds or drops move. Moving
+onto 3.x is the exception for padding: an `S1`–`S4` shorter than the 12 bytes header
+protection needs is replaced, which is why the whole object is pasted rather than only
+the new keys. Individual flags (`--protocol`, `--s3`, `--i1`, `--priority`, `--endpoint`)
+work too when you only need one of them. `add-node` and `update-node` refuse a
+generation this entry node's image cannot build an uplink on, and say to run
+`saucewg update` first.
+
+A generation picked by hand is kept: `update-node --protocol` (or a pasted object) on
+anything but 3.1 marks the node, and [upgrading the exit nodes](#31-updating-the-exit-nodes-with-the-entry-node)
+then leaves it on that generation. Moving it back to 3.1 lifts the mark. On a `managed`
+node, `POST /api/nodes/{name}/protocol` does both halves in one call instead, and marks
+it the same way.
 
 ### 4.4 What actually happens underneath
 
@@ -982,8 +1059,8 @@ POST /api/nodes
 | `address6` | allocated | The same on the IPv6 half of the bridge. `"none"` keeps this node off it while the rest of the cascade uses it |
 | `family` | `auto` | Which endpoint family to dial this node over once it reports both: `auto`, `4`, `6` |
 | `preshared_key` | — | Extra symmetric key on this uplink |
-| `protocol` | `2.0` | AmneziaWG generation for this uplink — `1.0` (alias `legacy`), `1.5` or `2.0` |
-| `signature` | `quic` | The `I1` disguise on 1.5 and 2.0 |
+| `protocol` | `3.1` | AmneziaWG generation for this uplink — `1.0` (alias `legacy`), `1.5`, `2.0`, `3.0` or `3.1`. Left out, the node gets the newest one this entry node's image speaks; one it does not speak is a `409` that says to run `saucewg update` here first. Anything but 3.1 is kept when the exit nodes are upgraded ([§3.1](#31-updating-the-exit-nodes-with-the-entry-node)) |
+| `signature` | `quic` | The `I1` disguise on 1.5 and newer |
 | `note` | — | Free text, carried through to `GET /api/nodes` |
 
 The response is `202 Accepted` with a **task**, because a cold install takes minutes:
@@ -1022,7 +1099,7 @@ cumulative, so a bot can edit one message in place with the tail of it. On succe
   "endpoint": "203.0.113.9:51820",
   "address": "10.77.0.4/32",
   "priority": 40,
-  "protocol": "2.0",
+  "protocol": "3.1",
   "uplink_public_key": "Lkug…=",
   "ssh_key": true,
   "healthy": true
@@ -1056,6 +1133,14 @@ mid-install.
 | `POST /api/nodes/{name}/protocol` | `{"protocol": "2.0", "signature": "quic"}` | `202` + task. Reconfigures both ends of the uplink |
 | `POST /api/nodes/{name}/activate` | — | Prefer this node |
 | `POST /api/nodes/auto` | — | Drop the preference |
+| `GET /api/nodes/fleet` | — | How upgrading the exit nodes stands: `release` and `protocol` they are taken to, `auto`, `running`, and `last` — the walk under way or the last one's report, including one `saucewg update` ran ([§3.1](#31-updating-the-exit-nodes-with-the-entry-node)) |
+| `POST /api/nodes/upgrade` | `{}`, `{"protocol": "3.0"}` or `{"keep_protocol": true}` | `202` + task. Upgrades every managed exit node one at a time, the one carrying traffic last; `409` while a walk is already running, from the panel or from `saucewg` |
+
+`GET /api/nodes` also says, per node, whether `protocol_pinned` — the generation was
+chosen by hand and an upgrade leaves it there — and lists in `protocols` the generations
+this entry node's own image can build an uplink on. Every call above that changes a node
+answers `409` while the exit nodes are being upgraded; `activate` and `auto` stay open, and
+the walk leaves a choice made during it in place.
 
 `PUT` and `POST …/protocol` both change a generation, and the difference matters. `PUT`
 edits the entry node's side of the uplink only — use it when the exit node was already
@@ -1117,13 +1202,13 @@ none of them need credentials once it carries the panel's key.
 | `POST /api/nodes/{name}/restart` | `{}` | `202` + task. Recreates its containers and waits for the uplink to come back |
 | `POST /api/nodes/{name}/stop` | `{}` | `202` + task. The cascade fails over to the next healthy node |
 | `POST /api/nodes/{name}/start` | `{}` | `202` + task |
-| `POST /api/nodes/{name}/upgrade` | `{}` or `{"tag": "1.5.1"}` | `202` + task. Pulls newer images and recreates. Minutes, like an install |
+| `POST /api/nodes/{name}/upgrade` | `{}` or `{"tag": "1.6.0"}` | `202` + task. Pulls newer images and recreates. Minutes, like an install |
 | `POST /api/nodes/{name}/recover` | — | `202` + task. Restart, then re-pair if that was not enough — the escalation of §4.9, run now |
 
 ```json
 {
   "name": "eu-fr", "reachable": true, "error": null, "ssh_host": "203.0.113.9",
-  "role": "exit", "cli_version": "1.5.1", "dir": "/opt/saucewg",
+  "role": "exit", "cli_version": "1.6.0", "dir": "/opt/saucewg",
   "os": "Debian GNU/Linux 12 (bookworm)", "kernel": "Linux 6.1.0-18-amd64",
   "arch": "x86_64", "cpus": 2, "memory_mb": 1966, "disk_free_mb": 17980,
   "uptime_seconds": 934221, "docker": true, "saucewg": true,

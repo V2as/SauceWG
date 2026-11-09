@@ -15,27 +15,49 @@ const PARAM_ORDER = [
   'S1', 'S2', 'S3', 'S4',
   'H1', 'H2', 'H3', 'H4',
   'I1', 'I2', 'I3', 'I4', 'I5',
+  'HEADER_PROTECTION_KEY', 'CONTENT_PADDING_ADDITION',
+  'REKEY_AFTER_TIME', 'REKEY_TIMEOUT', 'REJECT_AFTER_TIME',
+  'KEEPALIVE_TIMEOUT', 'MAX_HANDSHAKE_ATTEMPTS',
+  'RANDOM_TRAILERS', 'DISABLE_COOKIES',
 ]
 
-const LABELS: Record<string, string> = { JC: 'Jc', JMIN: 'Jmin', JMAX: 'Jmax' }
+// How a .conf spells them.
+const LABELS: Record<string, string> = {
+  JC: 'Jc',
+  JMIN: 'Jmin',
+  JMAX: 'Jmax',
+  HEADER_PROTECTION_KEY: 'HeaderProtectionKey',
+  CONTENT_PADDING_ADDITION: 'ContentPaddingAddition',
+  REKEY_AFTER_TIME: 'RekeyAfterTime',
+  REKEY_TIMEOUT: 'RekeyTimeout',
+  REJECT_AFTER_TIME: 'RejectAfterTime',
+  KEEPALIVE_TIMEOUT: 'KeepaliveTimeout',
+  MAX_HANDSHAKE_ATTEMPTS: 'MaxHandshakeAttempts',
+  RANDOM_TRAILERS: 'RandomTrailers',
+  DISABLE_COOKIES: 'DisableCookies',
+}
 
 // What a client needs in order to load a profile of this generation at all.
 const REQUIREMENTS: Record<string, string> = {
   '1.0': 'Loads on any KeeneticOS from 4.2 Alpha 2 on, and on every AmneziaVPN build.',
   '1.5': 'Needs KeeneticOS 5.1 Alpha 3 or newer on a router, or AmneziaVPN 4.8.12.9 or newer.',
   '2.0': 'Needs KeeneticOS 5.1 Alpha 3 or newer on a router, or AmneziaVPN 4.8.12.9 or newer.',
+  '3.0': 'Needs AmneziaVPN 5.0.0.5 or newer, or KeeneticOS 5.2 Alpha 11 on a router; a stable KeeneticOS stops at 2.0.',
+  '3.1': 'Needs AmneziaVPN 5.0.1.5 or newer, or KeeneticOS 5.2 Alpha 11 on a router; a stable KeeneticOS stops at 2.0.',
 }
 
 const presentParams = computed(() =>
   PARAM_ORDER.filter((key) => settings.value?.obfuscation[key])
 )
 
-// The AmneziaVPN app does not pass non-zero S3/S4 to its own backend, so it never strips
-// the padding this node adds: the handshake completes and no traffic flows. Routers using
-// the kernel module are unaffected, so this is a warning rather than a misconfiguration.
+// The AmneziaVPN 4.x app does not pass non-zero S3/S4 to its own backend, so it never
+// strips the padding this node adds: the handshake completes and no traffic flows.
+// Routers using the kernel module are unaffected, so this is a warning rather than a
+// misconfiguration. 3.x needs the padding for header protection, and every app release
+// that loads a 3.x profile honours it.
 const appPaddingWarning = computed(() => {
   const obf = settings.value?.obfuscation
-  if (!obf) return false
+  if (!obf || obf.HEADER_PROTECTION_KEY) return false
   return ['S3', 'S4'].some((key) => Number(obf[key] ?? 0) > 0)
 })
 
@@ -123,7 +145,8 @@ onMounted(load)
       <p style="color: var(--text-dim); font-size: 12px; margin-bottom: 6px">
         Which parameters are present is what makes this a {{ settings.protocol }} profile.
         S1–S4 and H1–H4 must match on both sides of the tunnel, so they are copied verbatim into
-        every client config. Jc/Jmin/Jmax and I1–I5 only affect the sending side.
+        every client config — and on 3.x so are HeaderProtectionKey and RandomTrailers.
+        Jc/Jmin/Jmax, I1–I5 and the 3.x timers only affect the sending side.
       </p>
       <p style="color: var(--text-dim); font-size: 12px; margin-bottom: 0">
         {{ REQUIREMENTS[settings.protocol] }}

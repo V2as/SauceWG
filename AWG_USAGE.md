@@ -1233,7 +1233,7 @@ Host metrics, client totals, live throughput, and the cascade summary:
 
 ```json
 {
-  "panel_title": "SauceWG", "version": "1.5.1",
+  "panel_title": "SauceWG", "version": "1.6.0",
   "cpu_percent": 3.4, "cpu_cores": 2,
   "mem_total": 2084986880, "mem_used": 903168000,
   "disk_total": 41660260352, "disk_used": 9331159040,

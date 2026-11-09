@@ -418,7 +418,7 @@ uplinks_source_json() {
             local args=() suffix name
             for suffix in $AWG_OBF_SUFFIXES; do
                 name="CASCADE_${suffix}"
-                args+=(--arg "$(printf '%s' "$suffix" | tr '[:upper:]' '[:lower:]')" "${!name:-}")
+                args+=(--arg "obf_$(printf '%s' "$suffix" | tr '[:upper:]' '[:lower:]')" "${!name:-}")
             done
             jq -n \
                 --arg name "${CASCADE_NAME:-exit-1}" \
@@ -433,11 +433,9 @@ uplinks_source_json() {
                 "${args[@]}" \
                 '[{name: $name, endpoint: $endpoint, endpoint6: $endpoint6, family: $family,
                    public_key: $key, preshared_key: $psk,
-                   address: $address, address6: $address6, priority: 10, protocol: $protocol,
-                   jc: $jc, jmin: $jmin, jmax: $jmax,
-                   s1: $s1, s2: $s2, s3: $s3, s4: $s4,
-                   h1: $h1, h2: $h2, h3: $h3, h4: $h4,
-                   i1: $i1, i2: $i2, i3: $i3, i4: $i4, i5: $i5}]'
+                   address: $address, address6: $address6, priority: 10, protocol: $protocol}
+                  + ($ARGS.named | with_entries(select(.key | startswith("obf_"))
+                                                | .key |= ltrimstr("obf_")))]'
             ;;
         *) printf '[]' ;;
     esac
@@ -649,13 +647,17 @@ uplinks_parse() {
         ] | join("\u001f")')
 
     # Obfuscation arrives as its own stream of (slot, parameter, value) triples so
-    # that adding a parameter to AWG_OBF_SUFFIXES needs no new column here.
+    # that adding a parameter to AWG_OBF_SUFFIXES needs no new column here. A JSON
+    # boolean — the natural way to write RandomTrailers — becomes the on/off the
+    # tools read, so `true` and `"on"` are one value to the signature as well.
     local slot value
     while IFS=$'\x1f' read -r slot suffix value; do
         [ -n "$slot" ] || continue
         UP_OBF[$slot,$suffix]=$value
     done < <(printf '%s' "$json" | jq -r --arg suffixes "$AWG_OBF_SUFFIXES" '
-        def s: if . == null then "" else tostring end;
+        def s: if . == null then ""
+               elif type == "boolean" then (if . then "on" else "off" end)
+               else tostring end;
         ($suffixes | split(" ")) as $obf
         | to_entries[]
         | .key as $slot
@@ -2225,11 +2227,15 @@ uplinks_write_state() {
         --arg probe_target6 "$([ -n "${CASCADE_UPLINK_SUBNET6:-}" ] && printf '%s' "$CASCADE_PROBE_TARGET6")" \
         --argjson handshake_timeout "$CASCADE_HANDSHAKE_TIMEOUT" \
         --argjson failover_seconds "$CASCADE_FAILOVER_SECONDS" \
+        --arg generations "${AWG_GENERATIONS:-1.0 1.5 2.0}" \
         --argjson now "$(date -u +%s)" '
         ($handshake_timeout + $failover_seconds) as $dead_after
         | {
             updated_at: $now,
             reload_id: $reload,
+            # Which AmneziaWG generations this container can build an uplink for, so
+            # the panel does not move an exit node to one its own end cannot speak.
+            generations: ($generations | split(" ") | map(select(. != ""))),
             source: $source,
             config_error: (if $error == "" then null else $error end),
             mode: $mode,

@@ -26,6 +26,10 @@ MANUAL = "manual"
 FALLBACK_DIRECT = "direct"
 FALLBACK_BLOCK = "block"
 
+#: What a node container that does not say which generations it speaks is built on:
+#: amneziawg-go 0.2, which stops at 2.0.
+LEGACY_GENERATIONS: tuple[str, ...] = ("1.0", "1.5", "2.0")
+
 #: Nodes already reported as stalled, so that a state read on every request does not
 #: write the same warning to the log several times a second.
 _stalled: set[str] = set()
@@ -173,6 +177,8 @@ class UplinkState:
     failover_seconds: int = 0
     #: Which families the link to the exit nodes carries, and how they are dialled.
     bridge: BridgeState = field(default_factory=BridgeState)
+    #: The AmneziaWG generations the node container can build an uplink for.
+    generations: tuple[str, ...] = LEGACY_GENERATIONS
     nodes: list[ExitNodeState] = field(default_factory=list)
 
     @property
@@ -222,6 +228,13 @@ def _timestamp(value: object) -> datetime | None:
     if not isinstance(value, (int, float)) or value <= 0:
         return None
     return datetime.fromtimestamp(value, tz=timezone.utc)
+
+
+def _generations(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return LEGACY_GENERATIONS
+    named = tuple(str(item) for item in value if item)
+    return named or LEGACY_GENERATIONS
 
 
 def _seconds(value: object, fallback: int) -> int:
@@ -340,6 +353,7 @@ def load_uplink_state() -> UplinkState:
             raw.get("failover_seconds"), settings.cascade_failover_seconds
         ),
         bridge=_bridge(raw.get("bridge")),
+        generations=_generations(raw.get("generations")),
         nodes=nodes,
     )
 
@@ -399,3 +413,21 @@ def write_control(mode: str, node: str | None = None) -> None:
     except OSError:
         os.unlink(handle.name)
         raise
+
+
+def read_control() -> tuple[str, str | None] | None:
+    """The failover choice last written, as ``(mode, node)``; None if there is none.
+
+    Read from the request rather than from the published state, which only catches
+    up on the container's next health tick.
+    """
+    try:
+        with open(settings.uplink_control_file, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("mode") == MANUAL and isinstance(payload.get("node"), str):
+        return MANUAL, payload["node"]
+    return AUTO, None

@@ -62,6 +62,18 @@ jobs:
           AWG_ENDPOINT_HOST: 127.0.0.1
         run: python -m app.cli recover | jq -e 'length == 0'
 
+      # `saucewg update` runs this the moment the new panel answers. With no exit
+      # nodes there is nothing to walk, and that is an answer rather than a failure.
+      - name: The panel CLI can be asked to upgrade the exit nodes
+        working-directory: backend
+        env:
+          JWT_SECRET: ci
+          ADMIN_PASSWORD: ci-password
+          POSTGRES_PASSWORD: ci
+          AWG_ENDPOINT_HOST: 127.0.0.1
+          AWG_SOCKET_DIR: /tmp/saucewg-run
+        run: python -m app.cli upgrade-nodes | jq -e '.ok and (.nodes | length) == 0'
+
   # The bypass relay decides whether a destination the network drops is reachable,
   # and it decides it with concurrency: several handshakes outstanding, the first
   # answer kept, the rest closed. None of that can be seen from the outside — a
@@ -171,7 +183,11 @@ jobs:
       # both the .env writer and compose's own interpolation.
       - name: The installer writes a loadable profile for every generation
         run: |
-          for version in 1.0 1.5 2.0; do
+          v2='["AWG_I1","AWG_S3","AWG_S4"]'
+          v3='["AWG_HEADER_PROTECTION_KEY","AWG_REKEY_AFTER_TIME","AWG_REKEY_TIMEOUT",
+               "AWG_REJECT_AFTER_TIME","AWG_KEEPALIVE_TIMEOUT","AWG_MAX_HANDSHAKE_ATTEMPTS"]'
+          v31='["AWG_RANDOM_TRAILERS","AWG_DISABLE_COOKIES"]'
+          for version in 1.0 1.5 2.0 3.0 3.1; do
             sudo rm -rf /tmp/gen
             sudo bash saucewg.sh --dir /tmp/gen --yes install-node \
               --name ci-gen --endpoint-host 127.0.0.1 --protocol "$version" --no-start
@@ -180,16 +196,25 @@ jobs:
             resolved=$(sudo docker compose --project-directory /tmp/gen \
               -f /tmp/gen/docker-compose.yml --env-file /tmp/gen/.env config --format json \
               | jq -r '.services.awg.environment')
-            for param in $(jq -rn --arg v "$version" '
-                  {"1.0": [], "1.5": ["AWG_I1"], "2.0": ["AWG_I1","AWG_S3","AWG_S4"]}[$v][]'); do
+            for param in $(jq -rn --arg v "$version" --argjson v2 "$v2" --argjson v3 "$v3" --argjson v31 "$v31" '
+                  {"1.0": [], "1.5": ["AWG_I1"], "2.0": $v2, "3.0": ($v2 + $v3),
+                   "3.1": ($v2 + $v3 + $v31)}[$v][]'); do
               printf '%s' "$resolved" | jq -e --arg p "$param" '(.[$p] // "") != ""' >/dev/null \
                 || { echo "::error::$version is missing $param"; exit 1; }
             done
-            for param in $(jq -rn --arg v "$version" '
-                  {"1.0": ["AWG_I1","AWG_S3","AWG_S4"], "1.5": ["AWG_S3","AWG_S4"], "2.0": []}[$v][]'); do
+            for param in $(jq -rn --arg v "$version" --argjson v2 "$v2" --argjson v3 "$v3" --argjson v31 "$v31" '
+                  {"1.0": ($v2 + $v3 + $v31), "1.5": (["AWG_S3","AWG_S4"] + $v3 + $v31),
+                   "2.0": ($v3 + $v31), "3.0": $v31, "3.1": []}[$v][]'); do
               printf '%s' "$resolved" | jq -e --arg p "$param" '(.[$p] // "") == ""' >/dev/null \
                 || { echo "::error::$version should not carry $param"; exit 1; }
             done
+            # amneziawg-go refuses header protection over a padding shorter than its
+            # nonce, and refuses the whole profile with it.
+            case $version in 3.*)
+              printf '%s' "$resolved" \
+                | jq -e '[.AWG_S1, .AWG_S2, .AWG_S3, .AWG_S4] | all(tonumber >= 12)' >/dev/null \
+                || { echo "::error::$version pads below the 12 bytes header protection needs"; exit 1; }
+            esac
             echo "AmneziaWG $version reaches the container intact"
           done
 
@@ -209,6 +234,18 @@ jobs:
             || { echo "::error::moving back to 1.0 left S3 behind"; exit 1; }
           sudo grep -qx 'AWG_I1=' /tmp/gen/.env \
             || { echo "::error::moving back to 1.0 left a signature behind"; exit 1; }
+          sudo bash saucewg.sh --dir /tmp/gen --yes set-protocol 3.1 --no-restart
+          sudo grep -q '^AWG_HEADER_PROTECTION_KEY=.' /tmp/gen/.env \
+            || { echo "::error::moving to 3.1 did not add a header protection key"; exit 1; }
+          for param in S1 S2 S3 S4; do
+            value=$(sudo sed -n "s/^AWG_${param}=//p" /tmp/gen/.env)
+            [ "$value" -ge 12 ] || { echo "::error::moving to 3.1 left $param at $value"; exit 1; }
+          done
+          sudo bash saucewg.sh --dir /tmp/gen --yes set-protocol 2.0 --no-restart
+          sudo grep -qx 'AWG_HEADER_PROTECTION_KEY=' /tmp/gen/.env \
+            || { echo "::error::moving back to 2.0 left header protection behind"; exit 1; }
+          sudo grep -qx 'AWG_RANDOM_TRAILERS=' /tmp/gen/.env \
+            || { echo "::error::moving back to 2.0 left RandomTrailers behind"; exit 1; }
           echo "set-protocol moves a node cleanly in both directions"
 
       # An interface app clients dial has to pad by zero: the AmneziaVPN app drops non-zero
@@ -217,6 +254,14 @@ jobs:
       # padding, which is the hop a censor sees anyway.
       - name: Client-facing padding stays zero while node-to-node padding does not
         run: |
+          # Clients get the newest generation a stable KeeneticOS loads; the hop
+          # between two nodes runs this image at both ends and gets the newest one.
+          sudo grep -qx 'AWG_PROTOCOL=2.0' /tmp/entry/.env \
+            || { echo "::error::a new entry node does not serve clients 2.0"; exit 1; }
+          sudo grep -qx 'AWG_PROTOCOL=3.1' /tmp/exit/.env \
+            || { echo "::error::a new exit node does not speak 3.1"; exit 1; }
+          sudo grep -qx 'CASCADE_PROTOCOL_DEFAULT=3.1' /tmp/entry/.env \
+            || { echo "::error::the entry node does not expect its exit nodes on 3.1"; exit 1; }
           for param in S3 S4; do
             sudo grep -qx "AWG_${param}=0" /tmp/entry/.env \
               || { echo "::error::the entry node pads app clients with $param"; exit 1; }
@@ -233,6 +278,21 @@ jobs:
               || { echo "::error::set-protocol gave the entry node non-zero $param"; exit 1; }
           done
           echo "set-protocol keeps a client-facing interface padding by zero"
+
+          # 3.x has no zero to fall back on, since header protection needs every
+          # padding to hold its nonce — and on the way back down that padding is no
+          # reason to keep breaking the AmneziaVPN 4.x app.
+          sudo bash saucewg.sh --dir /tmp/entry --yes set-protocol 3.1 --no-restart
+          for param in S1 S2 S3 S4; do
+            value=$(sudo sed -n "s/^AWG_${param}=//p" /tmp/entry/.env)
+            [ "$value" -ge 12 ] || { echo "::error::3.1 left the entry node's $param at $value"; exit 1; }
+          done
+          sudo bash saucewg.sh --dir /tmp/entry --yes set-protocol 2.0 --no-restart
+          for param in S3 S4; do
+            sudo grep -qx "AWG_${param}=0" /tmp/entry/.env \
+              || { echo "::error::coming down from 3.1 left clients padded with $param"; exit 1; }
+          done
+          echo "a client-facing interface moves onto 3.1 and back to zero padding"
 
       # The cascade list is what the panel and the CLI both edit, so the CLI has to
       # keep producing entries the node container can actually parse.
@@ -528,10 +588,41 @@ jobs:
             || { echo "::error::the regenerated compose file does not pass the limit through"; exit 1; }
           echo "an update brings the speed limit in without turning it on"
 
+      # Exit nodes follow the entry node's release from 1.6.0 on, and the link to
+      # them moves to 3.1. An installation updated from before that has to come out
+      # with both written down and announced, and a choice to opt out has to stick —
+      # including an empty generation, which is how an operator keeps nodes put.
+      - name: Updating an older installation lets the panel upgrade its exit nodes
+        run: |
+          sudo sed -i '/^NODE_AUTO_UPGRADE=/d; /^NODE_UPGRADE_PROTOCOL=/d' /tmp/nobypass/.env
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/nobypass --yes update \
+            --no-restart 2>&1 | tee /tmp/fleet-update.log
+          sudo grep -qx 'NODE_AUTO_UPGRADE=true' /tmp/nobypass/.env \
+            || { echo "::error::update left the exit node upgrade unset"; exit 1; }
+          sudo grep -qx 'NODE_UPGRADE_PROTOCOL=3.1' /tmp/nobypass/.env \
+            || { echo "::error::update left the exit nodes' generation unset"; exit 1; }
+          grep -q 'exit nodes now follow' /tmp/fleet-update.log \
+            || { echo "::error::the change in behaviour was not announced"; exit 1; }
+          sudo docker compose --project-directory /tmp/nobypass \
+            -f /tmp/nobypass/docker-compose.yml --env-file /tmp/nobypass/.env config --format json \
+            | jq -e '.services.panel.environment
+                     | .NODE_AUTO_UPGRADE == "true" and .NODE_UPGRADE_PROTOCOL == "3.1"' >/dev/null \
+            || { echo "::error::the regenerated compose file does not pass the upgrade through"; exit 1; }
+
+          sudo sed -i 's/^NODE_UPGRADE_PROTOCOL=.*/NODE_UPGRADE_PROTOCOL=/' /tmp/nobypass/.env
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/nobypass --yes update --no-restart
+          sudo grep -qx 'NODE_UPGRADE_PROTOCOL=' /tmp/nobypass/.env \
+            || { echo "::error::update overwrote a deliberate choice"; exit 1; }
+          sudo docker compose --project-directory /tmp/nobypass \
+            -f /tmp/nobypass/docker-compose.yml --env-file /tmp/nobypass/.env config --format json \
+            | jq -e '.services.panel.environment.NODE_UPGRADE_PROTOCOL == ""' >/dev/null \
+            || { echo "::error::an empty generation did not reach the panel empty"; exit 1; }
+          echo "exit nodes follow an update, and an operator can keep them where they are"
+
       # Recovering an exit node happens inside the panel container, so the CLI's own
       # job is to reach it and to say so plainly when it cannot — a silent failure
       # here reads as "every node is fine".
-      - name: recover says when it cannot reach the panel
+      - name: recover and upgrade-nodes say when they cannot reach the panel
         run: |
           sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/entry --yes recover \
             > /tmp/recover.log 2>&1 \
@@ -539,6 +630,12 @@ jobs:
           grep -q 'did not answer' /tmp/recover.log \
             || { echo "::error::recover failed without saying why"; cat /tmp/recover.log; exit 1; }
           echo "recover reports an unreachable panel"
+          sudo env PATH=/tmp/shim:$PATH bash saucewg.sh --dir /tmp/entry --yes upgrade-nodes \
+            > /tmp/upgrade-nodes.log 2>&1 \
+            && { echo "::error::upgrade-nodes reported success without a panel"; exit 1; }
+          grep -q 'did not answer' /tmp/upgrade-nodes.log \
+            || { echo "::error::upgrade-nodes failed without saying why"; cat /tmp/upgrade-nodes.log; exit 1; }
+          echo "upgrade-nodes reports an unreachable panel"
 
       # `saucewg update` run as the installed command reads the file it would have to
       # overwrite, so it cannot deliver a newer CLI by copying — and the compose file and

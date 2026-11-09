@@ -17,7 +17,7 @@
 # makes the script safe to drive from a bot or a provisioning service.
 set -euo pipefail
 
-SAUCEWG_VERSION="1.5.1"
+SAUCEWG_VERSION="1.6.0"
 
 SAUCEWG_REPO="${SAUCEWG_REPO:-V2as/SauceWG}"
 SAUCEWG_REF="${SAUCEWG_REF:-main}"
@@ -32,6 +32,8 @@ REGISTRY="${SAUCEWG_REGISTRY:-docker.io}"
 NAMESPACE="${SAUCEWG_NAMESPACE:-v2as}"
 IMAGE_PREFIX="${SAUCEWG_IMAGE_PREFIX:-saucewg-}"
 IMAGE_TAG="${SAUCEWG_TAG:-latest}"
+# Whether this run named the image source itself, rather than taking the defaults.
+IMAGE_SOURCE_GIVEN="${SAUCEWG_REGISTRY:+registry }${SAUCEWG_NAMESPACE:+namespace }${SAUCEWG_IMAGE_PREFIX:+prefix }"
 
 ENV_FILE="${APP_DIR}/.env"
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
@@ -199,6 +201,27 @@ env_get() {
     sed -n "s/^${key}=//p" "$file" | tail -n1
 }
 
+# The image source this installation was set up with, for whatever this run did not
+# name itself. `update` rewrites every image reference, and doing that from the
+# built-in defaults would quietly move a server installed from a mirror back onto
+# Docker Hub.
+load_saved_image_source() {
+    local saved
+    case " $IMAGE_SOURCE_GIVEN " in *" registry "*) ;; *)
+        saved=$(env_get "$ENV_FILE" SAUCEWG_REGISTRY || true)
+        [ -z "$saved" ] || REGISTRY=$saved ;;
+    esac
+    case " $IMAGE_SOURCE_GIVEN " in *" namespace "*) ;; *)
+        saved=$(env_get "$ENV_FILE" SAUCEWG_NAMESPACE || true)
+        [ -z "$saved" ] || NAMESPACE=$saved ;;
+    esac
+    case " $IMAGE_SOURCE_GIVEN " in *" prefix "*) ;; *)
+        saved=$(env_get "$ENV_FILE" SAUCEWG_IMAGE_PREFIX || true)
+        [ -z "$saved" ] || IMAGE_PREFIX=$saved ;;
+    esac
+    return 0
+}
+
 image_ref() {
     local component=$1
     local base="${NAMESPACE}/${IMAGE_PREFIX}${component}:${IMAGE_TAG}"
@@ -220,21 +243,48 @@ image_ref() {
 #   1.0   Jc Jmin Jmax S1 S2 H1-H4          every KeeneticOS from 4.2 Alpha 2 on
 #   1.5   the same, plus I1                 KeeneticOS 5.1 Alpha 3 and newer
 #   2.0   the same, plus I1, S3 and S4      KeeneticOS 5.1 Alpha 3 and newer
+#   3.0   2.0 plus HeaderProtectionKey,     AmneziaVPN 5.0.0.5, KeeneticOS 5.2 Alpha 11
+#         ContentPaddingAddition and the
+#         five randomised timings
+#   3.1   3.0 plus RandomTrailers and       AmneziaVPN 5.0.1.5, KeeneticOS 5.2 Alpha 11
+#         DisableCookies
 #
-# AWG 3.0 is deliberately absent: no router firmware speaks it, so a 3.0 profile
-# cannot be loaded into a Keenetic at all.
+# The node image runs amneziawg-go v3, which speaks all five, so an interface can be
+# moved up without touching the binary. App clients default to 2.0 — the newest a
+# router on a stable KeeneticOS loads — and the hop between two nodes to 3.1, since
+# that one runs this image at both ends.
 #
 # S1-S4 pad the four WireGuard message types and H1-H4 replace their type headers,
-# so both ends must agree on them — which is why they travel in the exit node list.
-# Jc/Jmin/Jmax (junk packets) and I1-I5 (signature packets) are built by the sender
-# alone, so each end is free to use its own.
+# so both ends must agree on them — which is why they travel in the exit node list,
+# with the header protection key and RandomTrailers under 3.x. Jc/Jmin/Jmax (junk
+# packets), I1-I5 (signature packets), content padding, the timings and
+# DisableCookies are acted on by the sender alone, so each end is free to use its own.
 #
 # This mirrors docker/awg/lib.sh and backend/app/awg/protocol.py; the three have to
 # agree, and CI checks that they do.
 
-AWG_PROTOCOLS="1.0 1.5 2.0"
-AWG_PROTOCOL_LATEST="2.0"
-AWG_OBF_PARAMS="JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5"
+AWG_PROTOCOLS="1.0 1.5 2.0 3.0 3.1"
+AWG_PROTOCOL_LATEST="3.1"
+AWG_PROTOCOL_CLIENTS="2.0"
+AWG_PROTOCOL_NODES="3.1"
+AWG_OBF_PARAMS="JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5 HEADER_PROTECTION_KEY CONTENT_PADDING_ADDITION REKEY_AFTER_TIME REKEY_TIMEOUT REJECT_AFTER_TIME KEEPALIVE_TIMEOUT MAX_HANDSHAKE_ATTEMPTS RANDOM_TRAILERS DISABLE_COOKIES"
+# The ones both ends of a tunnel must agree on, and so the ones a pairing object carries.
+AWG_SHARED_PARAMS="S1 S2 S3 S4 H1 H2 H3 H4 HEADER_PROTECTION_KEY RANDOM_TRAILERS"
+# Header protection takes its nonce out of every padding, so under it amneziawg-go
+# refuses any of S1-S4 below this.
+AWG_HEADER_PROTECTION_MIN_PADDING=12
+# The 3.x timings AmneziaVPN's own server uses. Each is a range the sender draws from.
+AWG_TIMINGS="REKEY_AFTER_TIME REKEY_TIMEOUT REJECT_AFTER_TIME KEEPALIVE_TIMEOUT MAX_HANDSHAKE_ATTEMPTS"
+awg_timing_default() {
+    case $1 in
+        REKEY_AFTER_TIME)       printf '100-120' ;;
+        REKEY_TIMEOUT)          printf '3-7' ;;
+        REJECT_AFTER_TIME)      printf '150-180' ;;
+        KEEPALIVE_TIMEOUT)      printf '5-15' ;;
+        MAX_HANDSHAKE_ATTEMPTS) printf '15-20' ;;
+        *) return 1 ;;
+    esac
+}
 
 # Canonical name of a generation, or non-zero for anything unrecognised.
 awg_protocol() {
@@ -244,6 +294,8 @@ awg_protocol() {
         ''|legacy|awg-legacy|awglegacy|1|1.0) printf '1.0' ;;
         1.5)                                  printf '1.5' ;;
         2|2.0)                                printf '2.0' ;;
+        3|3.0)                                printf '3.0' ;;
+        3.1)                                  printf '3.1' ;;
         *) return 1 ;;
     esac
 }
@@ -255,6 +307,25 @@ awg_protocol_params() {
         1.0) printf 'JC JMIN JMAX S1 S2 H1 H2 H3 H4' ;;
         1.5) printf 'JC JMIN JMAX S1 S2 H1 H2 H3 H4 I1' ;;
         2.0) printf 'JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1' ;;
+        3.0) printf 'JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1 HEADER_PROTECTION_KEY CONTENT_PADDING_ADDITION REKEY_AFTER_TIME REKEY_TIMEOUT REJECT_AFTER_TIME KEEPALIVE_TIMEOUT MAX_HANDSHAKE_ATTEMPTS' ;;
+        3.1) printf 'JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1 HEADER_PROTECTION_KEY CONTENT_PADDING_ADDITION REKEY_AFTER_TIME REKEY_TIMEOUT REJECT_AFTER_TIME KEEPALIVE_TIMEOUT MAX_HANDSHAKE_ATTEMPTS RANDOM_TRAILERS DISABLE_COOKIES' ;;
+    esac
+}
+
+# The .conf spelling of a parameter, for messages an operator reads.
+awg_param_label() {
+    case $1 in
+        JC) printf 'Jc' ;; JMIN) printf 'Jmin' ;; JMAX) printf 'Jmax' ;;
+        HEADER_PROTECTION_KEY)    printf 'HeaderProtectionKey' ;;
+        CONTENT_PADDING_ADDITION) printf 'ContentPaddingAddition' ;;
+        REKEY_AFTER_TIME)         printf 'RekeyAfterTime' ;;
+        REKEY_TIMEOUT)            printf 'RekeyTimeout' ;;
+        REJECT_AFTER_TIME)        printf 'RejectAfterTime' ;;
+        KEEPALIVE_TIMEOUT)        printf 'KeepaliveTimeout' ;;
+        MAX_HANDSHAKE_ATTEMPTS)   printf 'MaxHandshakeAttempts' ;;
+        RANDOM_TRAILERS)          printf 'RandomTrailers' ;;
+        DISABLE_COOKIES)          printf 'DisableCookies' ;;
+        *) printf '%s' "$1" ;;
     esac
 }
 
@@ -270,6 +341,51 @@ require_protocol() {
     resolved=$(awg_protocol "${1:-}") \
         || die "AmneziaWG ${1} is not a generation SauceWG can serve (one of: ${AWG_PROTOCOLS})"
     printf '%s' "$resolved"
+}
+
+awg_param_shared() {
+    case " $AWG_SHARED_PARAMS " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# 32 random bytes in base64: a header protection key. A cipher key rather than a
+# Curve25519 one, so it needs no clamping — and no awg binary on the host.
+awg_random_key() { head -c 32 /dev/urandom | base64 | tr -d '\n'; }
+
+# A switch in the one spelling amneziawg-tools reads.
+awg_switch() {
+    case $(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]') in
+        on|true|yes|1)  printf 'on' ;;
+        off|false|no|0) printf 'off' ;;
+        *) return 1 ;;
+    esac
+}
+
+# The generations the node image a .env names can run. Read from the image rather
+# than assumed, because an exit node can be told to move up before it has pulled the
+# release that speaks the new generation — and the container would then refuse to
+# start at all. An image from before 3.x carries no list and speaks what 1.5 did.
+image_protocols() {
+    local image list
+    image=$(env_get "$ENV_FILE" IMAGE_AWG 2>/dev/null || true)
+    [ -n "$image" ] || image=$(image_ref awg)
+    list=$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" 2>/dev/null \
+        | sed -n 's/^AWG_GENERATIONS=//p' | head -n1) || true
+    if [ -z "$list" ] && ! docker image inspect "$image" >/dev/null 2>&1; then
+        # Not pulled yet, so nothing says it cannot: the install pulls it next.
+        printf '%s' "$AWG_PROTOCOLS"
+        return 0
+    fi
+    printf '%s' "${list:-1.0 1.5 2.0}"
+}
+
+require_image_protocol() {
+    local protocol=$1 speaks
+    speaks=$(image_protocols)
+    case " $speaks " in
+        *" $protocol "*) return 0 ;;
+    esac
+    die "the node image this server runs speaks AmneziaWG ${speaks// /, } only; run \`saucewg update\` before moving it to ${protocol}"
 }
 
 # ---------------------------------------------------------------------------
@@ -368,6 +484,20 @@ awg_cps_spec() {
     esac
 }
 
+# True when PROFILE_<suffix> has to be generated afresh: unset, not a number, or below
+# the floor header protection needs.
+profile_padding_unusable() {
+    local name="PROFILE_$1" floor=${2:-0} value
+    value=${!name:-}
+    case $value in
+        '') return 0 ;;
+        *[!0-9]*) warn "$1=${value} is not a padding length; generating one"; return 0 ;;
+    esac
+    [ "$value" -ge "$floor" ] && return 1
+    log "$1=${value} is below the ${floor} bytes header protection needs; generating one"
+    return 0
+}
+
 # Fills PROFILE_* with a complete obfuscation profile for one generation and clears
 # the parameters that generation must not carry — so moving a node down from 2.0 to
 # 1.0 really does stop it advertising S3, S4 and I1. Values already set are kept,
@@ -385,11 +515,16 @@ generate_profile() {
         awg_protocol_has "$protocol" "$suffix" || printf -v "$name" '%s' ''
     done
 
+    # Under header protection a padding below the cipher's nonce is refused by
+    # amneziawg-go outright, so one that is too small is replaced like a missing one.
+    local floor=0
+    awg_protocol_has "$protocol" HEADER_PROTECTION_KEY && floor=$AWG_HEADER_PROTECTION_MIN_PADDING
+
     [ -n "${PROFILE_JC:-}" ]   || PROFILE_JC=$(rand_range 3 10)
     [ -n "${PROFILE_JMIN:-}" ] || PROFILE_JMIN=50
     [ -n "${PROFILE_JMAX:-}" ] || PROFILE_JMAX=1000
-    [ -n "${PROFILE_S1:-}" ]   || PROFILE_S1=$(rand_range 15 150)
-    if [ -z "${PROFILE_S2:-}" ]; then
+    profile_padding_unusable S1 "$floor" && PROFILE_S1=$(rand_range 15 150)
+    if profile_padding_unusable S2 "$floor"; then
         while :; do
             PROFILE_S2=$(rand_range 15 150)
             # AmneziaWG requires S1 + 56 != S2 so the init and response packets do
@@ -400,17 +535,42 @@ generate_profile() {
 
     if awg_protocol_has "$protocol" S3; then
         # S3 and S4 pad the cookie reply and every transport packet, and both ends have
-        # to agree on them. The AmneziaVPN app drops them while importing a profile, so
-        # an interface app clients dial pads by zero — otherwise the handshake still
-        # completes and every transport packet the app sends is discarded as malformed.
-        # A node-to-node hop runs amneziawg-go at both ends, which honours them.
-        if [ "$peers" = clients ]; then
+        # to agree on them. The AmneziaVPN 4.x app drops them while importing a 2.0
+        # profile, so an interface app clients dial pads by zero there — otherwise the
+        # handshake still completes and every transport packet the app sends is
+        # discarded as malformed. A node-to-node hop runs amneziawg-go at both ends,
+        # which honours them. 3.x has no zero to fall back on, and every app release
+        # that speaks it pads all four messages itself.
+        if [ "$peers" = clients ] && [ "$floor" -eq 0 ]; then
             [ -n "${PROFILE_S3:-}" ] || PROFILE_S3=0
             [ -n "${PROFILE_S4:-}" ] || PROFILE_S4=0
         else
-            [ -n "${PROFILE_S3:-}" ] || PROFILE_S3=$(rand_range 8 55)
-            [ -n "${PROFILE_S4:-}" ] || PROFILE_S4=$(rand_range 4 27)
+            profile_padding_unusable S3 "$floor" \
+                && PROFILE_S3=$(rand_range "$(( floor > 8 ? floor : 8 ))" 55)
+            profile_padding_unusable S4 "$floor" \
+                && PROFILE_S4=$(rand_range "$(( floor > 4 ? floor : 4 ))" 27)
         fi
+    fi
+
+    if awg_protocol_has "$protocol" HEADER_PROTECTION_KEY; then
+        local timing
+        [ -n "${PROFILE_HEADER_PROTECTION_KEY:-}" ] || PROFILE_HEADER_PROTECTION_KEY=$(awg_random_key)
+        for timing in $AWG_TIMINGS; do
+            name="PROFILE_${timing}"
+            [ -n "${!name:-}" ] || printf -v "$name" '%s' "$(awg_timing_default "$timing")"
+        done
+    fi
+
+    if awg_protocol_has "$protocol" RANDOM_TRAILERS; then
+        local switch setting
+        for switch in RANDOM_TRAILERS DISABLE_COOKIES; do
+            name="PROFILE_${switch}"
+            if ! setting=$(awg_switch "${!name:-on}"); then
+                warn "$(awg_param_label "$switch") takes on or off, not '${!name}'; using on"
+                setting=on
+            fi
+            printf -v "$name" '%s' "$setting"
+        done
     fi
 
     local seen="" value
@@ -434,6 +594,16 @@ generate_profile() {
         [ -n "$signature" ] || signature=${PROFILE_I1:-quic}
         PROFILE_I1=$(awg_cps_spec "$signature")
     fi
+}
+
+# The AWG_* lines of a fresh .env for the profile in PROFILE_*. Every parameter is
+# listed, so the file shows which ones the generation leaves empty.
+profile_env_lines() {
+    local suffix name
+    for suffix in $AWG_OBF_PARAMS; do
+        name="PROFILE_${suffix}"
+        printf 'AWG_%s=%s\n' "$suffix" "${!name:-}"
+    done
 }
 
 # Writes the profile into a .env, clearing the parameters the generation dropped so
@@ -691,6 +861,15 @@ services:
       AWG_I3: ${AWG_I3:-}
       AWG_I4: ${AWG_I4:-}
       AWG_I5: ${AWG_I5:-}
+      AWG_HEADER_PROTECTION_KEY: ${AWG_HEADER_PROTECTION_KEY:-}
+      AWG_CONTENT_PADDING_ADDITION: ${AWG_CONTENT_PADDING_ADDITION:-}
+      AWG_REKEY_AFTER_TIME: ${AWG_REKEY_AFTER_TIME:-}
+      AWG_REKEY_TIMEOUT: ${AWG_REKEY_TIMEOUT:-}
+      AWG_REJECT_AFTER_TIME: ${AWG_REJECT_AFTER_TIME:-}
+      AWG_KEEPALIVE_TIMEOUT: ${AWG_KEEPALIVE_TIMEOUT:-}
+      AWG_MAX_HANDSHAKE_ATTEMPTS: ${AWG_MAX_HANDSHAKE_ATTEMPTS:-}
+      AWG_RANDOM_TRAILERS: ${AWG_RANDOM_TRAILERS:-}
+      AWG_DISABLE_COOKIES: ${AWG_DISABLE_COOKIES:-}
       CASCADE_ENABLED: ${CASCADE_ENABLED:-true}
       CASCADE_PROTOCOL_DEFAULT: ${CASCADE_PROTOCOL_DEFAULT:-}
       CASCADE_MTU: ${CASCADE_MTU:-1380}
@@ -814,8 +993,14 @@ services:
       NODE_RECOVERY_GRACE_SECONDS: ${NODE_RECOVERY_GRACE_SECONDS:-300}
       NODE_RECOVERY_INTERVAL_SECONDS: ${NODE_RECOVERY_INTERVAL_SECONDS:-60}
       NODE_RECOVERY_MAX_ATTEMPTS: ${NODE_RECOVERY_MAX_ATTEMPTS:-6}
+      NODE_AUTO_UPGRADE: ${NODE_AUTO_UPGRADE:-true}
+      NODE_AUTO_UPGRADE_DELAY_SECONDS: ${NODE_AUTO_UPGRADE_DELAY_SECONDS:-120}
+      NODE_AUTO_UPGRADE_RETRY_SECONDS: ${NODE_AUTO_UPGRADE_RETRY_SECONDS:-900}
+      NODE_UPGRADE_PROTOCOL: ${NODE_UPGRADE_PROTOCOL-3.1}
       SAUCEWG_REPO: ${SAUCEWG_REPO:-V2as/SauceWG}
       SAUCEWG_REF: ${SAUCEWG_REF:-main}
+      SAUCEWG_RAW_BASE: ${SAUCEWG_RAW_BASE:-}
+      SAUCEWG_REGISTRY: ${SAUCEWG_REGISTRY:-docker.io}
       SAUCEWG_NAMESPACE: ${SAUCEWG_NAMESPACE:-v2as}
       SAUCEWG_IMAGE_PREFIX: ${SAUCEWG_IMAGE_PREFIX:-saucewg-}
       SAUCEWG_TAG: ${SAUCEWG_TAG:-latest}
@@ -894,6 +1079,15 @@ services:
       AWG_I3: ${AWG_I3:-}
       AWG_I4: ${AWG_I4:-}
       AWG_I5: ${AWG_I5:-}
+      AWG_HEADER_PROTECTION_KEY: ${AWG_HEADER_PROTECTION_KEY:-}
+      AWG_CONTENT_PADDING_ADDITION: ${AWG_CONTENT_PADDING_ADDITION:-}
+      AWG_REKEY_AFTER_TIME: ${AWG_REKEY_AFTER_TIME:-}
+      AWG_REKEY_TIMEOUT: ${AWG_REKEY_TIMEOUT:-}
+      AWG_REJECT_AFTER_TIME: ${AWG_REJECT_AFTER_TIME:-}
+      AWG_KEEPALIVE_TIMEOUT: ${AWG_KEEPALIVE_TIMEOUT:-}
+      AWG_MAX_HANDSHAKE_ATTEMPTS: ${AWG_MAX_HANDSHAKE_ATTEMPTS:-}
+      AWG_RANDOM_TRAILERS: ${AWG_RANDOM_TRAILERS:-}
+      AWG_DISABLE_COOKIES: ${AWG_DISABLE_COOKIES:-}
       AWG_PEER_PUBLIC_KEY: ${AWG_PEER_PUBLIC_KEY:-}
       AWG_PEER_PSK: ${AWG_PEER_PSK:-}
       # Set to dial the entry node from here instead of waiting to be dialled,
@@ -967,8 +1161,9 @@ cmd_install() {
     endpoint_family=$(require_endpoint_family "$endpoint_family")
 
     # A fresh install has no clients to keep working, so it starts on the newest
-    # generation KeeneticOS accepts rather than on 1.0.
-    protocol=$(require_protocol "${protocol:-$AWG_PROTOCOL_LATEST}")
+    # generation a router on a stable KeeneticOS accepts rather than on 1.0. 3.x is
+    # one `--protocol` away for a fleet of AmneziaVPN 5 apps.
+    protocol=$(require_protocol "${protocol:-$AWG_PROTOCOL_CLIENTS}")
 
     if [ -f "$ENV_FILE" ] && [ "$reinstall" = false ]; then
         die "${APP_DIR} already holds an installation. Use 'saucewg update', or pass --reinstall."
@@ -1022,6 +1217,8 @@ IMAGE_WEB=$(image_ref web)
 
 SAUCEWG_REPO=${SAUCEWG_REPO}
 SAUCEWG_REF=${SAUCEWG_REF}
+SAUCEWG_RAW_BASE=${SAUCEWG_RAW_BASE:-}
+SAUCEWG_REGISTRY=${REGISTRY}
 SAUCEWG_NAMESPACE=${NAMESPACE}
 SAUCEWG_IMAGE_PREFIX=${IMAGE_PREFIX}
 SAUCEWG_TAG=${IMAGE_TAG}
@@ -1052,25 +1249,12 @@ AWG_MTU=1420
 AWG_ENDPOINT_HOST=${endpoint_host}
 AWG_PRIVATE_KEY=
 AWG_PROTOCOL=${protocol}
-AWG_JC=${PROFILE_JC}
-AWG_JMIN=${PROFILE_JMIN}
-AWG_JMAX=${PROFILE_JMAX}
-AWG_S1=${PROFILE_S1}
-AWG_S2=${PROFILE_S2}
-AWG_S3=${PROFILE_S3}
-AWG_S4=${PROFILE_S4}
-AWG_H1=${PROFILE_H1}
-AWG_H2=${PROFILE_H2}
-AWG_H3=${PROFILE_H3}
-AWG_H4=${PROFILE_H4}
-AWG_I1=${PROFILE_I1}
-AWG_I2=
-AWG_I3=
-AWG_I4=
-AWG_I5=
+$(profile_env_lines)
 
 CASCADE_ENABLED=true
-CASCADE_PROTOCOL_DEFAULT=${protocol}
+# For an exit node whose entry in the list names no generation. Every node this
+# panel or \`saucewg install-node\` sets up names its own.
+CASCADE_PROTOCOL_DEFAULT=${AWG_PROTOCOL_NODES}
 CASCADE_MTU=1380
 CASCADE_KEEPALIVE=25
 # While every exit node is down: direct = this entry node carries client traffic
@@ -1171,6 +1355,12 @@ NODE_RECOVERY_ENABLED=true
 NODE_RECOVERY_GRACE_SECONDS=300
 NODE_RECOVERY_INTERVAL_SECONDS=60
 NODE_RECOVERY_MAX_ATTEMPTS=6
+# Exit nodes follow this panel's release: \`saucewg update\` upgrades every node the
+# panel holds a key for, one at a time, and the panel catches up on any it could not
+# reach. A node is then moved to NODE_UPGRADE_PROTOCOL unless it speaks it already
+# or was put on a generation by hand. Empty leaves every node on its generation.
+NODE_AUTO_UPGRADE=true
+NODE_UPGRADE_PROTOCOL=${AWG_PROTOCOL_NODES}
 EOF
     chmod 600 "$ENV_FILE"
 
@@ -1181,6 +1371,7 @@ EOF
     if [ "$start" = true ]; then
         step "Pulling images"
         compose pull --quiet >&2 || die "could not pull the images from ${REGISTRY}/${NAMESPACE}"
+        require_image_protocol "$protocol"
         step "Starting SauceWG"
         compose up -d >&2
         wait_for_panel
@@ -1311,7 +1502,9 @@ cmd_install_node() {
     done
 
     [ -n "$name" ] || name=$(hostname -s 2>/dev/null || echo exit)
-    protocol=$(require_protocol "${protocol:-$AWG_PROTOCOL_LATEST}")
+    # Only the entry node dials an exit node, and it runs this same image, so a new
+    # one starts on the newest generation there is.
+    protocol=$(require_protocol "${protocol:-$AWG_PROTOCOL_NODES}")
 
     case $subnet6 in
         auto|yes|on|true) subnet6=$CASCADE_UPLINK_SUBNET6_DEFAULT ;;
@@ -1331,6 +1524,7 @@ cmd_install_node() {
         # to another generation behind the operator's back: the entry node is paired
         # with the profile it has now.
         if [ "$requested_protocol" = true ]; then
+            require_image_protocol "$protocol"
             load_profile "$ENV_FILE"
             generate_profile "$protocol" "$signature" nodes
             store_profile "$ENV_FILE" "$protocol"
@@ -1357,6 +1551,9 @@ COMPOSE_PROJECT_NAME=saucewg-exit
 IMAGE_AWG=$(image_ref awg)
 
 SAUCEWG_NODE_NAME=${name}
+SAUCEWG_REGISTRY=${REGISTRY}
+SAUCEWG_NAMESPACE=${NAMESPACE}
+SAUCEWG_IMAGE_PREFIX=${IMAGE_PREFIX}
 SAUCEWG_TAG=${IMAGE_TAG}
 
 AWG_IFACE=awg0
@@ -1370,22 +1567,7 @@ AWG_MTU=1420
 AWG_PRIVATE_KEY=
 
 AWG_PROTOCOL=${protocol}
-AWG_JC=${PROFILE_JC}
-AWG_JMIN=${PROFILE_JMIN}
-AWG_JMAX=${PROFILE_JMAX}
-AWG_S1=${PROFILE_S1}
-AWG_S2=${PROFILE_S2}
-AWG_S3=${PROFILE_S3}
-AWG_S4=${PROFILE_S4}
-AWG_H1=${PROFILE_H1}
-AWG_H2=${PROFILE_H2}
-AWG_H3=${PROFILE_H3}
-AWG_H4=${PROFILE_H4}
-AWG_I1=${PROFILE_I1}
-AWG_I2=
-AWG_I3=
-AWG_I4=
-AWG_I5=
+$(profile_env_lines)
 
 AWG_PEER_PUBLIC_KEY=${peer_key}
 AWG_PEER_PSK=${psk}
@@ -1440,6 +1622,9 @@ EOF
 
     step "Pulling images"
     compose pull --quiet >&2 || die "could not pull ${IMAGE_TAG} from ${REGISTRY}/${NAMESPACE}"
+    # The container refuses to start on a generation its image does not speak, which
+    # would leave the node down with nothing on this side saying why.
+    require_image_protocol "$(env_get "$ENV_FILE" AWG_PROTOCOL || printf '%s' "$protocol")"
     step "Starting the exit node"
     compose up -d >&2
 
@@ -1527,12 +1712,13 @@ emit_node_info() {
 
     # Only the parameters the node's generation actually carries are reported: an
     # extra S3 in the list would have the entry node build a 2.0 uplink towards an
-    # exit node that speaks 1.0, and the handshake would never complete.
+    # exit node that speaks 1.0, and the handshake would never complete. Of those,
+    # the ones the entry node has to repeat, plus the signature packets.
     local json
     json=$(printf '%s' "$params" | jq -R -s \
         --arg name "$name" --arg endpoint "$endpoint" --arg endpoint6 "$endpoint6" \
         --arg port "$port" --arg subnet6 "$subnet6" \
-        --arg shared "S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5" '
+        --arg shared "$AWG_SHARED_PARAMS I1 I2 I3 I4 I5" '
         def unquote:
             if startswith("\u0027") and endswith("\u0027")
             then .[1:-1] | gsub("\u0027\\\\\u0027\u0027"; "\u0027")
@@ -1667,6 +1853,12 @@ request_reload() {
     warn "the node did not confirm the reload; check: saucewg logs awg"
 }
 
+# The parameter an obfuscation flag sets: --s3 is S3, --header-protection-key is
+# HEADER_PROTECTION_KEY.
+obf_flag_param() {
+    printf '%s' "${1#--}" | tr '[:lower:]' '[:upper:]' | tr '-' '_'
+}
+
 cmd_add_node() {
     need_root add-node
     require_entry
@@ -1693,8 +1885,11 @@ cmd_add_node() {
             # one node off it while the rest of the cascade uses it.
             --address6) address6=$2; shift 2 ;;
             --protocol|--awg-version) protocol=$2; shift 2 ;;
-            --s[1-4]|--h[1-4]|--i[1-5]|--jc|--jmin|--jmax)
-                obf[$(printf '%s' "${1#--}" | tr '[:lower:]' '[:upper:]')]=$2; shift 2 ;;
+            --s[1-4]|--h[1-4]|--i[1-5]|--jc|--jmin|--jmax|--header-protection-key|\
+            --content-padding-addition|--rekey-after-time|--rekey-timeout|\
+            --reject-after-time|--keepalive-timeout|--max-handshake-attempts|\
+            --random-trailers|--disable-cookies)
+                obf[$(obf_flag_param "$1")]=$2; shift 2 ;;
             --no-reload) reload=false; shift ;;
             *) die "unknown option for add-node: $1" ;;
         esac
@@ -1746,6 +1941,16 @@ cmd_add_node() {
 
     name=$(printf '%s' "$node" | jq -r '.name // ""')
     [ -n "$name" ] || die "the node object needs a name"
+
+    # This node's container builds the uplink, so a generation its image cannot speak
+    # is refused here rather than by the container after the list is written.
+    local generation
+    generation=$(printf '%s' "$node" | jq -r '.protocol // "" | tostring')
+    if [ -n "$generation" ]; then
+        generation=$(require_protocol "$generation")
+        require_image_protocol "$generation"
+        node=$(printf '%s' "$node" | jq --arg p "$generation" '. + {protocol: $p}')
+    fi
 
     local file uplink_subnet uplink_subnet6
     file=$(nodes_file)
@@ -1995,8 +2200,11 @@ cmd_update_node() {
             --address6) address6=$2; shift 2 ;;
             --priority) obf[PRIORITY]=$2; shift 2 ;;
             --protocol|--awg-version) protocol=$2; shift 2 ;;
-            --s[1-4]|--h[1-4]|--i[1-5]|--jc|--jmin|--jmax)
-                obf[$(printf '%s' "${1#--}" | tr '[:lower:]' '[:upper:]')]=$2; shift 2 ;;
+            --s[1-4]|--h[1-4]|--i[1-5]|--jc|--jmin|--jmax|--header-protection-key|\
+            --content-padding-addition|--rekey-after-time|--rekey-timeout|\
+            --reject-after-time|--keepalive-timeout|--max-handshake-attempts|\
+            --random-trailers|--disable-cookies)
+                obf[$(obf_flag_param "$1")]=$2; shift 2 ;;
             --no-reload) reload=false; shift ;;
             -*) die "unknown option for update-node: $1" ;;
             *) name=$1; shift ;;
@@ -2035,6 +2243,14 @@ cmd_update_node() {
         patch=$(printf '%s' "$patch" | jq --arg k "$key" --arg v "${obf[$param]}" \
             '. + {($k): (if ($v | test("^[0-9]+$")) then ($v | tonumber) else $v end)}')
     done
+    if [ -z "$protocol" ]; then
+        protocol=$(printf '%s' "$patch" | jq -r '.protocol // "" | tostring')
+        [ -z "$protocol" ] || protocol=$(require_protocol "$protocol")
+    fi
+    if [ -n "$protocol" ]; then
+        require_image_protocol "$protocol"
+        patch=$(printf '%s' "$patch" | jq --arg v "$protocol" '. + {protocol: $v}')
+    fi
 
     local file
     file=$(nodes_file)
@@ -2057,16 +2273,21 @@ cmd_update_node() {
 
     # The old generation's parameters are dropped rather than overwritten: a leftover
     # S3 would keep this uplink advertising 2.0 to an exit node that no longer does.
+    # A generation chosen by hand is kept when the panel upgrades the exit nodes,
+    # unless it is the one they are upgraded to anyway.
     local params_lower
     params_lower=$(printf '%s' "$AWG_OBF_PARAMS" | tr '[:upper:]' '[:lower:]')
     jq --arg n "$name" --argjson patch "$patch" --arg obf "$params_lower" \
-       --argjson d4 "$drop4" --argjson d6 "$drop6" '
+       --argjson d4 "$drop4" --argjson d6 "$drop6" --arg newest "$AWG_PROTOCOL_NODES" '
         ($obf | split(" ")) as $keys
         | map(if .name == $n
               then (if ($patch | has("protocol")) then delpaths([$keys[] | [.]]) else . end)
                    + ($patch | del(.name))
                    | (if $d4 then del(.endpoint) else . end)
                    | (if $d6 then del(.endpoint6) else . end)
+                   | (if ($patch | has("protocol") | not) then .
+                      elif $patch.protocol == $newest then del(.keep_protocol)
+                      else . + {keep_protocol: true} end)
               else . end)' "$file" > "${file}.tmp"
     mv "${file}.tmp" "$file"
     chmod 600 "$file"
@@ -3172,16 +3393,22 @@ cmd_protocol() {
     # serving 1.0 clients, so that is the honest answer rather than a blank.
     if [ -z "$active" ] && [ -n "$params" ]; then active=1.0; fi
 
+    local speaks
+    speaks=$(image_protocols)
+
     if [ "$JSON_OUTPUT" = true ]; then
         jq -n --arg role "$(role)" --arg configured "${configured:-}" --arg active "${active:-}" \
               --arg signature "$signature" --arg latest "$AWG_PROTOCOL_LATEST" \
-              --arg supported "$AWG_PROTOCOLS" '
+              --arg clients "$AWG_PROTOCOL_CLIENTS" --arg nodes "$AWG_PROTOCOL_NODES" \
+              --arg supported "$AWG_PROTOCOLS" --arg image "$speaks" '
             {role: $role,
              protocol: (if $active == "" then null else $active end),
              configured: (if $configured == "" then null else $configured end),
              signature: (if $signature == "" then null else $signature end),
              latest: $latest,
-             supported: ($supported | split(" "))}'
+             defaults: {clients: $clients, nodes: $nodes},
+             supported: ($supported | split(" ")),
+             image_supports: ($image | split(" "))}'
         return
     fi
 
@@ -3189,7 +3416,9 @@ cmd_protocol() {
     note "serving    AmneziaWG ${active:-<not running>}"
     [ -z "$configured" ] || note "configured AmneziaWG ${configured}"
     [ -z "$signature" ] || note "signature  ${signature}"
-    note "supported  ${AWG_PROTOCOLS} (newest on KeeneticOS: ${AWG_PROTOCOL_LATEST})"
+    note "supported  ${AWG_PROTOCOLS} (KeeneticOS stable: up to ${AWG_PROTOCOL_CLIENTS}; AmneziaVPN 5.0.1.5+: ${AWG_PROTOCOL_LATEST})"
+    [ "$speaks" = "$AWG_PROTOCOLS" ] \
+        || warn "the node image this server runs speaks ${speaks} only; saucewg update brings 3.x"
     if [ -n "$configured" ] && [ -n "$active" ] && [ "$configured" != "$active" ]; then
         warn "the interface is still on ${active}; apply the change with: saucewg restart"
     fi
@@ -3218,6 +3447,10 @@ cmd_set_protocol() {
     current=$(env_get "$ENV_FILE" AWG_PROTOCOL || true)
     [ -n "$current" ] || current=1.0
 
+    # Checked before anything is written: a container recreated on a generation its
+    # image cannot serve does not start, and takes the node down with it.
+    require_image_protocol "$protocol"
+
     if [ "$(role)" = "entry" ]; then
         confirm "Move the entry node to AmneziaWG ${protocol}? Every client config has to be re-exported and re-imported." \
             || die "aborted"
@@ -3228,6 +3461,13 @@ cmd_set_protocol() {
     local peers=clients
     [ "$(role)" = "exit" ] && peers=nodes
     load_profile "$ENV_FILE"
+    # Below 3.x an interface app clients dial pads by zero (see generate_profile).
+    # The padding 3.x gave it was only there for header protection, so it goes too.
+    if [ "$peers" = clients ] && awg_protocol_has "$current" HEADER_PROTECTION_KEY \
+        && ! awg_protocol_has "$protocol" HEADER_PROTECTION_KEY; then
+        PROFILE_S3=""
+        PROFILE_S4=""
+    fi
     generate_profile "$protocol" "$signature" "$peers"
     store_profile "$ENV_FILE" "$protocol"
     log "configured AmneziaWG ${protocol} (was ${current})"
@@ -3260,10 +3500,19 @@ cmd_set_protocol() {
     else
         note "Existing clients keep the old profile until their config is re-imported."
         note "Re-download each one from the panel, or with: saucewg shell panel"
-        if [ "$protocol" != "1.0" ]; then
-            note ""
-            note "AmneziaWG ${protocol} needs KeeneticOS 5.1 Alpha 3 or newer on a router."
-        fi
+        case $protocol in
+            1.0) ;;
+            3.0)
+                note ""
+                note "AmneziaWG 3.0 needs AmneziaVPN 5.0.0.5 or newer, or KeeneticOS 5.2 Alpha 11 on a router." ;;
+            3.1)
+                note ""
+                note "AmneziaWG 3.1 needs AmneziaVPN 5.0.1.5 or newer, or KeeneticOS 5.2 Alpha 11 on a router."
+                note "Routers on a stable KeeneticOS stop at 2.0." ;;
+            *)
+                note ""
+                note "AmneziaWG ${protocol} needs KeeneticOS 5.1 Alpha 3 or newer on a router." ;;
+        esac
     fi
 }
 
@@ -3275,7 +3524,7 @@ cmd_signatures() {
             jq -n --arg name "$name" --arg spec "$(awg_cps_preset "$name")" \
                   --arg about "$(awg_cps_describe "$name")" \
                   '{name: $name, spec: $spec, description: $about}'
-        done | jq -s --arg supported "1.5 2.0" \
+        done | jq -s --arg supported "1.5 2.0 3.0 3.1" \
             '{presets: ., applies_to: ($supported | split(" "))}'
         return
     fi
@@ -3289,7 +3538,7 @@ cmd_signatures() {
         printf '         %s\n' "$(awg_cps_preset "$name")"
     done
     note ""
-    note "Used by AmneziaWG 1.5 and 2.0; ignored on 1.0. A literal spec works too:"
+    note "Used by AmneziaWG 1.5 and later; ignored on 1.0. A literal spec works too:"
     note "  saucewg set-protocol 2.0 --signature '<b 0xdeadbeef><r 64>'"
 }
 
@@ -3359,14 +3608,18 @@ cmd_update() {
     need_root update
     require_installed
 
-    local restart=true
+    local restart=true nodes=true
     while [ $# -gt 0 ]; do
         case "$1" in
             --tag) IMAGE_TAG=$2; shift 2 ;;
             --no-restart) restart=false; shift ;;
+            --no-nodes) nodes=false; shift ;;
             *) die "unknown option for update: $1" ;;
         esac
     done
+    # An update without flags stays on the registry and namespace it was installed
+    # from, rather than moving a mirror-installed node to Docker Hub.
+    load_saved_image_source
 
     step "Updating the saucewg command"
     local newer
@@ -3380,12 +3633,35 @@ cmd_update() {
 
     step "Refreshing the compose file"
     # Regenerated on every update so a new release can add services or volumes.
+    env_set "$ENV_FILE" SAUCEWG_REGISTRY "$REGISTRY"
+    env_set "$ENV_FILE" SAUCEWG_NAMESPACE "$NAMESPACE"
+    env_set "$ENV_FILE" SAUCEWG_IMAGE_PREFIX "$IMAGE_PREFIX"
     if [ "$(role)" = "entry" ]; then
         write_entry_compose
         env_set "$ENV_FILE" IMAGE_AWG "$(image_ref awg)"
         env_set "$ENV_FILE" IMAGE_PANEL "$(image_ref panel)"
         env_set "$ENV_FILE" IMAGE_WEB "$(image_ref web)"
         env_set "$ENV_FILE" SAUCEWG_TAG "$IMAGE_TAG"
+        # Where the exit nodes fetch this script from when the panel upgrades them.
+        # Empty is GitHub; a mirror an entry node was installed from is kept.
+        grep -q '^SAUCEWG_RAW_BASE=' "$ENV_FILE" \
+            || env_set "$ENV_FILE" SAUCEWG_RAW_BASE "${SAUCEWG_RAW_BASE:-}"
+
+        # An exit node left on an older release than its entry node is the one
+        # place a cascade can break on update, so the exit nodes now follow: this
+        # update walks them over one at a time, and the panel catches up any that
+        # were down. Once there, they move to AmneziaWG ${AWG_PROTOCOL_NODES}, which
+        # clients never see — their own generation stays where it is.
+        if ! grep -q '^NODE_AUTO_UPGRADE=' "$ENV_FILE"; then
+            env_set "$ENV_FILE" NODE_AUTO_UPGRADE true
+            note "exit nodes now follow this node's release: they are upgraded one at a time after every update"
+            note "  turn that off with NODE_AUTO_UPGRADE=false in ${ENV_FILE}"
+        fi
+        if ! grep -q '^NODE_UPGRADE_PROTOCOL=' "$ENV_FILE"; then
+            env_set "$ENV_FILE" NODE_UPGRADE_PROTOCOL "$AWG_PROTOCOL_NODES"
+            note "the link to the exit nodes moves to AmneziaWG ${AWG_PROTOCOL_NODES}; clients keep their own generation"
+            note "  keep the nodes where they are with NODE_UPGRADE_PROTOCOL= (empty) in ${ENV_FILE}"
+        fi
         # Settings introduced after the initial install.
         grep -q '^NODE_REGISTRY_FILE=' "$ENV_FILE" \
             || env_set "$ENV_FILE" NODE_REGISTRY_FILE /etc/saucewg/host/exit-nodes.json
@@ -3505,7 +3781,11 @@ cmd_update() {
     # `saucewg set-protocol` is how an operator opts in.
     if ! grep -q '^AWG_PROTOCOL=' "$ENV_FILE"; then
         env_set "$ENV_FILE" AWG_PROTOCOL 1.0
-        note "recorded this node as AmneziaWG 1.0; move it with: saucewg set-protocol ${AWG_PROTOCOL_LATEST}"
+        if [ "$(role)" = "entry" ]; then
+            note "recorded this node as AmneziaWG 1.0; move it with: saucewg set-protocol ${AWG_PROTOCOL_CLIENTS}"
+        else
+            note "recorded this node as AmneziaWG 1.0; move it with: saucewg set-protocol ${AWG_PROTOCOL_NODES}"
+        fi
     fi
 
     step "Pulling images"
@@ -3525,8 +3805,88 @@ cmd_update() {
     else
         log "updated to ${IMAGE_TAG}"
     fi
+
+    # The exit nodes follow only once this node is known to be working: they are
+    # walked over from here, and walking them from a broken entry node would only
+    # take the cascade down at both ends.
+    local walked=null
+    if [ "$(role)" = "entry" ] && [ "$restart" = true ] && [ "$healthy" = true ] && [ "$nodes" = true ]; then
+        if [ "$(env_get "$ENV_FILE" NODE_AUTO_UPGRADE || true)" = false ]; then
+            log "NODE_AUTO_UPGRADE=false, so the exit nodes stay on their release; upgrade them with: saucewg upgrade-nodes"
+        else
+            step "Upgrading the exit nodes"
+            if walked=$(fleet_walk --origin update); then
+                fleet_summary "$walked" >&2
+            elif [ -n "$walked" ]; then
+                fleet_summary "$walked" >&2
+                warn "not every exit node was upgraded; the panel retries the ones that did not answer"
+            else
+                walked=null
+                warn "the exit nodes were not upgraded; the panel tries again shortly, or run: saucewg upgrade-nodes"
+            fi
+        fi
+    fi
+
     [ "$JSON_OUTPUT" = false ] || jq -n --arg tag "$IMAGE_TAG" --arg version "$SAUCEWG_VERSION" \
-        --argjson healthy "$healthy" '{ok: $healthy, tag: $tag, cli_version: $version}'
+        --argjson healthy "$healthy" --argjson nodes "$walked" \
+        '{ok: $healthy, tag: $tag, cli_version: $version, nodes: $nodes}'
+}
+
+# Walks the exit nodes over to this release through the panel, which holds the keys
+# to them. Its progress reaches the terminal as it happens; the report it ends with
+# is printed for the caller, and the exit status says whether every node made it.
+fleet_walk() {
+    local json status=0
+    json=$(compose exec -T panel python -m app.cli upgrade-nodes "$@") || status=$?
+    if ! printf '%s' "$json" | jq -e 'type == "object" and has("nodes")' >/dev/null 2>&1; then
+        return 1
+    fi
+    printf '%s' "$json"
+    return "$status"
+}
+
+fleet_summary() {
+    printf '%s' "$1" | jq -r '
+        if .error then "the exit nodes were not upgraded: \(.error)"
+        elif (.nodes | length) == 0 then "there are no exit nodes to upgrade"
+        else
+            "NAME\tRESULT\tRELEASE\tGENERATION\tDETAIL",
+            (.nodes[] |
+                "\(.name)\t\(.status)\t" +
+                (if .version_before == .version_after then (.version_after // "-")
+                 else "\(.version_before // "?") → \(.version_after // "?")" end) + "\t" +
+                (if .protocol_before == .protocol_after then (.protocol_after // "-")
+                 else "\(.protocol_before // "?") → \(.protocol_after // "?")" end) + "\t" +
+                (if (.detail // "") == "" then "-" else .detail end))
+        end' | column -t -s "$(printf '\t')"
+    printf '%s' "$1" | jq -r 'select(.halted) | "stopped: \(.halted)"' | while IFS= read -r line; do
+        warn "$line"
+    done
+}
+
+cmd_upgrade_nodes() {
+    need_root upgrade-nodes
+    require_entry
+
+    local args=(--origin cli)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --protocol) args+=(--protocol "$(require_protocol "${2:-}")"); shift 2 ;;
+            --keep-protocol) args+=(--keep-protocol); shift ;;
+            -*) die "unknown option for upgrade-nodes: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+
+    local json status=0
+    json=$(fleet_walk "${args[@]}") || status=$?
+    [ -n "$json" ] || die "the panel did not answer; is it running? (saucewg logs panel)"
+    if [ "$JSON_OUTPUT" = true ]; then
+        printf '%s' "$json" | jq .
+    else
+        fleet_summary "$json"
+    fi
+    return "$status"
 }
 
 cmd_uninstall() {
@@ -3663,17 +4023,27 @@ cmd_info() {
         endpoint=$(env_get "$ENV_FILE" AWG_PORT || echo "")
     fi
 
+    local protocol="" speaks=""
+    if [ -f "$ENV_FILE" ]; then
+        protocol=$(env_get "$ENV_FILE" AWG_PROTOCOL || true)
+        speaks=$(image_protocols)
+    fi
+
     jq -n \
         --arg version "$SAUCEWG_VERSION" \
         --arg role "$role_name" \
         --arg dir "$APP_DIR" \
         --arg endpoint "$endpoint" \
         --arg panel_url "$panel_url" \
+        --arg protocol "$protocol" \
+        --arg speaks "$speaks" \
         --argjson containers "${containers:-[]}" \
         --argjson cascade "${nodes:-null}" \
         '{cli_version: $version, role: $role, dir: $dir,
           endpoint: (if $endpoint == "" then null else $endpoint end),
           panel_url: (if $panel_url == "" then null else $panel_url end),
+          protocol: (if $protocol == "" then null else $protocol end),
+          image_supports: ($speaks | split(" ") | map(select(. != ""))),
           containers: $containers, cascade: $cascade}'
 }
 
@@ -3692,9 +4062,12 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
   Installation
     install                  Install the entry node: panel, database and cascade
     install-node             Install an exit node and print its pairing object
-                             (both take --protocol ${AWG_PROTOCOL_LATEST} and --signature quic;
+                             (both take --protocol VERSION and --signature quic; clients
+                             default to ${AWG_PROTOCOL_CLIENTS}, the link between nodes to ${AWG_PROTOCOL_NODES};
                              --uplink-subnet6 auto / --subnet6 auto adds IPv6 to the bridge)
-    update                   Pull the newest images and recreate the containers
+    update                   Pull the newest images and recreate the containers; on
+                             the entry node, then upgrade every exit node the panel
+                             manages, one at a time (--no-nodes skips that)
     uninstall [--purge]      Remove the containers and volumes
 
   Service
@@ -3716,6 +4089,10 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
     reload                   Re-read the exit node list without a restart
     recover [NAME…]          Put failed exit nodes back: restart, then re-pair
                              (defaults to every unhealthy node; needs the panel)
+    upgrade-nodes [NAME…]    Move exit nodes to this release one at a time, the one
+                             carrying traffic last, then onto AmneziaWG ${AWG_PROTOCOL_NODES}
+                             (--protocol VERSION picks another generation,
+                             --keep-protocol leaves each node on the one it runs)
     admin-password           Reset the panel admin password
 
   Routing (entry node)
@@ -3761,7 +4138,7 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
 
   AmneziaWG generation
     protocol                 Which generation this node serves
-    set-protocol VERSION     Move this node to 1.0, 1.5 or 2.0
+    set-protocol VERSION     Move this node to 1.0, 1.5, 2.0, 3.0 or 3.1
                              (--signature PRESET picks the I1 disguise)
     signatures               The signature packet presets --signature accepts
 
@@ -3791,6 +4168,10 @@ saucewg ${SAUCEWG_VERSION} — AmneziaWG cascade (generations ${AWG_PROTOCOLS})
     1.0   Jc Jmin Jmax S1 S2 H1-H4       every KeeneticOS from 4.2 Alpha 2 on
     1.5   the same, plus I1              KeeneticOS 5.1 Alpha 3 and newer
     2.0   the same, plus I1, S3 and S4   KeeneticOS 5.1 Alpha 3 and newer
+    3.0   2.0, plus header protection    AmneziaVPN 5.0.0.5, KeeneticOS 5.2 Alpha 11
+          and per-tunnel timers
+    3.1   3.0, plus RandomTrailers and   AmneziaVPN 5.0.1.5, KeeneticOS 5.2 Alpha 11
+          DisableCookies
 EOF
 }
 
@@ -3811,9 +4192,9 @@ main() {
             --quiet) QUIET=true; shift ;;
             --dir) APP_DIR=$2; shift 2 ;;
             --tag) IMAGE_TAG=$2; shift 2 ;;
-            --namespace) NAMESPACE=$2; shift 2 ;;
-            --registry) REGISTRY=$2; shift 2 ;;
-            --image-prefix) IMAGE_PREFIX=$2; shift 2 ;;
+            --namespace) NAMESPACE=$2; IMAGE_SOURCE_GIVEN+="namespace "; shift 2 ;;
+            --registry) REGISTRY=$2; IMAGE_SOURCE_GIVEN+="registry "; shift 2 ;;
+            --image-prefix) IMAGE_PREFIX=$2; IMAGE_SOURCE_GIVEN+="prefix "; shift 2 ;;
             -h|--help|help) usage; exit 0 ;;
             # Marzban-style separator: `bash script.sh @ install` also works.
             @) shift ;;
@@ -3860,6 +4241,7 @@ main() {
         uplink-key)       cmd_uplink_key "$@" ;;
         reload)           cmd_reload "$@" ;;
         recover)          cmd_recover "$@" ;;
+        upgrade-nodes)    cmd_upgrade_nodes "$@" ;;
         admin-password)   cmd_admin_password "$@" ;;
         routes|list-routes) cmd_routes "$@" ;;
         add-route)        cmd_add_route "$@" ;;

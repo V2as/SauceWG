@@ -120,11 +120,33 @@ class Settings(BaseSettings):
     # recovers by itself or an operator intervenes. Retrying for ever would hide
     # the one thing worth escalating: a server that no longer exists.
     node_recovery_max_attempts: int = 6
+
+    # --- keeping the fleet on this release --------------------------------
+    # An exit node runs whatever release it was installed with until something
+    # upgrades it. With this on, the panel walks every node it can reach unattended
+    # over to its own release shortly after it starts — which is right after an
+    # update — one node at a time and never the one carrying traffic while another
+    # can take it. `saucewg update` runs the same walk itself and reports on it.
+    node_auto_upgrade: bool = True
+    # How long after startup to begin, so the node container has rebuilt every
+    # uplink and measured its health before anything is judged by it.
+    node_auto_upgrade_delay_seconds: int = 120
+    # A node that did not answer is tried again this often until it has been
+    # upgraded. A walk that stopped because a node broke is not retried at all.
+    node_auto_upgrade_retry_seconds: int = 900
+    # The AmneziaWG generation a managed exit node is moved to once it runs this
+    # release, if it speaks an older one. Empty leaves every node on its generation.
+    # A node an operator put on a generation by hand is left there either way.
+    node_upgrade_protocol: str = "3.1"
+
     # Uploaded to every exit node and executed there. Falls back to fetching the
     # script from GitHub when the image does not carry a copy.
     saucewg_installer_path: str = "/app/assets/saucewg.sh"
     saucewg_repo: str = "V2as/SauceWG"
     saucewg_ref: str = "main"
+    # Where the script is published, when that is not GitHub at all.
+    saucewg_raw_base: str = ""
+    saucewg_registry: str = "docker.io"
     saucewg_namespace: str = "v2as"
     saucewg_image_prefix: str = "saucewg-"
     saucewg_tag: str = "latest"
@@ -215,6 +237,17 @@ class Settings(BaseSettings):
     @property
     def uplink_reload_file(self) -> str:
         return f"{self.awg_socket_dir}/reload.request"
+
+    @property
+    def fleet_lock_file(self) -> str:
+        # Beside the state files rather than in /tmp: `saucewg update` walks the
+        # fleet through `docker compose exec`, and only a file both processes see
+        # keeps that walk and the panel's own from running side by side.
+        return f"{self.awg_socket_dir}/fleet.lock"
+
+    @property
+    def fleet_state_file(self) -> str:
+        return f"{self.awg_socket_dir}/fleet.json"
 
 
 @lru_cache

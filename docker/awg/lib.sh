@@ -15,6 +15,11 @@ rand_range() {
 awg_genkey() { awg genkey; }
 awg_pubkey() { printf '%s' "$1" | awg pubkey; }
 
+# 32 random bytes in base64, the format of every key amneziawg-tools reads. Used for
+# the header protection key, which is a cipher key rather than a Curve25519 one, so
+# it needs no clamping — and the bootstrap scripts call this on a host without awg.
+awg_random_key() { head -c 32 /dev/urandom | base64 | tr -d '\n'; }
+
 first_host() {
     # 10.8.0.0/24 -> 10.8.0.1/24
     local cidr=$1 net prefix
@@ -259,20 +264,59 @@ params_store() {
 #   1.0   Jc Jmin Jmax S1 S2 H1-H4          any KeeneticOS from 4.2 Alpha 2 on
 #   1.5   the same, plus I1                 KeeneticOS 5.1 Alpha 3 and newer
 #   2.0   the same, plus I1, S3 and S4      KeeneticOS 5.1 Alpha 3 and newer
+#   3.0   2.0 plus HeaderProtectionKey,     AmneziaVPN 5.0.0.5, KeeneticOS 5.2 Alpha 11
+#         ContentPaddingAddition and the
+#         five randomised timings
+#   3.1   3.0 plus RandomTrailers and       AmneziaVPN 5.0.1.5, KeeneticOS 5.2 Alpha 11
+#         DisableCookies
 #
-# AWG 3.0 — header protection, content padding, custom timings — is deliberately
-# absent: no router firmware speaks it, and a 3.0 profile cannot be loaded into
-# one at all.
+# amneziawg-go v3 speaks every one of them: a profile without the 3.x parameters
+# is the same on the wire as it was with v0.2, so one binary serves old clients and
+# new ones alike.
 #
 # S1-S4 pad the four WireGuard message types and H1-H4 replace their type
-# headers, so both ends of a tunnel must agree on them. Jc/Jmin/Jmax (junk
-# packets) and I1-I5 (signature packets) are only ever built by the sender, so
-# each side is free to use its own.
+# headers, so both ends of a tunnel must agree on them — and so must they on the
+# header protection key, which encrypts those headers, and on RandomTrailers, which
+# decides whether a longer packet than expected is accepted at all. Jc/Jmin/Jmax
+# (junk packets), I1-I5 (signature packets), content padding, the timings and
+# DisableCookies are only ever acted on by the sender, so each side is free to use
+# its own.
 
-AWG_PROTOCOL_DEFAULT=${AWG_PROTOCOL_DEFAULT:-2.0}
+# shellcheck disable=SC2034  # read by the scripts that source this file
+AWG_PROTOCOLS="1.0 1.5 2.0 3.0 3.1"
 
-# Every parameter any generation can carry, in the order a .conf lists them.
-AWG_OBF_SUFFIXES="JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5"
+# What a brand-new interface speaks when nothing names a generation. App clients
+# get the newest one a router on a stable KeeneticOS loads; a hop between two nodes
+# runs this image at both ends, so it gets the newest one there is.
+AWG_PROTOCOL_CLIENTS=${AWG_PROTOCOL_CLIENTS:-2.0}
+AWG_PROTOCOL_NODES=${AWG_PROTOCOL_NODES:-3.1}
+
+# Every parameter any generation can carry, in the order a .conf lists them. One
+# line, because jq splits it on spaces.
+AWG_OBF_SUFFIXES="JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5 HEADER_PROTECTION_KEY CONTENT_PADDING_ADDITION REKEY_AFTER_TIME REKEY_TIMEOUT REJECT_AFTER_TIME KEEPALIVE_TIMEOUT MAX_HANDSHAKE_ATTEMPTS RANDOM_TRAILERS DISABLE_COOKIES"
+
+# The parameters both ends of a tunnel have to agree on. An exit node reports these
+# in its pairing object, and they are what the entry node's uplink must not invent.
+AWG_SHARED_SUFFIXES="S1 S2 S3 S4 H1 H2 H3 H4 HEADER_PROTECTION_KEY RANDOM_TRAILERS"
+
+# AmneziaWG 3.x defaults for the timings, the ones AmneziaVPN's own server uses.
+# Each is a range the sender draws from, which is the point: a fixed 120-second
+# rekey is as recognisable as a fixed packet length.
+AWG_TIMINGS="REKEY_AFTER_TIME REKEY_TIMEOUT REJECT_AFTER_TIME KEEPALIVE_TIMEOUT MAX_HANDSHAKE_ATTEMPTS"
+awg_timing_default() {
+    case $1 in
+        REKEY_AFTER_TIME)       printf '100-120' ;;
+        REKEY_TIMEOUT)          printf '3-7' ;;
+        REJECT_AFTER_TIME)      printf '150-180' ;;
+        KEEPALIVE_TIMEOUT)      printf '5-15' ;;
+        MAX_HANDSHAKE_ATTEMPTS) printf '15-20' ;;
+        *) return 1 ;;
+    esac
+}
+
+# Header protection takes its nonce from the first 12 bytes of each packet's random
+# prefix, so amneziawg-go refuses a key unless every one of S1-S4 is at least that.
+AWG_HEADER_PROTECTION_MIN_PADDING=12
 
 # Canonical name of a generation, or non-zero for anything unrecognised.
 awg_protocol() {
@@ -282,6 +326,8 @@ awg_protocol() {
         ''|legacy|awg-legacy|awglegacy|1|1.0) printf '1.0' ;;
         1.5)                                  printf '1.5' ;;
         2|2.0)                                printf '2.0' ;;
+        3|3.0)                                printf '3.0' ;;
+        3.1)                                  printf '3.1' ;;
         *) return 1 ;;
     esac
 }
@@ -294,6 +340,8 @@ awg_protocol_params() {
         1.0) printf 'JC JMIN JMAX S1 S2 H1 H2 H3 H4' ;;
         1.5) printf 'JC JMIN JMAX S1 S2 H1 H2 H3 H4 I1' ;;
         2.0) printf 'JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1' ;;
+        3.0) printf 'JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1 HEADER_PROTECTION_KEY CONTENT_PADDING_ADDITION REKEY_AFTER_TIME REKEY_TIMEOUT REJECT_AFTER_TIME KEEPALIVE_TIMEOUT MAX_HANDSHAKE_ATTEMPTS' ;;
+        3.1) printf 'JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1 HEADER_PROTECTION_KEY CONTENT_PADDING_ADDITION REKEY_AFTER_TIME REKEY_TIMEOUT REJECT_AFTER_TIME KEEPALIVE_TIMEOUT MAX_HANDSHAKE_ATTEMPTS RANDOM_TRAILERS DISABLE_COOKIES' ;;
     esac
 }
 
@@ -303,14 +351,54 @@ awg_protocol_has() {
     return 1
 }
 
-# The .conf spelling of a parameter: Jc and Jmin are mixed case, the rest upper.
+# True when both ends of a tunnel have to carry the same value for a parameter.
+awg_param_shared() {
+    case " $AWG_SHARED_SUFFIXES " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# The .conf spelling of a parameter.
 awg_param_label() {
     case $1 in
         JC)   printf 'Jc' ;;
         JMIN) printf 'Jmin' ;;
         JMAX) printf 'Jmax' ;;
+        HEADER_PROTECTION_KEY)    printf 'HeaderProtectionKey' ;;
+        CONTENT_PADDING_ADDITION) printf 'ContentPaddingAddition' ;;
+        REKEY_AFTER_TIME)         printf 'RekeyAfterTime' ;;
+        REKEY_TIMEOUT)            printf 'RekeyTimeout' ;;
+        REJECT_AFTER_TIME)        printf 'RejectAfterTime' ;;
+        KEEPALIVE_TIMEOUT)        printf 'KeepaliveTimeout' ;;
+        MAX_HANDSHAKE_ATTEMPTS)   printf 'MaxHandshakeAttempts' ;;
+        RANDOM_TRAILERS)          printf 'RandomTrailers' ;;
+        DISABLE_COOKIES)          printf 'DisableCookies' ;;
         *)    printf '%s' "$1" ;;
     esac
+}
+
+# A switch in the one spelling amneziawg-tools reads. The exit node list is JSON,
+# where the natural way to write one is `true`, which the tools refuse.
+awg_switch() {
+    case $(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]') in
+        on|true|yes|1)  printf 'on' ;;
+        off|false|no|0) printf 'off' ;;
+        *) return 1 ;;
+    esac
+}
+
+# True when the padding held in the variable named $1 has to be generated afresh:
+# unset, not a number, or below the floor ($2) the generation's header protection
+# needs.
+awg_padding_unusable() {
+    local name=$1 floor=${2:-0} value
+    value=${!name:-}
+    case $value in
+        '') return 0 ;;
+        *[!0-9]*) log "${name}=${value} is not a padding length; generating one"; return 0 ;;
+    esac
+    [ "$value" -ge "$floor" ] && return 1
+    log "${name}=${value} is below the ${floor} bytes header protection needs; generating one"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -356,7 +444,8 @@ awg_cps_spec() {
 
 # Fills in every parameter the generation needs and clears the ones it must not
 # carry, so switching a running node down from 2.0 to 1.0 really does stop
-# advertising S3, S4 and I1. The prefix keeps independent profiles per interface
+# advertising S3, S4 and I1 — or from 3.1 to 2.0 its header protection key, which a
+# 2.0 peer would read as garbage. The prefix keeps independent profiles per interface
 # (AWG_ for the server interface, NODE_ for one cascade uplink). The third argument
 # says what sits at the far end — app clients or another node — which decides how
 # much padding is safe to hand out.
@@ -384,12 +473,18 @@ generate_obfuscation() {
     local s1="${p}S1" s2="${p}S2" s3="${p}S3" s4="${p}S4"
     local h1="${p}H1" h2="${p}H2" h3="${p}H3" h4="${p}H4" i1="${p}I1"
 
+    # Under header protection a padding below the cipher's nonce is not something
+    # the far end can be asked to honour — amneziawg-go refuses the whole profile —
+    # so one that is too small is replaced like one that is missing.
+    local floor=0
+    awg_protocol_has "$protocol" HEADER_PROTECTION_KEY && floor=$AWG_HEADER_PROTECTION_MIN_PADDING
+
     [ -n "${!jc:-}" ]   || printf -v "$jc"   '%s' "$(rand_range 3 10)"
     [ -n "${!jmin:-}" ] || printf -v "$jmin" '%s' "50"
     [ -n "${!jmax:-}" ] || printf -v "$jmax" '%s' "1000"
-    [ -n "${!s1:-}" ]   || printf -v "$s1"   '%s' "$(rand_range 15 150)"
+    awg_padding_unusable "$s1" "$floor" && printf -v "$s1" '%s' "$(rand_range 15 150)"
 
-    if [ -z "${!s2:-}" ]; then
+    if awg_padding_unusable "$s2" "$floor"; then
         local candidate
         while :; do
             candidate=$(rand_range 15 150)
@@ -402,19 +497,45 @@ generate_obfuscation() {
 
     if awg_protocol_has "$protocol" S3; then
         # S3 and S4 pad the cookie reply and every transport packet, so both ends have
-        # to agree on them. The AmneziaVPN app drops them while importing a profile, so
-        # an interface app clients dial pads by zero — otherwise the handshake still
-        # completes and every transport packet the app sends is discarded as malformed,
-        # which looks exactly like a tunnel that connects and carries nothing. A
-        # node-to-node hop runs amneziawg-go at both ends, which honours them, and that
-        # is the hop worth obfuscating anyway.
-        if [ "$peers" = clients ]; then
+        # to agree on them. The AmneziaVPN 4.x app drops them while importing a 2.0
+        # profile, so an interface app clients dial pads by zero there — otherwise the
+        # handshake still completes and every transport packet the app sends is
+        # discarded as malformed, which looks exactly like a tunnel that connects and
+        # carries nothing. A node-to-node hop runs amneziawg-go at both ends, which
+        # honours them, and that is the hop worth obfuscating anyway.
+        #
+        # 3.x has no zero to fall back on, and needs none: every app release that
+        # speaks it pads all four messages itself.
+        if [ "$peers" = clients ] && [ "$floor" -eq 0 ]; then
             [ -n "${!s3:-}" ] || printf -v "$s3" '%s' '0'
             [ -n "${!s4:-}" ] || printf -v "$s4" '%s' '0'
         else
-            [ -n "${!s3:-}" ] || printf -v "$s3" '%s' "$(rand_range 8 55)"
-            [ -n "${!s4:-}" ] || printf -v "$s4" '%s' "$(rand_range 4 27)"
+            awg_padding_unusable "$s3" "$floor" \
+                && printf -v "$s3" '%s' "$(rand_range "$(( floor > 8 ? floor : 8 ))" 55)"
+            awg_padding_unusable "$s4" "$floor" \
+                && printf -v "$s4" '%s' "$(rand_range "$(( floor > 4 ? floor : 4 ))" 27)"
         fi
+    fi
+
+    if awg_protocol_has "$protocol" HEADER_PROTECTION_KEY; then
+        local hpk="${p}HEADER_PROTECTION_KEY" timing
+        [ -n "${!hpk:-}" ] || printf -v "$hpk" '%s' "$(awg_random_key)"
+        for timing in $AWG_TIMINGS; do
+            name="${p}${timing}"
+            [ -n "${!name:-}" ] || printf -v "$name" '%s' "$(awg_timing_default "$timing")"
+        done
+    fi
+
+    if awg_protocol_has "$protocol" RANDOM_TRAILERS; then
+        local switch value
+        for switch in RANDOM_TRAILERS DISABLE_COOKIES; do
+            name="${p}${switch}"
+            if ! value=$(awg_switch "${!name:-on}"); then
+                log "$(awg_param_label "$switch") takes on or off, not '${!name}'; using on"
+                value=on
+            fi
+            printf -v "$name" '%s' "$value"
+        done
     fi
 
     local seen="" value

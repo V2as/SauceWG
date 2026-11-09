@@ -291,6 +291,8 @@ class ExitNode(BaseModel):
     # Which AmneziaWG generation this uplink speaks. The exit node decides, since it
     # is the end that answers the handshake.
     protocol: str | None = None
+    # True when an operator chose that generation, so the fleet upgrade leaves it.
+    protocol_pinned: bool = False
     # True when the panel installed this node and can reach it over SSH again.
     managed: bool = False
     ssh_host: str | None = None
@@ -342,6 +344,9 @@ class ExitNodeList(BaseModel):
     # False when the panel cannot edit the list, e.g. NODE_PROVISION_ENABLED=false
     # or ./config is not mounted read-write.
     provisioning: bool = False
+    # The AmneziaWG generations this entry node's own image can build an uplink on,
+    # which bounds what an exit node can be put on.
+    protocols: list[str] = Field(default_factory=list)
     # Which families the link to the exit nodes carries, and how they are dialled.
     bridge: CascadeBridge = Field(default_factory=CascadeBridge)
     nodes: list[ExitNode]
@@ -442,6 +447,17 @@ class ExitNodeAdopt(BaseModel):
     # Signature packets are sender-side, so these are only carried so that a node
     # keeps the disguise it was installed with across a reload.
     i1: str | None = Field(default=None, max_length=1024)
+    # AmneziaWG 3.x. The header protection key and RandomTrailers have to match the
+    # exit node's; the rest are this end's own and default when omitted.
+    header_protection_key: str | None = Field(default=None, max_length=128, repr=False)
+    content_padding_addition: str | None = Field(default=None, max_length=32)
+    rekey_after_time: str | None = Field(default=None, max_length=32)
+    rekey_timeout: str | None = Field(default=None, max_length=32)
+    reject_after_time: str | None = Field(default=None, max_length=32)
+    keepalive_timeout: str | None = Field(default=None, max_length=32)
+    max_handshake_attempts: str | None = Field(default=None, max_length=32)
+    random_trailers: str | None = None
+    disable_cookies: str | None = None
     note: str | None = Field(default=None, max_length=512)
 
     @field_validator("protocol")
@@ -453,6 +469,50 @@ class ExitNodeAdopt(BaseModel):
     @classmethod
     def _family(cls, v: str | None) -> str | None:
         return _normalize_family(v)
+
+    @field_validator(
+        "content_padding_addition",
+        "rekey_after_time",
+        "rekey_timeout",
+        "reject_after_time",
+        "keepalive_timeout",
+        "max_handshake_attempts",
+        mode="before",
+    )
+    @classmethod
+    def _timing(cls, v: object) -> str | None:
+        # A pairing object prints a fixed value as a number and a range as a string.
+        return None if v is None else str(v).strip() or None
+
+    @field_validator("random_trailers", "disable_cookies", mode="before")
+    @classmethod
+    def _switch(cls, v: object) -> str | None:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        value = proto.switch(v)
+        if value is None:
+            raise ValueError(f"takes on or off, not {v!r}")
+        return value
+
+    @model_validator(mode="after")
+    def _header_protection(self) -> "ExitNodeAdopt":
+        """Refuses a 3.x profile amneziawg-go would refuse, before it reaches a reload."""
+        if self.protocol and proto.protects_headers(self.protocol) and not self.header_protection_key:
+            raise ValueError(
+                f"AmneziaWG {self.protocol} needs the exit node's header_protection_key"
+            )
+        if self.header_protection_key:
+            floor = proto.HEADER_PROTECTION_MIN_PADDING
+            short = [
+                f"s{index}"
+                for index, value in enumerate((self.s1, self.s2, self.s3, self.s4), start=1)
+                if value is not None and value < floor
+            ]
+            if short:
+                raise ValueError(
+                    f"{', '.join(short)} must be at least {floor} under header protection"
+                )
+        return self
 
     @model_validator(mode="after")
     def _one_endpoint(self) -> "ExitNodeAdopt":
@@ -911,6 +971,66 @@ class NodeUpgradeRequest(NodeCredentials):
     # Which image tag to move the exit node to. Omitted keeps the tag the panel
     # itself installs, so a fleet stays on one release.
     tag: str | None = Field(default=None, max_length=128)
+
+
+class FleetUpgradeRequest(BaseModel):
+    """Walks every managed exit node onto this panel's release, one at a time."""
+
+    # The generation to move nodes onto once they run this release. Omitted takes
+    # NODE_UPGRADE_PROTOCOL; a node an operator put on a generation by hand is left
+    # there either way.
+    protocol: str | None = Field(default=None, description=f"one of: {', '.join(proto.PROTOCOLS)}")
+    # Upgrades the release only, leaving every node on the generation it speaks.
+    keep_protocol: bool = False
+
+    @field_validator("protocol")
+    @classmethod
+    def _protocol(cls, v: str | None) -> str | None:
+        try:
+            return proto.normalize_or_none(v)
+        except proto.UnknownProtocol as exc:
+            raise ValueError(str(exc)) from None
+
+
+class FleetNodeOutcome(BaseModel):
+    name: str
+    #: current, upgraded, skipped, unreachable or failed.
+    status: str
+    detail: str = ""
+    version_before: str | None = None
+    version_after: str | None = None
+    protocol_before: str | None = None
+    protocol_after: str | None = None
+    healthy: bool | None = None
+    #: The panel tries this node again by itself.
+    pending: bool = False
+
+
+class FleetReport(BaseModel):
+    ok: bool
+    running: bool
+    #: Who started it: "update" (`saucewg update`), "cli" (`saucewg upgrade-nodes`),
+    #: "startup" or "panel".
+    origin: str = "panel"
+    release: str
+    protocol: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    current: str | None = None
+    halted: str | None = None
+    error: str | None = None
+    nodes: list[FleetNodeOutcome] = []
+
+
+class FleetStatus(BaseModel):
+    #: The release the walk takes nodes to, which is this panel's own.
+    release: str
+    #: The generation it moves them onto, or null for none.
+    protocol: str | None = None
+    #: Whether the panel walks the fleet by itself after it starts.
+    auto: bool
+    running: bool
+    last: FleetReport | None = None
 
 
 class TaskLogLine(BaseModel):

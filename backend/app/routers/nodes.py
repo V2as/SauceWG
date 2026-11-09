@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
 
+from .. import __version__
 from ..awg import protocol as awg_protocol
 from ..awg import registry
 from ..awg.uplinks import AUTO, MANUAL, ExitNodeState, load_uplink_state, write_control
@@ -24,6 +25,9 @@ from ..schemas import (
     ExitNodeList,
     ExitNodeProtocolChange,
     ExitNodeUpdate,
+    FleetReport,
+    FleetStatus,
+    FleetUpgradeRequest,
     NodeCheck,
     NodeCheckResult,
     NodeContainer,
@@ -37,7 +41,7 @@ from ..schemas import (
     TaskLogLine,
     TaskOut,
 )
-from ..services import identity, provision, recovery
+from ..services import cascade, fleet, identity, provision, recovery
 from ..services.tasks import Task, detached, tasks
 
 logger = logging.getLogger(__name__)
@@ -110,6 +114,7 @@ def _serialise(
         # The running interface is the authority; the registry entry is only what was
         # asked for, and an older node container reports neither.
         protocol=node.protocol or meta.get("protocol") or None,
+        protocol_pinned=bool(meta.get("keep_protocol")),
         managed=bool(meta.get("managed")),
         ssh_host=meta.get("ssh_host"),
         ssh_port=meta.get("ssh_port"),
@@ -141,6 +146,7 @@ def _snapshot(mode: str | None = None, pinned: str | None = None) -> ExitNodeLis
         updated_at=state.updated_at,
         config_error=registry.config_error(),
         provisioning=registry.writable(),
+        protocols=list(state.generations),
         bridge=CascadeBridge(
             subnet=state.bridge.subnet,
             subnet6=state.bridge.subnet6,
@@ -202,35 +208,16 @@ def _reject_if_busy(name: str) -> None:
             status_code=status.HTTP_409_CONFLICT,
             detail=f"another operation on {name!r} is still running (task {running.id})",
         )
+    # The fleet upgrade may be running in `saucewg update` rather than in this
+    # process, so it is asked for directly rather than looked up as a task.
+    if fleet.running():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="the exit nodes are being upgraded one at a time; wait for that to finish",
+        )
 
 
-async def _apply_and_wait(task: Task) -> None:
-    """Publishes the current list and waits for the node container to apply it."""
-    task.begin("Reloading the cascade")
-    request_id = registry.request_reload()
-
-    deadline = settings.node_reload_timeout_seconds
-    for tick in range(deadline * 2):
-        if registry.reload_applied(request_id):
-            error = registry.config_error()
-            if error:
-                raise provision.ProvisionError(f"the node container rejected the list: {error}")
-            task.emit("the node applied the new exit node list")
-            return
-        # A running container refreshes its state every health tick, so state this
-        # old means it is stopped. It reads the list on startup anyway, and waiting
-        # out the full timeout would only turn a saved change into a failure.
-        if tick == 10 and load_uplink_state().stale:
-            task.emit(
-                "the node container is not running; the exit node list is saved and "
-                "will be applied when it starts"
-            )
-            return
-        await asyncio.sleep(0.5)
-    raise provision.ProvisionError(
-        f"the node container did not apply the new list within {deadline}s; "
-        f"check `saucewg logs awg`"
-    )
+_apply_and_wait = cascade.apply_and_wait
 
 
 async def _wait_for_uplink_key(task: Task, name: str, timeout: int = 60) -> str:
@@ -393,21 +380,47 @@ def _find_or_404(name: str) -> dict[str, Any]:
     return node
 
 
-def _copy_profile(reported: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
-    """Carries an exit node's obfuscation profile into its registry entry.
+_copy_profile = cascade.copy_profile
 
-    S1-S4 and H1-H4 have to be repeated on the entry side because both ends of a
-    tunnel must pad and label packets identically. Recording the generation alongside
-    them is what keeps a later reload from rebuilding the uplink as something else.
+
+def _servable(protocol: str | None) -> str | None:
+    """The generation to build an exit node's uplink with, checked against this end.
+
+    An exit node can only be put on a generation this entry node's own container
+    speaks: an uplink it cannot build is a node the cascade loses. With nothing asked
+    for, a new node gets the newest generation both ends speak rather than whatever
+    the installer defaults to.
     """
-    if reported.get("protocol"):
-        entry["protocol"] = reported["protocol"]
-    for name in awg_protocol.ALL_PARAMS:
-        key = name.lower()
-        value = reported.get(key)
-        if value is not None and str(value) != "":
-            entry[key] = value
-    return entry
+    state = load_uplink_state()
+    if state.stale:
+        return protocol
+    speaks = [item for item in awg_protocol.PROTOCOLS if item in state.generations]
+    if protocol:
+        if protocol not in speaks:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"this entry node's own image speaks AmneziaWG {', '.join(speaks)} "
+                    f"only; run `saucewg update` here before putting an exit node on {protocol}"
+                ),
+            )
+        return protocol
+    if not speaks or awg_protocol.LATEST_PROTOCOL in speaks:
+        return None
+    return speaks[-1]
+
+
+def _pin_protocol(entry: dict[str, Any], protocol: str | None) -> None:
+    """Records whether an operator chose this node's generation by hand.
+
+    The fleet upgrade moves nodes onto the newest generation, and must not undo a
+    deliberate choice of an older one. Choosing the newest is no choice to protect:
+    it is where the node would be taken anyway.
+    """
+    if protocol and protocol != awg_protocol.LATEST_PROTOCOL:
+        entry["keep_protocol"] = True
+    else:
+        entry.pop("keep_protocol", None)
 
 
 def _bridge_subnet6(requested: str | None) -> str:
@@ -462,6 +475,54 @@ async def read_task(task_id: str, _: AdminDep) -> TaskOut:
     task = tasks.get(task_id)
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown task")
+    return _task_out(task)
+
+
+# ---------------------------------------------------------------------------
+# Keeping the fleet on this release
+# ---------------------------------------------------------------------------
+
+
+@router.get("/fleet", response_model=FleetStatus)
+async def read_fleet(_: AdminDep) -> FleetStatus:
+    """Where the walk of the exit nodes onto this panel's release stands.
+
+    ``last`` is the walk under way, or how the last one ended — including one that
+    `saucewg update` ran, which never shows up as a panel task.
+    """
+    try:
+        protocol = fleet.target_protocol(None)
+    except awg_protocol.UnknownProtocol:
+        protocol = None
+    last = fleet.last_report()
+    return FleetStatus(
+        release=__version__,
+        protocol=protocol,
+        auto=settings.node_auto_upgrade,
+        running=fleet.running(),
+        last=FleetReport.model_validate(last) if last else None,
+    )
+
+
+@router.post("/upgrade", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED)
+async def upgrade_fleet(admin: SudoAdminDep, payload: FleetUpgradeRequest | None = None) -> TaskOut:
+    """Upgrades every exit node the panel manages, one at a time.
+
+    Standbys go first; the node carrying traffic goes last, after traffic has been
+    moved to one that is already upgraded. A node that was healthy and does not come
+    back stops the walk. Nodes the panel cannot reach unattended are listed in the
+    result rather than touched.
+    """
+    _require_provision_enabled()
+    payload = payload or FleetUpgradeRequest()
+    protocol = "" if payload.keep_protocol else payload.protocol
+    if protocol:
+        _servable(protocol)
+    logger.info("admin %s is upgrading every exit node", admin.username)
+    try:
+        task = fleet.start(origin="panel", protocol=protocol)
+    except fleet.FleetBusy as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     return _task_out(task)
 
 
@@ -570,6 +631,7 @@ async def create_node(payload: ExitNodeCreate, admin: SudoAdminDep) -> TaskOut:
         )
 
     credentials = _credentials_from(payload)
+    protocol = _servable(payload.protocol)
     logger.info("admin %s is installing exit node %s on %s", admin.username, payload.name, payload.host)
 
     async def work(task: Task) -> None:
@@ -583,7 +645,7 @@ async def create_node(payload: ExitNodeCreate, admin: SudoAdminDep) -> TaskOut:
             # cascade. An entry node with no IPv6 half passes nothing either way.
             subnet6=_bridge_subnet6(payload.subnet6),
             preshared_key=payload.preshared_key,
-            protocol=payload.protocol,
+            protocol=protocol,
             signature=payload.signature,
         )
         node = await provision.install_exit_node(task, request)
@@ -610,6 +672,7 @@ async def create_node(payload: ExitNodeCreate, admin: SudoAdminDep) -> TaskOut:
             if node.get(key):
                 entry[key] = node[key]
         _copy_profile(node, entry)
+        _pin_protocol(entry, payload.protocol)
         if payload.preshared_key:
             entry["preshared_key"] = payload.preshared_key
         if payload.family:
@@ -669,29 +732,13 @@ async def create_node(payload: ExitNodeCreate, admin: SudoAdminDep) -> TaskOut:
 
 
 async def _await_handshake(task: Task, name: str, timeout: int = 90) -> bool:
-    """True once the node container reports a live handshake on that uplink."""
-    for _ in range(timeout):
-        state = load_uplink_state()
-        node = state.get(name)
-        if node is not None and node.last_handshake is not None:
-            return True
-        await asyncio.sleep(1)
-    return False
+    return await cascade.await_handshake(name, timeout)
 
 
-async def _await_health(task: Task, name: str, timeout: int = 120) -> bool:
-    """True once an uplink that already existed is passing health checks again.
-
-    A restart or an upgrade leaves the last handshake time in place, so recovery has
-    to be read from the health flag the node container maintains rather than from
-    the fact that a handshake once happened.
-    """
-    for _ in range(timeout):
-        node = load_uplink_state().get(name)
-        if node is not None and node.healthy:
-            return True
-        await asyncio.sleep(1)
-    return False
+async def _await_health(
+    task: Task, name: str, timeout: int = 120, since: datetime | None = None
+) -> bool:
+    return await cascade.await_health(name, timeout, since=since)
 
 
 @router.post("/adopt", response_model=ExitNodeList, status_code=status.HTTP_201_CREATED)
@@ -702,6 +749,7 @@ async def adopt_node(payload: ExitNodeAdopt, admin: SudoAdminDep) -> ExitNodeLis
     the entry node generates in return still has to be installed on that server.
     """
     _require_provisioning()
+    _servable(payload.protocol)
     try:
         nodes = registry.load_nodes()
     except registry.RegistryError as exc:
@@ -735,6 +783,7 @@ async def update_node(name: str, payload: ExitNodeUpdate, admin: SudoAdminDep) -
     """
     _require_provisioning()
     _reject_if_busy(name)
+    _servable(payload.protocol)
     try:
         nodes = registry.load_nodes()
         node = registry.find(nodes, name)
@@ -745,6 +794,8 @@ async def update_node(name: str, payload: ExitNodeUpdate, admin: SudoAdminDep) -
         changes = payload.model_dump(exclude_none=True)
         if not changes:
             return _snapshot()
+        if "protocol" in changes:
+            _pin_protocol(node, changes["protocol"])
         # "none" is a removal, so it is popped rather than stored. Refused when it
         # would leave the node with no address to dial at all, which is a node the
         # cascade can only report as permanently down.
@@ -918,10 +969,12 @@ async def change_node_protocol(
 ) -> TaskOut:
     """Moves one exit node, and the uplink to it, to another AmneziaWG generation.
 
-    The two ends have to agree on S1-S4 and H1-H4, so the exit node is reconfigured
-    first and the uplink is then rebuilt with the profile it reports back. The tunnel
-    is down for the few seconds in between, which is why this is a task rather than a
-    plain edit.
+    The two ends have to agree on S1-S4 and H1-H4 (and under 3.x on the header
+    protection key and RandomTrailers), so the exit node is reconfigured first and
+    the uplink is then rebuilt with the profile it reports back. The tunnel is down
+    for the few seconds in between, which is why this is a task rather than a plain
+    edit. Choosing a generation older than the newest pins the node to it, so the
+    fleet upgrade leaves it there.
     """
     _require_provisioning()
     _reject_if_busy(name)
@@ -934,6 +987,7 @@ async def change_node_protocol(
             f"changed from here. Run `saucewg set-protocol {payload.protocol}` on that "
             f"server and re-adopt it with the profile it prints.",
         )
+    _servable(payload.protocol)
     credentials = _credentials_for(node, payload)
 
     logger.info(
@@ -954,12 +1008,8 @@ async def change_node_protocol(
             raise provision.ProvisionError(
                 f"{name} was removed from the cascade while it was being reconfigured"
             )
-        # The old generation's parameters have to go, not just be overwritten: a
-        # leftover S3 would keep the uplink advertising 2.0 to a 1.0 exit node.
-        for param in awg_protocol.ALL_PARAMS:
-            entry.pop(param.lower(), None)
-        _copy_profile(reported, entry)
-        entry["protocol"] = payload.protocol
+        cascade.replace_profile(entry, reported, payload.protocol)
+        _pin_protocol(entry, payload.protocol)
         registry.save_nodes(current)
         await _apply_and_wait(task)
 
@@ -1143,10 +1193,11 @@ async def upgrade_node(
     async def work(task: Task) -> None:
         task.begin(f"Upgrading {name}")
         result = await provision.upgrade_exit_node(task, credentials, tag)
+        updated = datetime.now(timezone.utc)
         _remember_key(name, credentials)
 
         task.begin("Waiting for the tunnel")
-        healthy = await _await_health(task, name)
+        healthy = await _await_health(task, name, fleet.HEALTH_TIMEOUT, since=updated)
         task.result = {
             "name": name,
             "tag": result.get("tag") or tag,

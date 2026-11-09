@@ -13,14 +13,18 @@ import argparse
 import asyncio
 import json
 import sys
+import uuid
 
 from sqlalchemy import select
 
+from .awg.protocol import UnknownProtocol
 from .awg.uplinks import load_uplink_state
 from .db import SessionLocal, init_db
 from .models import Admin
 from .security import hash_password
-from .services import recovery
+from .services import fleet, recovery
+from .services.provision import ProvisionError
+from .services.tasks import Task
 
 
 async def _set_password(username: str, password: str, sudo: bool) -> dict[str, object]:
@@ -75,6 +79,31 @@ async def _recover(names: list[str]) -> list[dict[str, object]]:
     return out
 
 
+class _Printed(Task):
+    """A task whose progress goes to stderr as it happens, for an operator watching."""
+
+    def emit(self, text: str) -> None:
+        super().emit(text)
+        line = text.rstrip()
+        if line:
+            print(line, file=sys.stderr, flush=True)
+
+
+async def _upgrade_nodes(names: list[str], protocol: str | None, origin: str) -> dict[str, object]:
+    """Walks the exit nodes onto this release: the same walk the panel runs itself.
+
+    It runs here rather than through the API because `saucewg update` calls it the
+    moment the new panel answers, before anyone has logged in to it.
+    """
+    task = _Printed(id=uuid.uuid4().hex, action="upgrade-fleet", target=fleet.TARGET)
+    try:
+        return await fleet.upgrade(task, names=names or None, protocol=protocol, origin=origin)
+    except fleet.FleetBusy as exc:
+        return {"ok": False, "running": True, "error": str(exc), "nodes": []}
+    except ProvisionError as exc:
+        return {"ok": False, "running": False, "error": str(exc), "nodes": []}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="app.cli", description="SauceWG panel administration")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -93,6 +122,19 @@ def main(argv: list[str] | None = None) -> int:
 
     recover = sub.add_parser("recover", help="try to bring unhealthy exit nodes back")
     recover.add_argument("names", nargs="*", help="node names; defaults to every unhealthy node")
+
+    upgrade = sub.add_parser(
+        "upgrade-nodes", help="move every managed exit node to this release, one at a time"
+    )
+    upgrade.add_argument("names", nargs="*", help="node names; defaults to every exit node")
+    generation = upgrade.add_mutually_exclusive_group()
+    generation.add_argument(
+        "--protocol", help="the AmneziaWG generation to move nodes onto (default: NODE_UPGRADE_PROTOCOL)"
+    )
+    generation.add_argument(
+        "--keep-protocol", action="store_true", help="upgrade the release only"
+    )
+    upgrade.add_argument("--origin", default="cli", help=argparse.SUPPRESS)
 
     args = parser.parse_args(argv)
 
@@ -116,6 +158,16 @@ def main(argv: list[str] | None = None) -> int:
         # Non-zero when a node is still down, so a cron or a bot can tell without
         # parsing. An empty fleet of unhealthy nodes is a success.
         return 0 if all(row.get("healthy") for row in results) else 1
+
+    if args.command == "upgrade-nodes":
+        protocol = "" if args.keep_protocol else args.protocol
+        try:
+            fleet.target_protocol(protocol)
+        except UnknownProtocol as exc:
+            parser.error(str(exc))
+        report = asyncio.run(_upgrade_nodes(args.names, protocol, args.origin))
+        print(json.dumps(report, indent=2))
+        return 0 if report.get("ok") else 1
 
     parser.error(f"unknown command {args.command}")
     return 2

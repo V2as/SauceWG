@@ -583,6 +583,13 @@ node_v() {
         "$1" "$2" "$1" "$3" "$4" "$5"
 }
 
+# A 3.x exit node as its pairing object describes it: the header protection key and
+# RandomTrailers are shared like S1-S4, so they travel in the list with them.
+node_v3() {
+    printf '{"name":"%s","endpoint":"%s","public_key":"KEY-%s","address":"10.77.0.%s/32","priority":%s,"protocol":"%s","s1":20,"s2":31,"s3":17,"s4":12,"h1":"100-200","h2":"300-400","h3":"500-600","h4":"700-800","header_protection_key":"%s","random_trailers":false}' \
+        "$1" "$2" "$1" "$3" "$4" "$5" "$6"
+}
+
 # An exit node reachable over both families, which is what gives the endpoint
 # choice something to choose between.
 node_both() {
@@ -635,6 +642,18 @@ conf_params() {
     [ -n "${iface:-}" ] || { printf 'missing'; return; }
     sed -n 's/^\([A-Za-z0-9]*\) = .*/\1/p' "${AWG_CONFIG_DIR}/${iface}.conf" \
         | grep -Ex 'Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5]' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# The same for the parameters AmneziaWG 3.x added.
+conf_v3() {
+    local i iface
+    for i in "${!UP_NAME[@]}"; do
+        [ "${UP_NAME[$i]}" = "$1" ] && iface=${UP_IFACE[$i]}
+    done
+    [ -n "${iface:-}" ] || { printf 'missing'; return; }
+    sed -n 's/^\([A-Za-z0-9]*\) = .*/\1/p' "${AWG_CONFIG_DIR}/${iface}.conf" \
+        | grep -Ex 'HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies' \
+        | tr '\n' ' ' | sed 's/ $//'
 }
 
 conf_value() {
@@ -978,7 +997,7 @@ check "S3, S4 and I1 are gone again" "Jc Jmin Jmax S1 S2 H1 H2 H3 H4" "$(conf_pa
 check "and the generation is recorded as 1.0" "1.0" "$(protocol_of v-one)"
 
 echo "15. an unusable generation falls back instead of dropping the uplink"
-nodes "[$(node_v v-one 198.51.100.20:51820 2 10 3.0)]"
+nodes "[$(node_v v-one 198.51.100.20:51820 2 10 4.0)]"
 uplinks_reload
 check "the uplink is still up" "true" "$([ "$(pid_of v-one)" -gt 0 ] && echo true || echo false)"
 check "on 1.0, which every client can load" "1.0" "$(protocol_of v-one)"
@@ -997,6 +1016,31 @@ uplinks_reload
 uplinks_write_state
 check "and it survives a no-op reload" "2.0" \
     "$(jq -r '.nodes[] | select(.name == "v-one") | .protocol' "$UPLINK_STATE_FILE")"
+check "so is every generation this container can build" "1.0 1.5 2.0 3.0 3.1" \
+    "$(AWG_GENERATIONS="1.0 1.5 2.0 3.0 3.1" uplinks_write_state; jq -r '.generations | join(" ")' "$UPLINK_STATE_FILE")"
+
+echo "16b. a 3.x uplink adds header protection, its timers and, on 3.1, two switches"
+nodes "[$(node_v3 v-three 198.51.100.21:51820 6 50 3.0 HPK-THREE),$(node_v3 v-three1 198.51.100.22:51820 7 60 3.1 HPK-THREE-ONE)]"
+uplinks_reload
+check "3.0 is applied as asked" "3.0" "$(protocol_of v-three)"
+check "3.1 is applied as asked" "3.1" "$(protocol_of v-three1)"
+check "3.0 keeps everything 2.0 carries" "Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1" "$(conf_params v-three)"
+check "and adds header protection and the timers" \
+    "HeaderProtectionKey RekeyAfterTime RekeyTimeout RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts" \
+    "$(conf_v3 v-three)"
+check "3.1 adds RandomTrailers and DisableCookies" \
+    "HeaderProtectionKey RekeyAfterTime RekeyTimeout RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts RandomTrailers DisableCookies" \
+    "$(conf_v3 v-three1)"
+# Both ends encrypt the headers with the same key and agree on trailers, so these
+# come from the exit node like S1-S4 do — a key made up here never handshakes.
+check "the key is the exit node's" "HPK-THREE-ONE" "$(conf_value v-three1 HeaderProtectionKey)"
+check "so is RandomTrailers, in the spelling the tools read" "off" "$(conf_value v-three1 RandomTrailers)"
+check "so is the padding" "20 31 17 12" \
+    "$(conf_value v-three1 S1) $(conf_value v-three1 S2) $(conf_value v-three1 S3) $(conf_value v-three1 S4)"
+check "the timers are this end's own, drawn from AmneziaVPN's ranges" "100-120" \
+    "$(conf_value v-three1 RekeyAfterTime)"
+uplinks_write_state
+check "the generation is published" "3.1" "$(node_field v-three1 protocol)"
 
 echo "17. a healthy uplink carries client traffic through the cascade"
 nodes "[$(node eu-nl 198.51.100.20:51820 2 10),$(node eu-de 203.0.113.31:51820 3 20)]"

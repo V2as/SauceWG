@@ -5,12 +5,12 @@ name: ${COMPOSE_PROJECT_NAME:-saucewg-exit}
 
 services:
   awg:
-    image: ${IMAGE_AWG:-saucewg/awg:1.5.1}
+    image: ${IMAGE_AWG:-saucewg/awg:1.6.0}
     build:
       context: ./docker/awg
       args:
-        AWG_GO_REF: ${AWG_GO_REF:-v0.2.19}
-        AWG_TOOLS_REF: ${AWG_TOOLS_REF:-v1.0.20260618-2}
+        AWG_GO_REF: ${AWG_GO_REF:-v3.1.20260828}
+        AWG_TOOLS_REF: ${AWG_TOOLS_REF:-v3.1.20260812}
     restart: unless-stopped
     network_mode: host
     cap_add: [NET_ADMIN, NET_RAW]
@@ -29,9 +29,9 @@ services:
       AWG_SUBNET6: ${AWG_SUBNET6:-}
       AWG_MTU: ${AWG_MTU:-1420}
       AWG_PRIVATE_KEY: ${AWG_PRIVATE_KEY:-}
-      # 1.0, 1.5 or 2.0. The entry node has to be told which one this is, since both
-      # ends of the uplink must pad and label packets the same way; `saucewg node-info`
-      # prints the object that carries it.
+      # 1.0, 1.5, 2.0, 3.0 or 3.1. The entry node has to be told which one this is,
+      # since both ends of the uplink must pad and label packets the same way;
+      # `saucewg node-info` prints the object that carries it.
       AWG_PROTOCOL: ${AWG_PROTOCOL:-}
       AWG_JC: ${AWG_JC:-}
       AWG_JMIN: ${AWG_JMIN:-}
@@ -49,6 +49,17 @@ services:
       AWG_I3: ${AWG_I3:-}
       AWG_I4: ${AWG_I4:-}
       AWG_I5: ${AWG_I5:-}
+      # 3.x. The header protection key and RandomTrailers are shared with the entry
+      # node; the rest is this end's own.
+      AWG_HEADER_PROTECTION_KEY: ${AWG_HEADER_PROTECTION_KEY:-}
+      AWG_CONTENT_PADDING_ADDITION: ${AWG_CONTENT_PADDING_ADDITION:-}
+      AWG_REKEY_AFTER_TIME: ${AWG_REKEY_AFTER_TIME:-}
+      AWG_REKEY_TIMEOUT: ${AWG_REKEY_TIMEOUT:-}
+      AWG_REJECT_AFTER_TIME: ${AWG_REJECT_AFTER_TIME:-}
+      AWG_KEEPALIVE_TIMEOUT: ${AWG_KEEPALIVE_TIMEOUT:-}
+      AWG_MAX_HANDSHAKE_ATTEMPTS: ${AWG_MAX_HANDSHAKE_ATTEMPTS:-}
+      AWG_RANDOM_TRAILERS: ${AWG_RANDOM_TRAILERS:-}
+      AWG_DISABLE_COOKIES: ${AWG_DISABLE_COOKIES:-}
       AWG_PEER_PUBLIC_KEY: ${AWG_PEER_PUBLIC_KEY:-}
       AWG_PEER_PSK: ${AWG_PEER_PSK:-}
       # Set to dial the entry node from here instead of waiting to be dialled,

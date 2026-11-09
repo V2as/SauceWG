@@ -133,6 +133,17 @@ class TaskRegistry:
         self._running[task.id] = asyncio.create_task(runner())
         return task
 
+    async def run(self, action: str, target: str, work: Callable[[Task], Awaitable[None]]) -> Task:
+        """Starts a task and waits for it, for work that has a caller of its own.
+
+        It is still registered, so the panel shows its progress like any other.
+        """
+        task = self.start(action, target, work)
+        running = self._running.get(task.id)
+        if running is not None:
+            await running
+        return task
+
     def _prune(self) -> None:
         while len(self._order) > MAX_TASKS:
             # Drop the oldest *finished* task: one somebody is still polling has to

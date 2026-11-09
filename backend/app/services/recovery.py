@@ -44,7 +44,7 @@ from typing import Any
 from ..awg import registry
 from ..awg.uplinks import ExitNodeState, load_uplink_state
 from ..config import settings
-from ..services import identity, provision
+from ..services import fleet, identity, provision
 from ..services.tasks import detached, tasks
 
 logger = logging.getLogger(__name__)
@@ -138,7 +138,7 @@ def forget(name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _credentials(node: dict[str, Any]) -> provision.Credentials | None:
+def unattended_credentials(node: dict[str, Any]) -> provision.Credentials | None:
     """The way in, if the panel has one that needs no operator present.
 
     A node adopted by hand has no SSH address, and one installed before the panel
@@ -196,7 +196,7 @@ async def _healthy_within(name: str, timeout: int) -> bool:
 async def _recover(node: ExitNodeState, entry: dict[str, Any], attempt: Attempt) -> bool:
     """One escalating attempt at one node. True when the uplink came back."""
     name = node.name
-    credentials = _credentials(entry)
+    credentials = unattended_credentials(entry)
     if credentials is None:
         # Not a failure to record: there is no way in and no amount of retrying
         # creates one. The node simply is not ours to recover.
@@ -311,6 +311,10 @@ async def recover_now(name: str) -> dict[str, Any]:
     entry = next((item for item in registry.load_nodes() if item.get("name") == name), None)
     if node is None or entry is None:
         raise provision.ProvisionError(f"no exit node named {name!r}")
+    if fleet.running():
+        raise provision.ProvisionError(
+            "the exit nodes are being upgraded one at a time; try again once that finishes"
+        )
 
     attempt = _history.setdefault(name, Attempt(name=name))
     attempt.blocked = None
@@ -340,6 +344,10 @@ async def sweep() -> int:
     neither of which is improved by hurrying.
     """
     if not settings.node_recovery_enabled or not settings.node_provision_enabled:
+        return 0
+    # A node being upgraded is down on purpose for a minute or two, and restarting
+    # it halfway through would leave it on neither release.
+    if fleet.running():
         return 0
 
     state = load_uplink_state()
@@ -412,4 +420,12 @@ async def loop() -> None:
             logger.exception("exit node recovery iteration failed")
 
 
-__all__ = ["Attempt", "forget", "loop", "recover_now", "state", "sweep"]
+__all__ = [
+    "Attempt",
+    "forget",
+    "loop",
+    "recover_now",
+    "state",
+    "sweep",
+    "unattended_credentials",
+]

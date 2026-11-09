@@ -22,12 +22,12 @@ services:
 
   awg:
     <<: *restart
-    image: ${IMAGE_AWG:-saucewg/awg:1.5.1}
+    image: ${IMAGE_AWG:-saucewg/awg:1.6.0}
     build:
       context: ./docker/awg
       args:
-        AWG_GO_REF: ${AWG_GO_REF:-v0.2.19}
-        AWG_TOOLS_REF: ${AWG_TOOLS_REF:-v1.0.20260618-2}
+        AWG_GO_REF: ${AWG_GO_REF:-v3.1.20260828}
+        AWG_TOOLS_REF: ${AWG_TOOLS_REF:-v3.1.20260812}
     # The node manages interfaces, routes and NAT for the host, so it shares the
     # host network namespace instead of running behind a bridge.
     network_mode: host
@@ -41,9 +41,10 @@ services:
       AWG_SUBNET: ${AWG_SUBNET:-10.8.0.0/24}
       AWG_MTU: ${AWG_MTU:-1420}
       AWG_PRIVATE_KEY: ${AWG_PRIVATE_KEY:-}
-      # Which AmneziaWG generation this interface serves: 1.0, 1.5 or 2.0. Empty
-      # keeps whatever the interface already recorded, which is how an upgrade avoids
-      # moving live clients to a generation they do not speak.
+      # Which AmneziaWG generation this interface serves: 1.0, 1.5, 2.0, 3.0 or 3.1.
+      # Empty keeps whatever the interface already recorded, which is how an upgrade
+      # avoids moving live clients to a generation they do not speak. A stable
+      # KeeneticOS stops at 2.0; 3.x needs AmneziaVPN 5.0 or KeeneticOS 5.2 Alpha 11.
       AWG_PROTOCOL: ${AWG_PROTOCOL:-}
       # Obfuscation. Anything left empty is generated once and then persisted, and the
       # parameters the generation does not carry are cleared rather than kept.
@@ -52,23 +53,35 @@ services:
       AWG_JMAX: ${AWG_JMAX:-}
       AWG_S1: ${AWG_S1:-}
       AWG_S2: ${AWG_S2:-}
-      # 2.0 only.
+      # 2.0 and newer. Under 3.x every one of S1-S4 has to be at least 12.
       AWG_S3: ${AWG_S3:-}
       AWG_S4: ${AWG_S4:-}
       AWG_H1: ${AWG_H1:-}
       AWG_H2: ${AWG_H2:-}
       AWG_H3: ${AWG_H3:-}
       AWG_H4: ${AWG_H4:-}
-      # Signature packets, 1.5 and 2.0 only. A preset name (quic, dns, random, short,
+      # Signature packets, 1.5 and newer. A preset name (quic, dns, random, short,
       # none) or a literal spec; I2-I5 are optional extras.
       AWG_I1: ${AWG_I1:-}
       AWG_I2: ${AWG_I2:-}
       AWG_I3: ${AWG_I3:-}
       AWG_I4: ${AWG_I4:-}
       AWG_I5: ${AWG_I5:-}
+      # 3.0 and newer: the key packet headers are encrypted with, which both ends
+      # share, and this end's own padding and timers.
+      AWG_HEADER_PROTECTION_KEY: ${AWG_HEADER_PROTECTION_KEY:-}
+      AWG_CONTENT_PADDING_ADDITION: ${AWG_CONTENT_PADDING_ADDITION:-}
+      AWG_REKEY_AFTER_TIME: ${AWG_REKEY_AFTER_TIME:-}
+      AWG_REKEY_TIMEOUT: ${AWG_REKEY_TIMEOUT:-}
+      AWG_REJECT_AFTER_TIME: ${AWG_REJECT_AFTER_TIME:-}
+      AWG_KEEPALIVE_TIMEOUT: ${AWG_KEEPALIVE_TIMEOUT:-}
+      AWG_MAX_HANDSHAKE_ATTEMPTS: ${AWG_MAX_HANDSHAKE_ATTEMPTS:-}
+      # 3.1 only, on or off. RandomTrailers has to match at both ends.
+      AWG_RANDOM_TRAILERS: ${AWG_RANDOM_TRAILERS:-}
+      AWG_DISABLE_COOKIES: ${AWG_DISABLE_COOKIES:-}
       CASCADE_ENABLED: ${CASCADE_ENABLED:-true}
-      # Generation for an uplink whose exit node does not name one. Left at 1.0 so an
-      # existing cascade keeps working after an upgrade.
+      # Generation for an uplink whose exit node does not name one. Empty is 1.0, so
+      # an existing cascade keeps working after an upgrade; a fresh install writes 3.1.
       CASCADE_PROTOCOL_DEFAULT: ${CASCADE_PROTOCOL_DEFAULT:-}
       CASCADE_MTU: ${CASCADE_MTU:-1380}
       CASCADE_KEEPALIVE: ${CASCADE_KEEPALIVE:-25}
@@ -164,6 +177,15 @@ services:
       CASCADE_I3: ${CASCADE_I3:-}
       CASCADE_I4: ${CASCADE_I4:-}
       CASCADE_I5: ${CASCADE_I5:-}
+      CASCADE_HEADER_PROTECTION_KEY: ${CASCADE_HEADER_PROTECTION_KEY:-}
+      CASCADE_CONTENT_PADDING_ADDITION: ${CASCADE_CONTENT_PADDING_ADDITION:-}
+      CASCADE_REKEY_AFTER_TIME: ${CASCADE_REKEY_AFTER_TIME:-}
+      CASCADE_REKEY_TIMEOUT: ${CASCADE_REKEY_TIMEOUT:-}
+      CASCADE_REJECT_AFTER_TIME: ${CASCADE_REJECT_AFTER_TIME:-}
+      CASCADE_KEEPALIVE_TIMEOUT: ${CASCADE_KEEPALIVE_TIMEOUT:-}
+      CASCADE_MAX_HANDSHAKE_ATTEMPTS: ${CASCADE_MAX_HANDSHAKE_ATTEMPTS:-}
+      CASCADE_RANDOM_TRAILERS: ${CASCADE_RANDOM_TRAILERS:-}
+      CASCADE_DISABLE_COOKIES: ${CASCADE_DISABLE_COOKIES:-}
     volumes:
       - awg-config:/etc/amnezia/amneziawg
       - awg-run:/var/run/amneziawg
@@ -171,7 +193,7 @@ services:
 
   panel:
     <<: *restart
-    image: ${IMAGE_PANEL:-saucewg/panel:1.5.1}
+    image: ${IMAGE_PANEL:-saucewg/panel:1.6.0}
     build:
       # The repository root, so the image can carry saucewg.sh and install exit
       # nodes with the same script an operator would run by hand.
@@ -258,9 +280,22 @@ services:
       NODE_RECOVERY_GRACE_SECONDS: ${NODE_RECOVERY_GRACE_SECONDS:-300}
       NODE_RECOVERY_INTERVAL_SECONDS: ${NODE_RECOVERY_INTERVAL_SECONDS:-60}
       NODE_RECOVERY_MAX_ATTEMPTS: ${NODE_RECOVERY_MAX_ATTEMPTS:-6}
+      # Exit nodes follow this panel's release: after it starts, every node it
+      # installed is upgraded one at a time with traffic moved off it first, and a
+      # node that did not answer is tried again after the retry interval. Each is
+      # then moved to NODE_UPGRADE_PROTOCOL unless an operator put it on another
+      # generation; empty leaves every node on the one it has.
+      NODE_AUTO_UPGRADE: ${NODE_AUTO_UPGRADE:-true}
+      NODE_AUTO_UPGRADE_DELAY_SECONDS: ${NODE_AUTO_UPGRADE_DELAY_SECONDS:-120}
+      NODE_AUTO_UPGRADE_RETRY_SECONDS: ${NODE_AUTO_UPGRADE_RETRY_SECONDS:-900}
+      NODE_UPGRADE_PROTOCOL: ${NODE_UPGRADE_PROTOCOL-3.1}
       # Pins a node installed from the UI to the same release as this panel.
       SAUCEWG_REPO: ${SAUCEWG_REPO:-V2as/SauceWG}
       SAUCEWG_REF: ${SAUCEWG_REF:-main}
+      # Where an exit node fetches saucewg.sh and its images from, for a server
+      # that cannot reach GitHub or Docker Hub.
+      SAUCEWG_RAW_BASE: ${SAUCEWG_RAW_BASE:-}
+      SAUCEWG_REGISTRY: ${SAUCEWG_REGISTRY:-docker.io}
       SAUCEWG_NAMESPACE: ${SAUCEWG_NAMESPACE:-v2as}
       SAUCEWG_IMAGE_PREFIX: ${SAUCEWG_IMAGE_PREFIX:-saucewg-}
       SAUCEWG_TAG: ${SAUCEWG_TAG:-latest}
@@ -273,7 +308,7 @@ services:
 
   caddy:
     <<: *restart
-    image: ${IMAGE_WEB:-saucewg/web:1.5.1}
+    image: ${IMAGE_WEB:-saucewg/web:1.6.0}
     build:
       context: .
       dockerfile: docker/caddy/Dockerfile

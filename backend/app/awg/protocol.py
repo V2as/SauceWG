@@ -7,9 +7,15 @@ profile the same way, so getting the set right is what makes a config loadable.
     1.0   Jc Jmin Jmax S1 S2 H1-H4        every KeeneticOS from 4.2 Alpha 2 on
     1.5   the same, plus I1               KeeneticOS 5.1 Alpha 3 and newer
     2.0   the same, plus I1, S3 and S4    KeeneticOS 5.1 Alpha 3 and newer
+    3.0   2.0 plus HeaderProtectionKey,   AmneziaVPN 5.0.0.5, KeeneticOS 5.2 Alpha 11
+          ContentPaddingAddition and
+          five randomised timings
+    3.1   3.0 plus RandomTrailers and     AmneziaVPN 5.0.1.5, KeeneticOS 5.2 Alpha 11
+          DisableCookies
 
-AWG 3.0 is deliberately absent: no router firmware speaks it, so a 3.0 profile
-cannot be loaded into a Keenetic at all.
+The node runs amneziawg-go v3, which speaks all five: a profile without the 3.x
+parameters is the same on the wire as under v0.2, so routers that stop at 2.0 keep
+connecting to an upgraded node.
 
 This mirrors ``docker/awg/lib.sh``; the two must agree, because the node writes the
 profile and the panel renders the clients that have to match it.
@@ -22,18 +28,38 @@ from typing import Final
 PROTOCOL_1_0: Final = "1.0"
 PROTOCOL_1_5: Final = "1.5"
 PROTOCOL_2_0: Final = "2.0"
+PROTOCOL_3_0: Final = "3.0"
+PROTOCOL_3_1: Final = "3.1"
 
-#: Newest generation KeeneticOS 5.1 Alpha 3 and later accept, and what a fresh install
-#: is given. The installer owns that choice (``AWG_PROTOCOL_DEFAULT`` in lib.sh); this
-#: is here so the panel can say what "newest" means without asking the node.
+#: Newest generation a router on a stable KeeneticOS accepts, and what a fresh
+#: install gives the interface app clients dial. The installer owns that choice
+#: (``AWG_PROTOCOL_CLIENTS`` in lib.sh); this is here so the panel can say what it is
+#: without asking the node.
 LATEST_KEENETIC_PROTOCOL: Final = PROTOCOL_2_0
+
+#: Newest generation there is. A hop between two nodes runs amneziawg-go at both
+#: ends, so a new exit node speaks this (``AWG_PROTOCOL_NODES`` in lib.sh).
+LATEST_PROTOCOL: Final = PROTOCOL_3_1
 
 #: What to read state as when it records no generation at all. Deliberately *not* the
 #: newest: such a node has been serving 1.0 clients since before generations were
 #: recorded, and answering "2.0" would hand its clients a profile it cannot speak.
 ASSUMED_PROTOCOL: Final = PROTOCOL_1_0
 
-PROTOCOLS: Final = (PROTOCOL_1_0, PROTOCOL_1_5, PROTOCOL_2_0)
+PROTOCOLS: Final = (PROTOCOL_1_0, PROTOCOL_1_5, PROTOCOL_2_0, PROTOCOL_3_0, PROTOCOL_3_1)
+
+#: Parameters only AmneziaWG 3.x defines, in the order a .conf lists them.
+V3_PARAMS: Final = (
+    "HEADER_PROTECTION_KEY",
+    "CONTENT_PADDING_ADDITION",
+    "REKEY_AFTER_TIME",
+    "REKEY_TIMEOUT",
+    "REJECT_AFTER_TIME",
+    "KEEPALIVE_TIMEOUT",
+    "MAX_HANDSHAKE_ATTEMPTS",
+    "RANDOM_TRAILERS",
+    "DISABLE_COOKIES",
+)
 
 #: Every parameter any generation can carry, in the order a .conf lists them.
 ALL_PARAMS: Final = (
@@ -41,6 +67,12 @@ ALL_PARAMS: Final = (
     "S1", "S2", "S3", "S4",
     "H1", "H2", "H3", "H4",
     "I1", "I2", "I3", "I4", "I5",
+    *V3_PARAMS,
+)  # fmt: skip
+
+_V2_PARAMS: Final = (
+    "JC", "JMIN", "JMAX", "S1", "S2", "S3", "S4",
+    "H1", "H2", "H3", "H4", "I1",
 )  # fmt: skip
 
 #: Parameters that identify each generation. I2-I5 are opt-in extras rather than
@@ -48,22 +80,47 @@ ALL_PARAMS: Final = (
 PROTOCOL_PARAMS: Final[dict[str, tuple[str, ...]]] = {
     PROTOCOL_1_0: ("JC", "JMIN", "JMAX", "S1", "S2", "H1", "H2", "H3", "H4"),
     PROTOCOL_1_5: ("JC", "JMIN", "JMAX", "S1", "S2", "H1", "H2", "H3", "H4", "I1"),
-    PROTOCOL_2_0: (
-        "JC", "JMIN", "JMAX", "S1", "S2", "S3", "S4",
-        "H1", "H2", "H3", "H4", "I1",
-    ),  # fmt: skip
+    PROTOCOL_2_0: _V2_PARAMS,
+    PROTOCOL_3_0: _V2_PARAMS + V3_PARAMS[:7],
+    PROTOCOL_3_1: _V2_PARAMS + V3_PARAMS,
 }
 
 #: Parameters both ends must agree on, because they change the shape of packets the
-#: far end has to parse. The rest (junk and signature packets) are sender-side only,
-#: so the panel may hand a client its own values.
-SHARED_PARAMS: Final = ("S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4")
+#: far end has to parse: the paddings, the type headers, the key those headers are
+#: encrypted with, and whether a packet longer than expected is accepted at all. The
+#: rest (junk and signature packets, content padding, timings, cookies) are acted on
+#: by the sender alone, so the panel may hand a client its own values.
+SHARED_PARAMS: Final = (
+    "S1", "S2", "S3", "S4",
+    "H1", "H2", "H3", "H4",
+    "HEADER_PROTECTION_KEY", "RANDOM_TRAILERS",
+)  # fmt: skip
+
+#: Header protection takes its nonce from the first 12 bytes of every padding, so
+#: amneziawg-go refuses a key unless each of S1-S4 is at least that.
+HEADER_PROTECTION_MIN_PADDING: Final = 12
 
 #: Parameters whose value is a signature-packet spec rather than a number.
 TEXT_PARAMS: Final = ("I1", "I2", "I3", "I4", "I5")
 
+#: Parameters that are switched on or off rather than given a number.
+SWITCH_PARAMS: Final = ("RANDOM_TRAILERS", "DISABLE_COOKIES")
+
 #: How each parameter is spelled in a .conf file.
-_LABELS: Final = {"JC": "Jc", "JMIN": "Jmin", "JMAX": "Jmax"}
+_LABELS: Final = {
+    "JC": "Jc",
+    "JMIN": "Jmin",
+    "JMAX": "Jmax",
+    "HEADER_PROTECTION_KEY": "HeaderProtectionKey",
+    "CONTENT_PADDING_ADDITION": "ContentPaddingAddition",
+    "REKEY_AFTER_TIME": "RekeyAfterTime",
+    "REKEY_TIMEOUT": "RekeyTimeout",
+    "REJECT_AFTER_TIME": "RejectAfterTime",
+    "KEEPALIVE_TIMEOUT": "KeepaliveTimeout",
+    "MAX_HANDSHAKE_ATTEMPTS": "MaxHandshakeAttempts",
+    "RANDOM_TRAILERS": "RandomTrailers",
+    "DISABLE_COOKIES": "DisableCookies",
+}
 
 _ALIASES: Final = {
     "": PROTOCOL_1_0,
@@ -75,6 +132,9 @@ _ALIASES: Final = {
     "1.5": PROTOCOL_1_5,
     "2": PROTOCOL_2_0,
     "2.0": PROTOCOL_2_0,
+    "3": PROTOCOL_3_0,
+    "3.0": PROTOCOL_3_0,
+    "3.1": PROTOCOL_3_1,
 }
 
 
@@ -126,9 +186,31 @@ def carries(protocol: str, param: str) -> bool:
     return param in params_for(protocol)
 
 
+def protects_headers(protocol: str) -> bool:
+    """True for the generations that encrypt the type headers (3.0 and later)."""
+    return carries(protocol, "HEADER_PROTECTION_KEY")
+
+
+def older(protocol: str, than: str) -> bool:
+    """True when ``protocol`` comes before ``than``."""
+    return PROTOCOLS.index(normalize(protocol)) < PROTOCOLS.index(normalize(than))
+
+
 def label(param: str) -> str:
     param = param.upper()
     return _LABELS.get(param, param)
+
+
+def switch(value: object) -> str | None:
+    """A switch in the one spelling amneziawg-tools reads, or None if it is not one."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    text = str(value).strip().lower()
+    if text in ("on", "true", "yes", "1"):
+        return "on"
+    if text in ("off", "false", "no", "0"):
+        return "off"
+    return None
 
 
 def infer(params: dict[str, object], *, prefix: str = "") -> str:
@@ -143,6 +225,10 @@ def infer(params: dict[str, object], *, prefix: str = "") -> str:
         value = params.get(f"{prefix}{name}")
         return value is not None and str(value).strip() not in ("", "0")
 
+    if present("RANDOM_TRAILERS") or present("DISABLE_COOKIES"):
+        return PROTOCOL_3_1
+    if present("HEADER_PROTECTION_KEY"):
+        return PROTOCOL_3_0
     if present("S3") or present("S4"):
         return PROTOCOL_2_0
     if present("I1"):

@@ -86,6 +86,14 @@ setup_server_iface() {
         fi
     done
 
+    # Only an entry node's server interface is dialled by app clients; an exit node's
+    # is dialled by the entry node, which speaks the protocol in full.
+    local peers=nodes default=$AWG_PROTOCOL_NODES
+    if [ "$AWG_ROLE" = "entry" ]; then
+        peers=clients
+        default=$AWG_PROTOCOL_CLIENTS
+    fi
+
     # An installation that predates protocol selection has a profile but no
     # generation recorded, and it is serving 1.0 clients right now — so it stays on
     # 1.0 until someone asks for something else. Only a genuinely new interface
@@ -97,17 +105,13 @@ setup_server_iface() {
             AWG_PROTOCOL=1.0
             log "no protocol recorded for ${AWG_IFACE}; keeping the existing AmneziaWG 1.0 profile"
         else
-            AWG_PROTOCOL=$AWG_PROTOCOL_DEFAULT
+            AWG_PROTOCOL=${AWG_PROTOCOL_DEFAULT:-$default}
         fi
     fi
     SERVER_PROTOCOL=$(awg_protocol "$AWG_PROTOCOL") \
-        || die "AWG_PROTOCOL=${AWG_PROTOCOL} is not an AmneziaWG generation this node can serve (1.0, 1.5 or 2.0)"
+        || die "AWG_PROTOCOL=${AWG_PROTOCOL} is not an AmneziaWG generation this node can serve (one of: ${AWG_PROTOCOLS})"
     AWG_PROTOCOL=$SERVER_PROTOCOL
 
-    # Only an entry node's server interface is dialled by app clients; an exit node's
-    # is dialled by the entry node, which speaks the protocol in full.
-    local peers=nodes
-    [ "$AWG_ROLE" = "entry" ] && peers=clients
     generate_obfuscation "AWG_" "$SERVER_PROTOCOL" "$peers"
 
     # params_store reads these by name, so shellcheck cannot see the use.

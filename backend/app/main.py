@@ -27,6 +27,7 @@ from .routers import (
 )
 from .security import hash_password
 from .services.collector import collect, purge_old_usage
+from .services.fleet import loop as fleet_loop
 from .services.recovery import loop as recovery_loop
 from .services.sync import sync_peers
 from .services.tasks import tasks
@@ -112,6 +113,9 @@ async def lifespan(app: FastAPI):
         # The cascade routes around a failed exit node by itself; nothing but the
         # panel can put the server back, because nothing else can reach it.
         asyncio.create_task(recovery_loop()),
+        # An update moves this node to a new release; the exit nodes follow it here,
+        # including any that were down while `saucewg update` walked them.
+        asyncio.create_task(fleet_loop()),
     ]
     logger.info("%s %s is ready", settings.panel_title, __version__)
     try:

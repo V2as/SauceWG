@@ -1,10 +1,10 @@
-IMAGE_AWG   ?= saucewg/awg:1.5.1
-IMAGE_PANEL ?= saucewg/panel:1.5.1
-IMAGE_WEB   ?= saucewg/web:1.5.1
+IMAGE_AWG   ?= saucewg/awg:1.6.0
+IMAGE_PANEL ?= saucewg/panel:1.6.0
+IMAGE_WEB   ?= saucewg/web:1.6.0
 PLATFORMS   ?=
 
-AWG_GO_REF    ?= v0.2.19
-AWG_TOOLS_REF ?= v1.0.20260618-2
+AWG_GO_REF    ?= v3.1.20260828
+AWG_TOOLS_REF ?= v3.1.20260812
 
 BUILDX_FLAGS := $(if $(PLATFORMS),--platform $(PLATFORMS) --push,--load)
 

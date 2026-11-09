@@ -124,10 +124,13 @@ def render_client_config(
     file a different generation, which AmneziaVPN and KeeneticOS would then refuse
     to load or would load into a tunnel the server cannot answer.
 
-    S1-S4 and H1-H4 are copied verbatim, since the handshake fails unless both ends
-    agree. Jc/Jmin/Jmax and I1-I5 are built by the sender alone, so the panel is
-    free to hand out its own — useful when a client sits behind a censor that drops
-    the disguise the server picked for itself.
+    S1-S4, H1-H4 and — under 3.x — the header protection key and RandomTrailers are
+    copied verbatim, since the handshake fails unless both ends agree. Jc/Jmin/Jmax
+    and I1-I5 are built by the sender alone, so the panel is free to hand out its
+    own — useful when a client sits behind a censor that drops the disguise the
+    server picked for itself. I2-I5 are extras the server may or may not have set;
+    they cost nothing to mirror and some clients want the same padding profile in
+    both directions.
     """
     obf = server.obfuscation or {}
     version = server.protocol
@@ -152,17 +155,13 @@ def render_client_config(
     if chosen and proto.carries(version, "I1"):
         overrides["I1"] = proto.cps_spec(chosen)
 
-    for name in proto.PROTOCOL_PARAMS[version]:
+    for name in proto.ALL_PARAMS:
+        if not proto.carries(version, name):
+            continue
         value = overrides.get(name, obf.get(name, ""))
         if not value:
             continue
         lines.append(f"{proto.label(name)} = {value}")
-
-    # I2-I5 are extras the server may or may not have set; they cost nothing to
-    # mirror and some clients want the same padding profile in both directions.
-    for name in ("I2", "I3", "I4", "I5"):
-        if proto.carries(version, name) and obf.get(name):
-            lines.append(f"{name} = {obf[name]}")
 
     lines += ["", "[Peer]", f"PublicKey = {server.public_key}"]
     if preshared_key:

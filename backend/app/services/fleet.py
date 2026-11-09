@@ -646,22 +646,35 @@ def _unfinished(report: dict[str, Any] | None) -> bool:
     """Whether a walk left nodes behind that another one could still reach."""
     if not report or report.get("running") or report.get("halted"):
         return False
+    if not report.get("finished_at"):
+        # Killed before it could say how it ended.
+        return True
     return bool(report.get("error")) or any(item.get("pending") for item in report.get("nodes") or [])
+
+
+def _started_since(report: dict[str, Any] | None, moment: datetime) -> bool:
+    try:
+        return datetime.fromisoformat(str((report or {}).get("started_at"))) >= moment
+    except (TypeError, ValueError):
+        return False
 
 
 async def loop() -> None:
     """Brings the fleet onto this release shortly after the panel starts.
 
-    `saucewg update` has usually done it already, in which case every node reads as
-    current and the walk is a status check over SSH. What is left for this loop is a
-    node that was down at the time — after this walk or after one started from the
-    panel or the CLI — which is retried until it has been upgraded. A walk that
-    stopped because a node broke is left for an operator.
+    `saucewg update` walks the nodes as soon as the panel answers, and a walk made
+    since the start is not repeated: its report is what an operator should find, not
+    a status check over SSH that reads every node as current. What is left for this
+    loop is a start without such a walk, and a node that was down at the time — after
+    any walk, from the panel, the CLI or this loop — which is retried until it has been
+    upgraded. A walk that stopped because a node broke is left for an operator.
     """
     if not settings.node_auto_upgrade or not settings.node_provision_enabled:
         return
+    started = datetime.now(timezone.utc)
     await asyncio.sleep(settings.node_auto_upgrade_delay_seconds)
-    due = True
+    report = last_report()
+    due = not _started_since(report, started) or _unfinished(report)
     while True:
         if due and not running() and tasks.active_for(TARGET) is None:
             try:

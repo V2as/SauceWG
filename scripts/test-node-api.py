@@ -492,6 +492,33 @@ async def walk_the_fleet(client: httpx.AsyncClient) -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await retrying
             settings.node_auto_upgrade_delay_seconds, settings.node_auto_upgrade_retry_seconds = saved
+
+        print("the panel does not repeat the walk `saucewg update` made after it started")
+        reset(release=__version__)
+        await asyncio.sleep(0.3)
+        settings.node_auto_upgrade_delay_seconds, settings.node_auto_upgrade_retry_seconds = 1, 1
+        began = time.monotonic()
+        retrying = asyncio.create_task(fleet.loop())
+        # The panel's loop is under way long before `saucewg update` gets an answer.
+        await asyncio.sleep(0)
+        try:
+            report = await fleet.upgrade(detached("upgrade-fleet", "fleet"), protocol="", origin="update")
+            check("that walk is over before the panel's delay is", time.monotonic() - began < 1, report)
+            await asyncio.sleep(2.5)
+            last = fleet.last_report() or {}
+            check(
+                "its report stays the last one",
+                last.get("origin") == "update" and last.get("started_at") == report["started_at"],
+                last,
+            )
+        finally:
+            retrying.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await retrying
+            settings.node_auto_upgrade_delay_seconds, settings.node_auto_upgrade_retry_seconds = saved
+        with open(settings.fleet_state_file, "w", encoding="utf-8") as handle:
+            json.dump({**report, "running": True, "finished_at": None}, handle)
+        check("a walk killed before its end is taken up again", fleet._unfinished(fleet.last_report()), fleet.last_report())
     finally:
         stop.set()
         await pump
